@@ -1,0 +1,168 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+
+@layer base {
+  :root {
+    --canvas: #FAF9F6;
+    --surface: #FFFFFF;
+    --border: #E8E5DF;
+    --ink: #1C1B18;
+    --muted: #6F6B63;
+    --primary: #3B5BDB;
+  }
+
+  html {
+    font-family: "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", system-ui, -apple-system, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    background-color: var(--canvas);
+    color: var(--ink);
+  }
+}
+
+/* Safe area support for Android/iOS standalone PWA */
+.pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+/* Editorial Markdown Prose */
+.zhiwu-prose {
+  color: #262420;
+  line-height: 1.78;
+  font-size: 0.95rem;
+  word-break: break-word;
+}
+
+.zhiwu-prose h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #141311;
+  margin-top: 1.25rem;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid #ECE9E2;
+}
+
+.zhiwu-prose h2 {
+  font-size: 1.22rem;
+  font-weight: 700;
+  color: #1C1B18;
+  margin-top: 1.35rem;
+  margin-bottom: 0.6rem;
+}
+
+.zhiwu-prose h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #2B2924;
+  margin-top: 1.1rem;
+  margin-bottom: 0.45rem;
+}
+
+.zhiwu-prose p {
+  margin-bottom: 0.85rem;
+}
+
+.zhiwu-prose ul {
+  list-style-type: disc;
+  padding-left: 1.4rem;
+  margin-bottom: 0.85rem;
+}
+
+.zhiwu-prose ol {
+  list-style-type: decimal;
+  padding-left: 1.4rem;
+  margin-bottom: 0.85rem;
+}
+
+.zhiwu-prose li {
+  margin-bottom: 0.3rem;
+}
+
+.zhiwu-prose blockquote {
+  border-left: 3px solid #3B5BDB;
+  background-color: #F3F5FC;
+  padding: 0.65rem 1rem;
+  margin: 0.9rem 0;
+  border-radius: 0 0.5rem 0.5rem 0;
+  color: #363C52;
+}
+
+.zhiwu-prose blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+.zhiwu-prose code {
+  background-color: #F1EFEA;
+  color: #B42318;
+  padding: 0.12rem 0.38rem;
+  border-radius: 0.3rem;
+  font-size: 0.87em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.zhiwu-prose pre {
+  background-color: #1E1E24;
+  color: #F4F4F6;
+  padding: 0.95rem 1.1rem;
+  border-radius: 0.65rem;
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.zhiwu-prose pre code {
+  background-color: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.zhiwu-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.88rem;
+  display: block;
+  overflow-x: auto;
+}
+
+.zhiwu-prose th,
+.zhiwu-prose td {
+  border: 1px solid #E5E2DC;
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+}
+
+.zhiwu-prose th {
+  background-color: #F5F3EE;
+  font-weight: 600;
+}
+
+.zhiwu-prose img {
+  max-width: 100%;
+  border-radius: 0.65rem;
+  border: 1px solid #E8E5DF;
+  margin: 0.75rem 0;
+}
+
+.zhiwu-prose hr {
+  border-color: #E8E5DF;
+  margin: 1.25rem 0;
+}
+
+/* Custom subtle scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #D8D4CC;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #B9B4AA;
+}

@@ -1,0 +1,17 @@
+{
+  "name": "zhiwu-learning-platform",
+  "version": "1.0.0",
+  "description": "知悟 — 个人 AI 知识管理与动态学习平台（桌面端 + 安卓 PWA）",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "dev": "concurrently -k -n SERVER,CLIENT -c cyan,green \"npm run dev:server\" \"npm run dev:client\"",
+    "build": "npm --prefix client run build && npm --prefix server run build",
+    "start": "npm --prefix server run start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

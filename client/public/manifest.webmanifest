@@ -1,0 +1,18 @@
+{
+  "name": "知悟 — 个人 AI 学习平台",
+  "short_name": "知悟",
+  "description": "随时导入笔记、AI 总结归纳、动态出题、错题解析、间隔重复复习与费曼助教",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FAF9F6",
+  "theme_color": "#3B5BDB",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
