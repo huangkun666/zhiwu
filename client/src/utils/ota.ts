@@ -1,7 +1,5 @@
-export interface OtaConfig {
-  repo: string; // e.g. huangkun666/zhiwu
-  token: string; // optional for public repo, required for private GitHub repo
-}
+export const OTA_REPO = 'huangkun666/zhiwu';
+export const OTA_REPO_URL = `https://github.com/${OTA_REPO}`;
 
 export interface NativeOtaState {
   isNative: boolean;
@@ -10,40 +8,66 @@ export interface NativeOtaState {
   isOtaActive: boolean;
 }
 
-export interface RemoteReleaseInfo {
+export interface ActiveRefInfo {
+  branch: string;
+  sha: string;
+  shortSha: string;
   version: string;
+  isOta: boolean;
+}
+
+export interface OtaBuildEntry {
+  shortSha: string;
+  sha?: string;
+  branch?: string;
+  version?: string;
   nativeVersion: number;
-  changelog: string;
-  updatedAt: string;
-  bundleDownloadUrl: string;
-  apkDownloadUrl: string;
-  needsApkReinstall: boolean;
+  message?: string;
+  builtAt?: string;
+  downloadUrl: string;
+}
+
+export interface RemoteBranchInfo {
+  name: string;
+  headSha: string;
+  headShortSha: string;
+  headMessage: string;
+  headDate: string;
+  aheadBy: number;
+  behindBy: number;
+  isCurrent: boolean;
   hasUpdate: boolean;
+  headBundle: OtaBuildEntry | null;
 }
 
-const OTA_CFG_KEY = 'zhiwu_ota_config';
-export const BUILTIN_APP_VERSION = import.meta.env.VITE_APP_VERSION || '1.0.0';
-
-export function getOtaConfig(): OtaConfig {
-  try {
-    const raw = localStorage.getItem(OTA_CFG_KEY);
-    if (raw) {
-      const p = JSON.parse(raw);
-      return { repo: p.repo || 'huangkun666/zhiwu', token: p.token || '' };
-    }
-  } catch {
-    // ignore
-  }
-  return { repo: 'huangkun666/zhiwu', token: '' };
+export interface RemoteCommitInfo {
+  sha: string;
+  shortSha: string;
+  message: string;
+  date: string;
+  author: string;
+  isCurrent: boolean;
+  bundle: OtaBuildEntry | null;
+  needsApkReinstall: boolean;
+  isBuildingLikely: boolean;
 }
 
-export function saveOtaConfig(cfg: OtaConfig) {
-  try {
-    localStorage.setItem(OTA_CFG_KEY, JSON.stringify(cfg));
-  } catch {
-    // ignore
-  }
+export interface UpdateCheckResult {
+  checkedAt: string;
+  currentRef: ActiveRefInfo;
+  branches: RemoteBranchInfo[];
+  currentBranchInfo: RemoteBranchInfo | null;
+  otherUpdatedBranches: RemoteBranchInfo[];
+  bundlesBySha: Record<string, OtaBuildEntry>;
+  apkDownloadUrl: string;
+  latestNativeVersion: number;
 }
+
+const ACTIVE_REF_KEY = 'zhiwu_ota_active_ref';
+
+const BUILTIN_VERSION = import.meta.env.VITE_APP_VERSION || '1.0.0';
+const BUILTIN_BRANCH = import.meta.env.VITE_APP_BRANCH || 'main';
+const BUILTIN_COMMIT = import.meta.env.VITE_APP_COMMIT || '';
 
 export function getNativeOtaState(): NativeOtaState {
   try {
@@ -55,96 +79,327 @@ export function getNativeOtaState(): NativeOtaState {
   return { isNative: false, nativeVersion: 2, otaVersion: '', isOtaActive: false };
 }
 
-export function getCurrentDisplayVersion(): string {
+export function getCurrentRef(): ActiveRefInfo {
   const native = getNativeOtaState();
-  return native.isOtaActive && native.otaVersion ? native.otaVersion : BUILTIN_APP_VERSION;
+  if (native.isOtaActive) {
+    try {
+      const raw = localStorage.getItem(ACTIVE_REF_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.shortSha) {
+          return {
+            branch: parsed.branch || BUILTIN_BRANCH,
+            sha: parsed.sha || parsed.shortSha,
+            shortSha: parsed.shortSha,
+            version: parsed.version || native.otaVersion || BUILTIN_VERSION,
+            isOta: true,
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    const ver = native.otaVersion || BUILTIN_VERSION;
+    const parts = ver.split('@');
+    if (parts.length === 2) {
+      return { branch: parts[0], sha: parts[1], shortSha: parts[1].slice(0, 7), version: ver, isOta: true };
+    }
+    return {
+      branch: BUILTIN_BRANCH,
+      sha: BUILTIN_COMMIT,
+      shortSha: BUILTIN_COMMIT ? BUILTIN_COMMIT.slice(0, 7) : ver,
+      version: ver,
+      isOta: true,
+    };
+  }
+  return {
+    branch: BUILTIN_BRANCH,
+    sha: BUILTIN_COMMIT,
+    shortSha: BUILTIN_COMMIT ? BUILTIN_COMMIT.slice(0, 7) : `v${BUILTIN_VERSION}`,
+    version: BUILTIN_VERSION,
+    isOta: false,
+  };
 }
 
-export async function checkRemoteUpdate(cfg: OtaConfig): Promise<RemoteReleaseInfo> {
-  const repo = cfg.repo.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '');
-  if (!repo.includes('/')) throw new Error('仓库格式应为 用户名/仓库名（如 huangkun666/zhiwu）');
-
-  const headers: Record<string, string> = {
-    Accept: 'application/vnd.github+json',
-  };
-  if (cfg.token.trim()) {
-    headers['Authorization'] = `Bearer ${cfg.token.trim()}`;
+function savePendingActiveRef(ref: { branch: string; sha: string; shortSha: string; version: string }) {
+  try {
+    localStorage.setItem(ACTIVE_REF_KEY, JSON.stringify(ref));
+  } catch {
+    // ignore
   }
+}
 
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases/tags/latest-ota`, { headers });
+async function ghFetchJson(path: string): Promise<any> {
+  const res = await fetch(`https://api.github.com/repos/${OTA_REPO}${path}`, {
+    headers: { Accept: 'application/vnd.github+json' },
+  });
+  if (res.status === 403) {
+    throw new Error('GitHub 接口请求次数达到上限，请稍后再试');
+  }
   if (res.status === 404) {
-    throw new Error(
-      cfg.token.trim()
-        ? '尚未找到 latest-ota 发布记录，请等待云端构建完成'
-        : '无法读取私有仓库更新（404），如为私有仓库请在下方填入 GitHub Token（或将仓库设为公开）'
-    );
-  }
-  if (res.status === 401 || res.status === 403) {
-    throw new Error('GitHub Token 无效或缺少 repo 权限');
+    return null;
   }
   if (!res.ok) {
-    throw new Error(`检查更新失败 (HTTP ${res.status})`);
+    throw new Error(`远端请求失败 (${res.status})`);
+  }
+  return res.json();
+}
+
+function parseReleaseBundles(rel: any): {
+  bundlesBySha: Record<string, OtaBuildEntry>;
+  apkDownloadUrl: string;
+  latestNativeVersion: number;
+} {
+  const bundlesBySha: Record<string, OtaBuildEntry> = {};
+  let apkDownloadUrl = `${OTA_REPO_URL}/releases/tag/latest-ota`;
+  let latestNativeVersion = 2;
+
+  if (!rel) {
+    return { bundlesBySha, apkDownloadUrl, latestNativeVersion };
   }
 
-  const rel = await res.json();
-  const assets: any[] = rel.assets || [];
-  const bundleAsset = assets.find((a) => a.name === 'web-bundle.zip');
-  const apkAsset = assets.find((a) => a.name === 'zhiwu-android.apk');
+  const body = String(rel.body || '');
+  let manifestMap: Record<string, any> = {};
 
-  if (!bundleAsset) {
-    throw new Error('云端发布包中缺少 web-bundle.zip，请稍后重试');
-  }
-
-  // Parse metadata cleanly from release body JSON header or fallback to release fields
-  let version = rel.name?.replace(/^v/i, '') || '1.0.0';
-  let nativeVersion = 2;
-  let changelog = rel.body || '常规功能优化与体验升级';
-  const metaMatch = String(rel.body || '').match(/<!--ZHIWU_META:(.*?)-->/);
-  if (metaMatch?.[1]) {
+  const buildsMatch = body.match(/<!--ZHIWU_BUILDS:(.*?)-->/);
+  if (buildsMatch?.[1]) {
     try {
-      const meta = JSON.parse(metaMatch[1]);
-      if (meta.version) version = String(meta.version);
-      if (meta.nativeVersion) nativeVersion = Number(meta.nativeVersion);
-      if (meta.changelog) changelog = String(meta.changelog);
+      manifestMap = JSON.parse(buildsMatch[1]) || {};
     } catch {
       // ignore
     }
   }
 
-  const native = getNativeOtaState();
-  const currentVer = getCurrentDisplayVersion();
-  // Private repo asset download MUST use asset.url (API endpoint); public repo can use browser_download_url
-  const bundleDownloadUrl = cfg.token.trim() ? bundleAsset.url : bundleAsset.browser_download_url;
-  const apkDownloadUrl = apkAsset?.browser_download_url || rel.html_url;
+  const metaMatch = body.match(/<!--ZHIWU_META:(.*?)-->/);
+  if (metaMatch?.[1]) {
+    try {
+      const meta = JSON.parse(metaMatch[1]);
+      if (meta?.nativeVersion) latestNativeVersion = Number(meta.nativeVersion);
+    } catch {
+      // ignore
+    }
+  }
+
+  const assets: any[] = rel.assets || [];
+  const apkAsset = assets.find((a) => a.name === 'zhiwu-android.apk');
+  if (apkAsset?.browser_download_url) {
+    apkDownloadUrl = apkAsset.browser_download_url;
+  }
+
+  for (const asset of assets) {
+    const m = String(asset.name || '').match(/^web-bundle-([0-9a-f]{7,})\.zip$/i);
+    if (!m) continue;
+    const shortSha = m[1].toLowerCase().slice(0, 7);
+    const meta = manifestMap[shortSha] || {};
+    bundlesBySha[shortSha] = {
+      shortSha,
+      sha: meta.sha || shortSha,
+      branch: meta.branch,
+      version: meta.version,
+      nativeVersion: Number(meta.nativeVersion || latestNativeVersion || 2),
+      message: meta.message,
+      builtAt: meta.builtAt || asset.updated_at || '',
+      downloadUrl: asset.browser_download_url,
+    };
+  }
+
+  return { bundlesBySha, apkDownloadUrl, latestNativeVersion };
+}
+
+function firstLine(msg: string): string {
+  return String(msg || '').split('\n')[0].trim();
+}
+
+export function formatRelativeTime(iso: string): string {
+  if (!iso) return '';
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return '';
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 60) return '刚刚';
+  const mins = Math.floor(diffSec / 60);
+  if (mins < 60) return `${mins} 分钟前`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} 天前`;
+  return new Date(iso).toLocaleDateString();
+}
+
+export async function checkAllBranchesUpdate(): Promise<UpdateCheckResult> {
+  const currentRef = getCurrentRef();
+
+  const [rel, rawBranches] = await Promise.all([
+    ghFetchJson('/releases/tags/latest-ota'),
+    ghFetchJson('/branches?per_page=20'),
+  ]);
+
+  if (!Array.isArray(rawBranches) || rawBranches.length === 0) {
+    throw new Error('未获取到远端分支信息');
+  }
+
+  const { bundlesBySha, apkDownloadUrl, latestNativeVersion } = parseReleaseBundles(rel);
+
+  // Sort current branch first, then main/master, then alphabetical
+  const sortedRaw = [...rawBranches].sort((a, b) => {
+    if (a.name === currentRef.branch) return -1;
+    if (b.name === currentRef.branch) return 1;
+    if (a.name === 'main' || a.name === 'master') return -1;
+    if (b.name === 'main' || b.name === 'master') return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  // Limit detailed inspection to top 10 branches to stay light on GitHub API quota
+  const targetBranches = sortedRaw.slice(0, 10);
+
+  const branches: RemoteBranchInfo[] = await Promise.all(
+    targetBranches.map(async (b: any) => {
+      const headSha = String(b.commit?.sha || '');
+      const headShortSha = headSha.slice(0, 7);
+      const isCurrent = b.name === currentRef.branch;
+      const headBundle = bundlesBySha[headShortSha.toLowerCase()] || null;
+
+      let aheadBy = 0;
+      let behindBy = 0;
+      let headMessage = headBundle?.message || '';
+      let headDate = headBundle?.builtAt || '';
+
+      const sameAsCurrent =
+        Boolean(currentRef.sha) &&
+        (headSha === currentRef.sha || headSha.startsWith(currentRef.sha) || currentRef.sha.startsWith(headShortSha));
+
+      if (sameAsCurrent) {
+        // Already on this exact commit; fetch commit detail only if message is missing
+        if (!headMessage && headSha) {
+          const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
+          headMessage = firstLine(c?.commit?.message || '');
+          headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
+        }
+      } else if (currentRef.sha && /^[0-9a-f]{7,40}$/i.test(currentRef.sha)) {
+        const cmp = await ghFetchJson(`/compare/${currentRef.sha}...${headSha}`).catch(() => null);
+        if (cmp) {
+          aheadBy = Number(cmp.ahead_by || 0);
+          behindBy = Number(cmp.behind_by || 0);
+          const lastCommit = cmp.commits?.[cmp.commits.length - 1];
+          if (lastCommit) {
+            headMessage = firstLine(lastCommit.commit?.message || '');
+            headDate = lastCommit.commit?.committer?.date || lastCommit.commit?.author?.date || '';
+          } else {
+            const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
+            headMessage = firstLine(c?.commit?.message || '');
+            headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
+          }
+        } else {
+          // Unrelated history or unknown base commit
+          aheadBy = 1;
+          const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
+          headMessage = firstLine(c?.commit?.message || '');
+          headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
+        }
+      } else {
+        // Local dev build without embedded commit SHA: treat remote head as newer
+        aheadBy = 1;
+        const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
+        headMessage = firstLine(c?.commit?.message || '');
+        headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
+      }
+
+      return {
+        name: b.name,
+        headSha,
+        headShortSha,
+        headMessage: headMessage || headShortSha,
+        headDate,
+        aheadBy,
+        behindBy,
+        isCurrent,
+        hasUpdate: !sameAsCurrent && aheadBy > 0,
+        headBundle,
+      };
+    })
+  );
+
+  const currentBranchInfo = branches.find((b) => b.isCurrent) || branches[0] || null;
+  const otherUpdatedBranches = branches.filter((b) => !b.isCurrent && b.hasUpdate);
 
   return {
-    version,
-    nativeVersion,
-    changelog,
-    updatedAt: rel.published_at || rel.created_at || '',
-    bundleDownloadUrl,
+    checkedAt: new Date().toISOString(),
+    currentRef,
+    branches,
+    currentBranchInfo,
+    otherUpdatedBranches,
+    bundlesBySha,
     apkDownloadUrl,
-    needsApkReinstall: nativeVersion > native.nativeVersion,
-    hasUpdate: version !== currentVer,
+    latestNativeVersion,
   };
 }
 
-export function triggerNativeOtaUpdate(
-  downloadUrl: string,
-  version: string,
-  token: string,
+export async function fetchBranchCommits(
+  branch: string,
+  bundlesBySha: Record<string, OtaBuildEntry>,
+  currentRef: ActiveRefInfo
+): Promise<RemoteCommitInfo[]> {
+  const native = getNativeOtaState();
+  const raw = await ghFetchJson(`/commits?sha=${encodeURIComponent(branch)}&per_page=15`);
+  if (!Array.isArray(raw)) return [];
+
+  const now = Date.now();
+  return raw.map((item: any, idx: number) => {
+    const sha = String(item.sha || '');
+    const shortSha = sha.slice(0, 7);
+    const date = item.commit?.committer?.date || item.commit?.author?.date || '';
+    const bundle = bundlesBySha[shortSha.toLowerCase()] || null;
+    const isCurrent =
+      Boolean(currentRef.sha) &&
+      (sha === currentRef.sha || sha.startsWith(currentRef.sha) || currentRef.sha.startsWith(shortSha));
+    const ageMs = date ? now - new Date(date).getTime() : Infinity;
+    const isBuildingLikely = !bundle && idx === 0 && ageMs < 6 * 60 * 1000;
+
+    return {
+      sha,
+      shortSha,
+      message: firstLine(item.commit?.message || shortSha),
+      date,
+      author: item.commit?.author?.name || '',
+      isCurrent,
+      bundle,
+      needsApkReinstall: Boolean(bundle && bundle.nativeVersion > native.nativeVersion),
+      isBuildingLikely,
+    };
+  });
+}
+
+export function triggerNativeCommitUpdate(
+  branch: string,
+  commit: RemoteCommitInfo,
   onProgress: (ev: { status: string; message: string }) => void
 ) {
+  if (!commit.bundle) {
+    throw new Error('该提交尚未生成构建包');
+  }
   const bridge = (window as any).ZhiwuNative;
   if (!bridge?.applyOtaUpdate) {
-    throw new Error('仅安卓 App 内支持一键热更新');
+    throw new Error('请在安卓端应用内执行更新');
   }
+  const label = `${branch}@${commit.shortSha}`;
   (window as any).__zhiwuOtaEvent = (ev: { status: string; message: string }) => {
+    if (ev.status === 'done') {
+      savePendingActiveRef({
+        branch,
+        sha: commit.sha,
+        shortSha: commit.shortSha,
+        version: commit.bundle?.version || label,
+      });
+    }
     onProgress(ev);
   };
-  bridge.applyOtaUpdate(downloadUrl, version, token || '');
+  bridge.applyOtaUpdate(commit.bundle.downloadUrl, label, '');
 }
 
 export function resetNativeOta() {
+  try {
+    localStorage.removeItem(ACTIVE_REF_KEY);
+  } catch {
+    // ignore
+  }
   (window as any).ZhiwuNative?.resetOtaUpdate?.();
 }

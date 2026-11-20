@@ -7,6 +7,8 @@ import {
   Download,
   Eye,
   EyeOff,
+  GitBranch,
+  GitCommitHorizontal,
   HardDrive,
   ImageOff,
   Loader2,
@@ -15,7 +17,6 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
-  Sparkles,
   Sun,
   Upload,
   Zap,
@@ -25,14 +26,16 @@ import { QrScannerModal } from '../components/QrScannerModal';
 import { QrSendModal } from '../components/QrSendModal';
 import type { AIProviderConfig, AISettings } from '../types';
 import {
-  checkRemoteUpdate,
-  getCurrentDisplayVersion,
+  checkAllBranchesUpdate,
+  fetchBranchCommits,
+  formatRelativeTime,
+  getCurrentRef,
   getNativeOtaState,
-  getOtaConfig,
+  OTA_REPO,
   resetNativeOta,
-  saveOtaConfig,
-  triggerNativeOtaUpdate,
-  type RemoteReleaseInfo,
+  triggerNativeCommitUpdate,
+  type RemoteCommitInfo,
+  type UpdateCheckResult,
 } from '../utils/ota';
 import type { ThemeMode } from '../utils/theme';
 
@@ -61,15 +64,17 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
   const [qrSendOpen, setQrSendOpen] = useState(false);
   const [qrScanOpen, setQrScanOpen] = useState(false);
 
-  // In-App OTA Live Update state
-  const [otaConfig, setOtaConfig] = useState(getOtaConfig);
-  const [showOtaToken, setShowOtaToken] = useState(false);
+  // Remote branch & commit update state
+  const nativeOta = getNativeOtaState();
+  const currentRef = getCurrentRef();
   const [checkingOta, setCheckingOta] = useState(false);
-  const [remoteRelease, setRemoteRelease] = useState<RemoteReleaseInfo | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+  const [selectedBranch, setSelectedBranch] = useState(currentRef.branch);
+  const [branchCommits, setBranchCommits] = useState<RemoteCommitInfo[]>([]);
+  const [loadingCommits, setLoadingCommits] = useState(false);
+  const [selectedCommitSha, setSelectedCommitSha] = useState('');
   const [otaProgress, setOtaProgress] = useState('');
   const [otaError, setOtaError] = useState('');
-  const nativeOta = getNativeOtaState();
-  const currentAppVer = getCurrentDisplayVersion();
 
   useEffect(() => {
     api.getSettings().then((s) => {
@@ -179,14 +184,33 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
     }
   };
 
+  const loadCommitsForBranch = async (branchName: string, info: UpdateCheckResult) => {
+    setSelectedBranch(branchName);
+    setLoadingCommits(true);
+    setSelectedCommitSha('');
+    try {
+      const commits = await fetchBranchCommits(branchName, info.bundlesBySha, info.currentRef);
+      setBranchCommits(commits);
+      const firstInstallable = commits.find((c) => c.bundle && !c.isCurrent) || commits[0];
+      if (firstInstallable) setSelectedCommitSha(firstInstallable.sha);
+    } catch (e: any) {
+      setBranchCommits([]);
+      setOtaError(e.message || '获取提交记录失败');
+    } finally {
+      setLoadingCommits(false);
+    }
+  };
+
   const handleCheckOta = async () => {
-    saveOtaConfig(otaConfig);
     setCheckingOta(true);
     setOtaError('');
-    setRemoteRelease(null);
     try {
-      const info = await checkRemoteUpdate(otaConfig);
-      setRemoteRelease(info);
+      const info = await checkAllBranchesUpdate();
+      setUpdateInfo(info);
+      const defaultBranch = info.branches.some((b) => b.name === selectedBranch)
+        ? selectedBranch
+        : info.currentBranchInfo?.name || info.branches[0]?.name || 'main';
+      await loadCommitsForBranch(defaultBranch, info);
     } catch (e: any) {
       setOtaError(e.message || '检查更新失败');
     } finally {
@@ -194,29 +218,25 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
     }
   };
 
-  const handleApplyOta = () => {
-    if (!remoteRelease) return;
+  const handleApplyCommit = (branchName: string, commit: RemoteCommitInfo) => {
     setOtaError('');
-    setOtaProgress('正在连接 GitHub 下载更新包...');
+    setOtaProgress(`正在下载 ${branchName} @ ${commit.shortSha}...`);
     try {
-      triggerNativeOtaUpdate(
-        remoteRelease.bundleDownloadUrl,
-        remoteRelease.version,
-        otaConfig.token,
-        (ev) => {
-          if (ev.status === 'error') {
-            setOtaProgress('');
-            setOtaError(ev.message);
-          } else {
-            setOtaProgress(ev.message);
-          }
+      triggerNativeCommitUpdate(branchName, commit, (ev) => {
+        if (ev.status === 'error') {
+          setOtaProgress('');
+          setOtaError(ev.message);
+        } else {
+          setOtaProgress(ev.message);
         }
-      );
+      });
     } catch (e: any) {
       setOtaProgress('');
-      setOtaError(e.message || '启动热更新失败');
+      setOtaError(e.message || '更新失败');
     }
   };
+
+  const selectedCommitObj = branchCommits.find((c) => c.sha === selectedCommitSha) || null;
 
   const filteredModels = modelFilter.trim()
     ? fetchedModels.filter((m) => m.toLowerCase().includes(modelFilter.trim().toLowerCase()))
@@ -587,64 +607,49 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
         </div>
       </div>
 
-      {/* In-App Remote OTA Live Update (Android APK skips APK reinstall!) */}
+      {/* Application Update: Read-only Repo + Branch & Commit Selector */}
       <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-4">
         <div className="flex items-center justify-between gap-2">
-          <div>
-            <h2 className="font-semibold text-sm flex items-center gap-1.5">
-              <Sparkles className="w-4 h-4" />
-              远程在线更新（免重装 APK）
-            </h2>
-            <p className="text-xs text-[var(--text-muted)] mt-0.5">
-              当前版本 <span className="font-mono font-semibold text-[var(--text-primary)]">v{currentAppVer}</span>
-              {nativeOta.isOtaActive ? '（热更新版）' : '（内置版）'}
-            </p>
+          <div className="flex items-center gap-2 min-w-0">
+            <GitBranch className="w-4 h-4 text-[var(--text-secondary)] shrink-0" />
+            <h2 className="font-semibold text-sm">应用更新</h2>
           </div>
-          {nativeOta.isOtaActive && (
-            <button
-              type="button"
-              onClick={() => {
-                if (confirm('恢复为安装包内置版本？')) resetNativeOta();
-              }}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg zw-btn-secondary text-[11px] cursor-pointer"
-            >
-              <RotateCcw className="w-3 h-3" />
-              恢复内置
-            </button>
-          )}
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div>
-            <label className="block text-[11px] text-[var(--text-muted)] mb-1">GitHub 仓库</label>
-            <input
-              value={otaConfig.repo}
-              onChange={(e) => setOtaConfig((p) => ({ ...p, repo: e.target.value }))}
-              placeholder="huangkun666/zhiwu"
-              className="w-full px-3 py-2 rounded-xl zw-input text-xs font-mono"
-            />
-          </div>
-          <div>
-            <label className="block text-[11px] text-[var(--text-muted)] mb-1">
-              GitHub Token <span className="opacity-70">（私有仓库必填，公开留空）</span>
-            </label>
-            <div className="relative">
-              <input
-                type={showOtaToken ? 'text' : 'password'}
-                value={otaConfig.token}
-                onChange={(e) => setOtaConfig((p) => ({ ...p, token: e.target.value }))}
-                placeholder="ghp_...（私有库填写一次即可）"
-                className="w-full pl-3 pr-9 py-2 rounded-xl zw-input text-xs font-mono"
-              />
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-[11px] font-mono text-[var(--text-muted)]">
+              {currentRef.branch} @ {currentRef.shortSha}
+            </span>
+            {nativeOta.isOtaActive && (
               <button
                 type="button"
-                onClick={() => setShowOtaToken(!showOtaToken)}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)] cursor-pointer"
+                onClick={() => {
+                  if (confirm('恢复为安装包内置版本？')) resetNativeOta();
+                }}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg zw-btn-secondary text-[11px] cursor-pointer"
               >
-                {showOtaToken ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                <RotateCcw className="w-3 h-3" />
+                恢复内置
               </button>
-            </div>
+            )}
           </div>
+        </div>
+
+        {/* Read-only repository row + Check button */}
+        <div className="flex items-center justify-between gap-2.5 min-w-0">
+          <div
+            className="flex-1 min-w-0 px-3 py-2 rounded-xl border text-xs font-mono text-[var(--text-secondary)] truncate select-all"
+            style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+          >
+            {OTA_REPO}
+          </div>
+          <button
+            type="button"
+            onClick={handleCheckOta}
+            disabled={checkingOta || Boolean(otaProgress)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl zw-btn-secondary text-xs font-medium shrink-0 whitespace-nowrap cursor-pointer disabled:opacity-50"
+          >
+            {checkingOta ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+            检查更新
+          </button>
         </div>
 
         {otaError && (
@@ -666,63 +671,256 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
           </div>
         )}
 
-        {remoteRelease && (
-          <div
-            className="p-3.5 rounded-xl border space-y-2 text-xs"
-            style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-semibold">
-                {remoteRelease.hasUpdate ? `发现新版本 v${remoteRelease.version}` : `已是最新版本 (v${remoteRelease.version})`}
-              </span>
-              {remoteRelease.updatedAt && (
-                <span className="text-[10px] text-[var(--text-muted)]">
-                  {new Date(remoteRelease.updatedAt).toLocaleString()}
-                </span>
-              )}
-            </div>
-            <p className="text-[var(--text-secondary)] leading-relaxed">{remoteRelease.changelog}</p>
-            {remoteRelease.hasUpdate && (
-              <div className="pt-1 flex flex-wrap gap-2">
-                {!remoteRelease.needsApkReinstall && nativeOta.isNative ? (
-                  <button
-                    type="button"
-                    disabled={Boolean(otaProgress)}
-                    onClick={handleApplyOta}
-                    className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer disabled:opacity-50"
-                  >
-                    立即一键热更新（无需重装 APK）
-                  </button>
-                ) : remoteRelease.needsApkReinstall ? (
-                  <a
-                    href={remoteRelease.apkDownloadUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold inline-block"
-                  >
-                    包含底层升级，点击下载新版 APK
-                  </a>
-                ) : (
-                  <span className="text-[11px] text-[var(--text-muted)]">
-                    提示：请在安卓手机 App 内点击「立即热更新」直接免重装生效。
+        {updateInfo && (
+          <div className="space-y-4 pt-1">
+            {/* 1. Current Branch Status */}
+            {updateInfo.currentBranchInfo && (
+              <div
+                className="p-3.5 rounded-xl border space-y-2.5"
+                style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-xs font-semibold truncate">
+                      {updateInfo.currentBranchInfo.hasUpdate
+                        ? `${updateInfo.currentBranchInfo.name} 有 ${updateInfo.currentBranchInfo.aheadBy} 个新提交`
+                        : `${updateInfo.currentBranchInfo.name} 已是最新`}
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-mono text-[var(--text-muted)] shrink-0">
+                    {updateInfo.currentBranchInfo.headShortSha}
                   </span>
+                </div>
+
+                <div className="text-xs text-[var(--text-secondary)] truncate">
+                  {updateInfo.currentBranchInfo.headMessage}
+                  {updateInfo.currentBranchInfo.headDate && (
+                    <span className="text-[var(--text-muted)] ml-2">
+                      {formatRelativeTime(updateInfo.currentBranchInfo.headDate)}
+                    </span>
+                  )}
+                </div>
+
+                {updateInfo.currentBranchInfo.hasUpdate && (
+                  <div className="pt-0.5 flex flex-wrap items-center gap-2">
+                    {updateInfo.currentBranchInfo.headBundle ? (
+                      updateInfo.currentBranchInfo.headBundle.nativeVersion > nativeOta.nativeVersion ? (
+                        <a
+                          href={updateInfo.apkDownloadUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="px-3.5 py-1.5 rounded-xl zw-btn-primary text-xs font-semibold inline-block"
+                        >
+                          下载新版 APK
+                        </a>
+                      ) : nativeOta.isNative ? (
+                        <button
+                          type="button"
+                          disabled={Boolean(otaProgress)}
+                          onClick={() => {
+                            const b = updateInfo.currentBranchInfo!;
+                            handleApplyCommit(b.name, {
+                              sha: b.headSha,
+                              shortSha: b.headShortSha,
+                              message: b.headMessage,
+                              date: b.headDate,
+                              author: '',
+                              isCurrent: false,
+                              bundle: b.headBundle,
+                              needsApkReinstall: false,
+                              isBuildingLikely: false,
+                            });
+                          }}
+                          className="px-3.5 py-1.5 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer disabled:opacity-50"
+                        >
+                          更新到最新 ({updateInfo.currentBranchInfo.headShortSha})
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-[var(--text-muted)]">当前环境不支持端内应用更新</span>
+                      )
+                    ) : (
+                      <span className="text-[11px] text-[var(--text-muted)]">最新提交构建中，请稍后刷新</span>
+                    )}
+                  </div>
                 )}
               </div>
             )}
+
+            {/* 2. Non-current branches with new commits */}
+            {updateInfo.otherUpdatedBranches.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">其他分支有新提交</span>
+                  <span className="text-[11px] text-[var(--text-muted)]">
+                    {updateInfo.otherUpdatedBranches.length} 个分支
+                  </span>
+                </div>
+                <div
+                  className="rounded-xl border divide-y overflow-hidden"
+                  style={{ borderColor: 'var(--border-hairline)', background: 'var(--bg-subtle)' }}
+                >
+                  {updateInfo.otherUpdatedBranches.map((b) => {
+                    const isViewing = selectedBranch === b.name;
+                    return (
+                      <div
+                        key={b.name}
+                        className="px-3.5 py-2.5 flex items-center justify-between gap-3"
+                        style={{ borderColor: 'var(--border-hairline)' }}
+                      >
+                        <div className="min-w-0 flex-1 space-y-0.5">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-xs font-mono font-semibold truncate">{b.name}</span>
+                            <span
+                              className="px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0"
+                              style={{ background: 'var(--bg-active)', color: 'var(--text-primary)' }}
+                            >
+                              +{b.aheadBy}
+                            </span>
+                            {b.headDate && (
+                              <span className="text-[10px] text-[var(--text-muted)] shrink-0">
+                                {formatRelativeTime(b.headDate)}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-[var(--text-muted)] truncate">
+                            <span className="font-mono mr-1.5">{b.headShortSha}</span>
+                            {b.headMessage}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => loadCommitsForBranch(b.name, updateInfo)}
+                          className="px-2.5 py-1 rounded-lg zw-btn-secondary text-[11px] shrink-0 cursor-pointer"
+                          style={
+                            isViewing
+                              ? { background: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)', borderColor: 'transparent' }
+                              : undefined
+                          }
+                        >
+                          {isViewing ? '已选中' : '查看'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 3. Branch & Commit Selector */}
+            <div className="space-y-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 items-end">
+                <div>
+                  <label className="block text-[11px] text-[var(--text-muted)] mb-1">分支</label>
+                  <select
+                    value={selectedBranch}
+                    onChange={(e) => loadCommitsForBranch(e.target.value, updateInfo)}
+                    className="w-full px-3 py-2 rounded-xl zw-input text-xs font-mono"
+                  >
+                    {updateInfo.branches.map((b) => (
+                      <option key={b.name} value={b.name}>
+                        {b.name}
+                        {b.isCurrent ? ' (当前)' : ''}
+                        {b.hasUpdate ? ` (+${b.aheadBy})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="text-[11px] text-[var(--text-muted)] sm:text-right pb-1">
+                  共 {branchCommits.length} 条提交
+                </div>
+              </div>
+
+              <div
+                className="rounded-xl border divide-y max-h-64 overflow-y-auto"
+                style={{ borderColor: 'var(--border-hairline)', background: 'var(--bg-subtle)' }}
+              >
+                {loadingCommits ? (
+                  <div className="p-4 flex items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    加载提交记录...
+                  </div>
+                ) : branchCommits.length === 0 ? (
+                  <div className="p-4 text-center text-xs text-[var(--text-muted)]">暂无提交记录</div>
+                ) : (
+                  branchCommits.map((c) => {
+                    const isSelected = selectedCommitSha === c.sha;
+                    const selectable = Boolean(c.bundle) && !c.isCurrent;
+                    return (
+                      <button
+                        key={c.sha}
+                        type="button"
+                        onClick={() => setSelectedCommitSha(c.sha)}
+                        className="w-full text-left px-3.5 py-2.5 flex items-center justify-between gap-2.5 transition cursor-pointer"
+                        style={{
+                          borderColor: 'var(--border-hairline)',
+                          background: isSelected ? 'var(--bg-active)' : 'transparent',
+                        }}
+                      >
+                        <div className="min-w-0 flex-1 space-y-0.5">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <GitCommitHorizontal className="w-3.5 h-3.5 text-[var(--text-muted)] shrink-0" />
+                            <span className="text-xs font-mono font-semibold shrink-0">{c.shortSha}</span>
+                            <span className="text-xs text-[var(--text-primary)] truncate">{c.message}</span>
+                          </div>
+                          <div className="text-[10px] text-[var(--text-muted)] pl-5">
+                            {formatRelativeTime(c.date)}
+                          </div>
+                        </div>
+                        <span
+                          className="px-2 py-0.5 rounded-md text-[10px] shrink-0 border"
+                          style={
+                            c.isCurrent
+                              ? { background: 'var(--ok-bg)', borderColor: 'var(--ok-border)', color: 'var(--ok-fg)' }
+                              : selectable
+                                ? { background: 'var(--bg-card-solid)', borderColor: 'var(--border-strong)', color: 'var(--text-primary)' }
+                                : { background: 'transparent', borderColor: 'var(--border-hairline)', color: 'var(--text-muted)' }
+                          }
+                        >
+                          {c.isCurrent ? '当前' : c.bundle ? '可切换' : c.isBuildingLikely ? '构建中' : '无构建包'}
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+
+              {selectedCommitObj && !selectedCommitObj.isCurrent && (
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                  <span className="text-[11px] font-mono text-[var(--text-muted)]">
+                    目标：{selectedBranch} @ {selectedCommitObj.shortSha}
+                  </span>
+                  {selectedCommitObj.needsApkReinstall ? (
+                    <a
+                      href={updateInfo.apkDownloadUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold inline-block"
+                    >
+                      下载新版 APK
+                    </a>
+                  ) : selectedCommitObj.bundle ? (
+                    nativeOta.isNative ? (
+                      <button
+                        type="button"
+                        disabled={Boolean(otaProgress)}
+                        onClick={() => handleApplyCommit(selectedBranch, selectedCommitObj)}
+                        className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer disabled:opacity-50"
+                      >
+                        切换到 {selectedBranch} @ {selectedCommitObj.shortSha}
+                      </button>
+                    ) : (
+                      <span className="text-[11px] text-[var(--text-muted)]">请在安卓端执行切换</span>
+                    )
+                  ) : (
+                    <span className="text-[11px] text-[var(--text-muted)]">
+                      {selectedCommitObj.isBuildingLikely ? '该提交构建中' : '该提交无可用构建包'}
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
-
-        <div className="flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={handleCheckOta}
-            disabled={checkingOta || Boolean(otaProgress)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer disabled:opacity-50"
-          >
-            {checkingOta ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-            检查远程更新
-          </button>
-        </div>
       </div>
 
       <QrSendModal open={qrSendOpen} onClose={() => setQrSendOpen(false)} />

@@ -2,28 +2,40 @@ name: Build Zhiwu Android APK & OTA Update
 
 on:
   push:
-    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: zhiwu-ota-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-apk:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Compute release version
+      - name: Compute build metadata
         id: ver
         run: |
           VERSION="1.0.${{ github.run_number }}"
+          FULL_SHA="${GITHUB_SHA}"
           SHORT_SHA="${GITHUB_SHA::7}"
+          BRANCH="${GITHUB_REF_NAME}"
           MSG=$(git log -1 --pretty=%s)
+          IS_MAIN="false"
+          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            IS_MAIN="true"
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "full_sha=${FULL_SHA}" >> "$GITHUB_OUTPUT"
           echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
           echo "msg=${MSG}" >> "$GITHUB_OUTPUT"
+          echo "is_main=${IS_MAIN}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
@@ -32,18 +44,40 @@ jobs:
           cache: 'npm'
           cache-dependency-path: client/package-lock.json
 
+      - name: Build standalone mobile web bundle
+        working-directory: client
+        env:
+          VITE_STANDALONE: 'true'
+          VITE_APP_VERSION: ${{ steps.ver.outputs.version }}
+          VITE_APP_BRANCH: ${{ steps.ver.outputs.branch }}
+          VITE_APP_COMMIT: ${{ steps.ver.outputs.full_sha }}
+        run: |
+          npm ci || npm install
+          npm run build
+
+      - name: Package per-commit OTA bundle
+        working-directory: client/dist
+        env:
+          SHORT_SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          zip -rq "../../web-bundle-${SHORT_SHA}.zip" .
+          cp "../../web-bundle-${SHORT_SHA}.zip" ../../web-bundle.zip
+
       - name: Setup Java 21
+        if: steps.ver.outputs.is_main == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
 
       - name: Setup Android SDK (API 36)
+        if: steps.ver.outputs.is_main == 'true'
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-36 build-tools;36.0.0 platform-tools'
 
       - name: Cache Gradle dependencies
+        if: steps.ver.outputs.is_main == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -53,48 +87,118 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      - name: Install dependencies & build standalone mobile bundle
-        working-directory: client
-        env:
-          VITE_STANDALONE: 'true'
-          VITE_APP_VERSION: ${{ steps.ver.outputs.version }}
+      - name: Sync Capacitor & build Android APK
+        if: steps.ver.outputs.is_main == 'true'
         run: |
-          npm ci || npm install
-          npm run build
+          cd client
           npx cap sync android
-
-      - name: Package OTA web-bundle.zip
-        working-directory: client/dist
-        run: |
-          zip -rq ../../web-bundle.zip .
-
-      - name: Build Android APK
-        working-directory: client/android
-        run: |
+          cd android
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
           ./gradlew assembleDebug
           cp app/build/outputs/apk/debug/app-debug.apk ../../zhiwu-android.apk
 
       - name: Upload Zhiwu APK Artifact
+        if: steps.ver.outputs.is_main == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: zhiwu-android-apk
           path: zhiwu-android.apk
           retention-days: 30
 
-      - name: Publish Rolling OTA GitHub Release (latest-ota)
+      - name: Publish OTA bundle to persistent Release (latest-ota)
         env:
           GH_TOKEN: ${{ github.token }}
           APP_VER: ${{ steps.ver.outputs.version }}
+          APP_BRANCH: ${{ steps.ver.outputs.branch }}
+          APP_SHA: ${{ steps.ver.outputs.full_sha }}
+          APP_SHORT_SHA: ${{ steps.ver.outputs.sha }}
           APP_MSG: ${{ steps.ver.outputs.msg }}
+          IS_MAIN: ${{ steps.ver.outputs.is_main }}
         run: |
-          META_JSON=$(node -e 'console.log(JSON.stringify({version: process.env.APP_VER, nativeVersion: 2, changelog: process.env.APP_MSG}))')
-          BODY="<!--ZHIWU_META:${META_JSON}-->"$'\n'"### 知悟 v${APP_VER}"$'\n'"${APP_MSG}"
-          gh release delete latest-ota --yes || true
-          git push origin :refs/tags/latest-ota || true
-          gh release create latest-ota \
-            web-bundle.zip \
-            zhiwu-android.apk \
-            --title "v${APP_VER}" \
-            --notes "$BODY"
+          if ! gh release view latest-ota >/dev/null 2>&1; then
+            gh release create latest-ota --title "OTA Builds" --notes "Zhiwu OTA Releases"
+          fi
+
+          gh release upload latest-ota "web-bundle-${APP_SHORT_SHA}.zip" --clobber
+          if [ "$IS_MAIN" = "true" ]; then
+            gh release upload latest-ota web-bundle.zip zhiwu-android.apk --clobber
+          fi
+
+          node <<'EOF'
+          const { execFileSync } = require('child_process');
+          const fs = require('fs');
+
+          const rel = JSON.parse(
+            execFileSync('gh', ['release', 'view', 'latest-ota', '--json', 'body,assets'], { encoding: 'utf8' })
+          );
+          const body = rel.body || '';
+
+          let builds = {};
+          const bm = body.match(/<!--ZHIWU_BUILDS:(.*?)-->/);
+          if (bm && bm[1]) {
+            try { builds = JSON.parse(bm[1]) || {}; } catch {}
+          }
+
+          let mainMeta = null;
+          const mm = body.match(/<!--ZHIWU_META:(.*?)-->/);
+          if (mm && mm[1]) {
+            try { mainMeta = JSON.parse(mm[1]); } catch {}
+          }
+
+          const shortSha = process.env.APP_SHORT_SHA.toLowerCase();
+          builds[shortSha] = {
+            sha: process.env.APP_SHA,
+            shortSha,
+            branch: process.env.APP_BRANCH,
+            version: process.env.APP_VER,
+            nativeVersion: 2,
+            message: process.env.APP_MSG,
+            builtAt: new Date().toISOString(),
+          };
+
+          if (process.env.IS_MAIN === 'true' || !mainMeta) {
+            mainMeta = {
+              version: process.env.APP_VER,
+              nativeVersion: 2,
+              branch: process.env.APP_BRANCH,
+              commit: shortSha,
+              changelog: process.env.APP_MSG,
+            };
+          }
+
+          // Prune commit bundles beyond the 25 most recent to keep storage clean
+          const commitAssets = (rel.assets || [])
+            .filter((a) => /^web-bundle-[0-9a-f]{7,}\.zip$/i.test(a.name))
+            .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime());
+
+          const keepSet = new Set();
+          commitAssets.forEach((asset, idx) => {
+            const m = asset.name.match(/^web-bundle-([0-9a-f]{7,})\.zip$/i);
+            const shaKey = m ? m[1].toLowerCase().slice(0, 7) : '';
+            if (idx < 25) {
+              keepSet.add(shaKey);
+            } else {
+              try {
+                execFileSync('gh', ['release', 'delete-asset', 'latest-ota', asset.name, '--yes'], { stdio: 'inherit' });
+              } catch {}
+            }
+          });
+          keepSet.add(shortSha);
+
+          for (const key of Object.keys(builds)) {
+            if (!keepSet.has(key)) delete builds[key];
+          }
+
+          const notes = [
+            `<!--ZHIWU_META:${JSON.stringify(mainMeta)}-->`,
+            `<!--ZHIWU_BUILDS:${JSON.stringify(builds)}-->`,
+            `### 知悟 OTA 更新索引`,
+            `最近构建：\`${process.env.APP_BRANCH}\` @ \`${shortSha}\` — ${process.env.APP_MSG}`,
+          ].join('\n');
+
+          fs.writeFileSync('/tmp/ota_notes.md', notes, 'utf8');
+          execFileSync('gh', ['release', 'edit', 'latest-ota', '--title', `v${mainMeta.version}`, '--notes-file', '/tmp/ota_notes.md'], {
+            stdio: 'inherit',
+          });
+          EOF
