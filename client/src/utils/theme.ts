@@ -27,6 +27,11 @@ export function applyTheme(mode: ThemeMode) {
     metaTheme.setAttribute('content', mode === 'dark' ? '#09090B' : '#ECEEF2');
   }
   try {
+    (window as any).ZhiwuNative?.setTheme?.(mode === 'dark');
+  } catch {
+    // ignore outside native Android
+  }
+  try {
     localStorage.setItem(STORAGE_KEY, mode);
   } catch {
     // ignore

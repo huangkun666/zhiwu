@@ -174,7 +174,7 @@ export function Layout({
 
       {/* Mobile Top Glass Header */}
       <header
-        className="md:hidden sticky top-0 z-30 flex items-center justify-between px-4 py-3 zw-glass border-b"
+        className="md:hidden sticky top-0 z-30 flex items-center justify-between px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] zw-glass border-b"
       >
         <button onClick={() => onNavigate('home')} className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-lg zw-btn-primary flex items-center justify-center text-xs font-bold">
