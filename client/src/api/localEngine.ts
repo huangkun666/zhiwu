@@ -1,3 +1,4 @@
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import type {
   ActiveModelCapability,
   AIProviderConfig,
@@ -562,7 +563,8 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
   }
 
   if (ext === '.docx') {
-    const mammoth = await import('mammoth');
+    const mammothMod: any = await import('mammoth');
+    const mammoth = mammothMod.default || mammothMod;
     const arrayBuffer = await file.arrayBuffer();
     const res = await mammoth.extractRawText({ arrayBuffer });
     return { title: baseTitle, content: (res.value || '').trim() || `> 已导入 Word 文档：\`${name}\``, sourceType: 'docx' };
@@ -570,20 +572,25 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
 
   if (ext === '.pdf' || file.type === 'application/pdf') {
     const pdfjs = await import('pdfjs-dist');
-    // Disable external worker requirement on Android WebView for maximum offline reliability
+    if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+      pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+    }
     const arrayBuffer = await file.arrayBuffer();
-    const loadingTask = pdfjs.getDocument({ data: new Uint8Array(arrayBuffer), useWorkerFetch: false });
+    const loadingTask = pdfjs.getDocument({ data: new Uint8Array(arrayBuffer) });
     const pdf = await loadingTask.promise;
     const pages: string[] = [];
-    for (let i = 1; i <= Math.min(pdf.numPages, 60); i++) {
+    for (let i = 1; i <= Math.min(pdf.numPages, 80); i++) {
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
-      pages.push(tc.items.map((it: any) => it.str || '').join(' '));
+      const line = tc.items.map((it: any) => it.str || '').join(' ').replace(/\s{2,}/g, ' ').trim();
+      if (line) pages.push(line);
     }
     const text = pages.join('\n\n').trim();
     return {
       title: baseTitle,
-      content: text ? `> 来源 PDF：\`${name}\`（共 ${pdf.numPages} 页）\n\n${text}` : `> 来源 PDF：\`${name}\`（未提取到纯文本，可能为扫描版 PDF）`,
+      content: text
+        ? `> 来源 PDF：\`${name}\`（共 ${pdf.numPages} 页）\n\n${text}`
+        : `> 来源 PDF：\`${name}\`（共 ${pdf.numPages} 页，未提取到可选中文字层，可能是纯扫描图片版 PDF，建议截图后用拍照识图导入）`,
       sourceType: 'pdf',
     };
   }

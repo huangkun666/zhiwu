@@ -1,9 +1,12 @@
-name: Build Zhiwu Android APK
+name: Build Zhiwu Android APK & OTA Update
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-apk:
@@ -11,6 +14,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Compute release version
+        id: ver
+        run: |
+          VERSION="1.0.${{ github.run_number }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          MSG=$(git log -1 --pretty=%s)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "msg=${MSG}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
@@ -44,10 +57,16 @@ jobs:
         working-directory: client
         env:
           VITE_STANDALONE: 'true'
+          VITE_APP_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           npm ci || npm install
           npm run build
           npx cap sync android
+
+      - name: Package OTA web-bundle.zip
+        working-directory: client/dist
+        run: |
+          zip -rq ../../web-bundle.zip .
 
       - name: Build Android APK
         working-directory: client/android
@@ -55,11 +74,27 @@ jobs:
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
           ./gradlew assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk zhiwu-android.apk
+          cp app/build/outputs/apk/debug/app-debug.apk ../../zhiwu-android.apk
 
       - name: Upload Zhiwu APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: zhiwu-android-apk
-          path: client/android/zhiwu-android.apk
+          path: zhiwu-android.apk
           retention-days: 30
+
+      - name: Publish Rolling OTA GitHub Release (latest-ota)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VER: ${{ steps.ver.outputs.version }}
+          APP_MSG: ${{ steps.ver.outputs.msg }}
+        run: |
+          META_JSON=$(node -e 'console.log(JSON.stringify({version: process.env.APP_VER, nativeVersion: 2, changelog: process.env.APP_MSG}))')
+          BODY="<!--ZHIWU_META:${META_JSON}-->"$'\n'"### 知悟 v${APP_VER}"$'\n'"${APP_MSG}"
+          gh release delete latest-ota --yes || true
+          git push origin :refs/tags/latest-ota || true
+          gh release create latest-ota \
+            web-bundle.zip \
+            zhiwu-android.apk \
+            --title "v${APP_VER}" \
+            --notes "$BODY"

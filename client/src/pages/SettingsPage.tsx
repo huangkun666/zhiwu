@@ -13,7 +13,9 @@ import {
   Moon,
   QrCode,
   RefreshCw,
+  RotateCcw,
   Save,
+  Sparkles,
   Sun,
   Upload,
   Zap,
@@ -22,6 +24,16 @@ import { api, IS_STANDALONE_MODE } from '../api/client';
 import { QrScannerModal } from '../components/QrScannerModal';
 import { QrSendModal } from '../components/QrSendModal';
 import type { AIProviderConfig, AISettings } from '../types';
+import {
+  checkRemoteUpdate,
+  getCurrentDisplayVersion,
+  getNativeOtaState,
+  getOtaConfig,
+  resetNativeOta,
+  saveOtaConfig,
+  triggerNativeOtaUpdate,
+  type RemoteReleaseInfo,
+} from '../utils/ota';
 import type { ThemeMode } from '../utils/theme';
 
 interface SettingsPageProps {
@@ -48,6 +60,16 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
   const [modelsError, setModelsError] = useState('');
   const [qrSendOpen, setQrSendOpen] = useState(false);
   const [qrScanOpen, setQrScanOpen] = useState(false);
+
+  // In-App OTA Live Update state
+  const [otaConfig, setOtaConfig] = useState(getOtaConfig);
+  const [showOtaToken, setShowOtaToken] = useState(false);
+  const [checkingOta, setCheckingOta] = useState(false);
+  const [remoteRelease, setRemoteRelease] = useState<RemoteReleaseInfo | null>(null);
+  const [otaProgress, setOtaProgress] = useState('');
+  const [otaError, setOtaError] = useState('');
+  const nativeOta = getNativeOtaState();
+  const currentAppVer = getCurrentDisplayVersion();
 
   useEffect(() => {
     api.getSettings().then((s) => {
@@ -154,6 +176,45 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
       onSettingsChanged?.();
     } catch (err: any) {
       alert(err.message || '导入失败');
+    }
+  };
+
+  const handleCheckOta = async () => {
+    saveOtaConfig(otaConfig);
+    setCheckingOta(true);
+    setOtaError('');
+    setRemoteRelease(null);
+    try {
+      const info = await checkRemoteUpdate(otaConfig);
+      setRemoteRelease(info);
+    } catch (e: any) {
+      setOtaError(e.message || '检查更新失败');
+    } finally {
+      setCheckingOta(false);
+    }
+  };
+
+  const handleApplyOta = () => {
+    if (!remoteRelease) return;
+    setOtaError('');
+    setOtaProgress('正在连接 GitHub 下载更新包...');
+    try {
+      triggerNativeOtaUpdate(
+        remoteRelease.bundleDownloadUrl,
+        remoteRelease.version,
+        otaConfig.token,
+        (ev) => {
+          if (ev.status === 'error') {
+            setOtaProgress('');
+            setOtaError(ev.message);
+          } else {
+            setOtaProgress(ev.message);
+          }
+        }
+      );
+    } catch (e: any) {
+      setOtaProgress('');
+      setOtaError(e.message || '启动热更新失败');
     }
   };
 
@@ -523,6 +584,144 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
               下载原始 SQLite (.db)
             </a>
           )}
+        </div>
+      </div>
+
+      {/* In-App Remote OTA Live Update (Android APK skips APK reinstall!) */}
+      <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-4">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h2 className="font-semibold text-sm flex items-center gap-1.5">
+              <Sparkles className="w-4 h-4" />
+              远程在线更新（免重装 APK）
+            </h2>
+            <p className="text-xs text-[var(--text-muted)] mt-0.5">
+              当前版本 <span className="font-mono font-semibold text-[var(--text-primary)]">v{currentAppVer}</span>
+              {nativeOta.isOtaActive ? '（热更新版）' : '（内置版）'}
+            </p>
+          </div>
+          {nativeOta.isOtaActive && (
+            <button
+              type="button"
+              onClick={() => {
+                if (confirm('恢复为安装包内置版本？')) resetNativeOta();
+              }}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg zw-btn-secondary text-[11px] cursor-pointer"
+            >
+              <RotateCcw className="w-3 h-3" />
+              恢复内置
+            </button>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="block text-[11px] text-[var(--text-muted)] mb-1">GitHub 仓库</label>
+            <input
+              value={otaConfig.repo}
+              onChange={(e) => setOtaConfig((p) => ({ ...p, repo: e.target.value }))}
+              placeholder="huangkun666/zhiwu"
+              className="w-full px-3 py-2 rounded-xl zw-input text-xs font-mono"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] text-[var(--text-muted)] mb-1">
+              GitHub Token <span className="opacity-70">（私有仓库必填，公开留空）</span>
+            </label>
+            <div className="relative">
+              <input
+                type={showOtaToken ? 'text' : 'password'}
+                value={otaConfig.token}
+                onChange={(e) => setOtaConfig((p) => ({ ...p, token: e.target.value }))}
+                placeholder="ghp_...（私有库填写一次即可）"
+                className="w-full pl-3 pr-9 py-2 rounded-xl zw-input text-xs font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => setShowOtaToken(!showOtaToken)}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)] cursor-pointer"
+              >
+                {showOtaToken ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {otaError && (
+          <div
+            className="p-3 rounded-xl border text-xs"
+            style={{ background: 'var(--danger-bg)', borderColor: 'var(--danger-border)', color: 'var(--danger-fg)' }}
+          >
+            {otaError}
+          </div>
+        )}
+
+        {otaProgress && (
+          <div
+            className="p-3 rounded-xl border text-xs flex items-center gap-2"
+            style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+          >
+            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span>{otaProgress}</span>
+          </div>
+        )}
+
+        {remoteRelease && (
+          <div
+            className="p-3.5 rounded-xl border space-y-2 text-xs"
+            style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold">
+                {remoteRelease.hasUpdate ? `发现新版本 v${remoteRelease.version}` : `已是最新版本 (v${remoteRelease.version})`}
+              </span>
+              {remoteRelease.updatedAt && (
+                <span className="text-[10px] text-[var(--text-muted)]">
+                  {new Date(remoteRelease.updatedAt).toLocaleString()}
+                </span>
+              )}
+            </div>
+            <p className="text-[var(--text-secondary)] leading-relaxed">{remoteRelease.changelog}</p>
+            {remoteRelease.hasUpdate && (
+              <div className="pt-1 flex flex-wrap gap-2">
+                {!remoteRelease.needsApkReinstall && nativeOta.isNative ? (
+                  <button
+                    type="button"
+                    disabled={Boolean(otaProgress)}
+                    onClick={handleApplyOta}
+                    className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer disabled:opacity-50"
+                  >
+                    立即一键热更新（无需重装 APK）
+                  </button>
+                ) : remoteRelease.needsApkReinstall ? (
+                  <a
+                    href={remoteRelease.apkDownloadUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold inline-block"
+                  >
+                    包含底层升级，点击下载新版 APK
+                  </a>
+                ) : (
+                  <span className="text-[11px] text-[var(--text-muted)]">
+                    提示：请在安卓手机 App 内点击「立即热更新」直接免重装生效。
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={handleCheckOta}
+            disabled={checkingOta || Boolean(otaProgress)}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer disabled:opacity-50"
+          >
+            {checkingOta ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+            检查远程更新
+          </button>
         </div>
       </div>
 
