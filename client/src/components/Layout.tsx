@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   BookOpen,
   FileCheck2,
@@ -48,6 +48,36 @@ export function Layout({
   badges,
   children,
 }: LayoutProps) {
+  // Automatically hide mobile bottom tab bar when soft keyboard is open (native app feel)
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+
+  useEffect(() => {
+    const checkViewport = () => {
+      const vv = window.visualViewport;
+      if (!vv) return;
+      // When keyboard pops up on mobile, visualViewport height shrinks noticeably
+      const activeTag = document.activeElement?.tagName;
+      const isTextFocused = activeTag === 'INPUT' || activeTag === 'TEXTAREA';
+      setKeyboardOpen(isTextFocused && vv.height < window.screen.height * 0.72);
+    };
+    const onFocusIn = (e: FocusEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') {
+        setTimeout(checkViewport, 120);
+      }
+    };
+    const onFocusOut = () => setTimeout(() => setKeyboardOpen(false), 120);
+
+    window.visualViewport?.addEventListener('resize', checkViewport);
+    document.addEventListener('focusin', onFocusIn);
+    document.addEventListener('focusout', onFocusOut);
+    return () => {
+      window.visualViewport?.removeEventListener('resize', checkViewport);
+      document.removeEventListener('focusin', onFocusIn);
+      document.removeEventListener('focusout', onFocusOut);
+    };
+  }, []);
+
   const getBadge = (id: PageId) => {
     if (id === 'review' && badges.dueReviews > 0) return badges.dueReviews;
     if (id === 'practice' && badges.activeMistakes > 0) return badges.activeMistakes;
@@ -219,11 +249,12 @@ export function Layout({
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 md:pl-60 pb-22 md:pb-10 min-h-screen">
+      <main className={`flex-1 md:pl-60 ${keyboardOpen ? 'pb-4' : 'pb-22'} md:pb-10 min-h-screen`}>
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-7">{children}</div>
       </main>
 
-      {/* Mobile Frosted Bottom Tab Bar */}
+      {/* Mobile Frosted Bottom Tab Bar (auto-hides while typing on soft keyboard) */}
+      {!keyboardOpen && (
       <nav className="md:hidden fixed bottom-0 inset-x-0 z-30 zw-glass border-t px-1 pt-1.5 pb-safe">
         <div className="grid grid-cols-5">
           {CORE_NAV_ITEMS.map((item) => {
@@ -257,6 +288,7 @@ export function Layout({
           })}
         </div>
       </nav>
+      )}
     </div>
   );
 }

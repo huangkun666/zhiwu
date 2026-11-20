@@ -223,11 +223,11 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
           <h2 className="font-semibold text-sm">AI 模型配置</h2>
         </div>
 
-        {/* Remote vs Local Switcher */}
+        {/* Remote vs Local Switcher (clean single-line, zero redundant subtitle) */}
         <div className="grid grid-cols-2 gap-2.5">
           {[
-            { id: 'remote' as const, label: '远程模型', sub: 'API Key · 任意云端接口', icon: Cloud },
-            { id: 'local' as const, label: '本地模型', sub: 'Ollama / LM Studio / vLLM', icon: HardDrive },
+            { id: 'remote' as const, label: '远程模型', icon: Cloud },
+            { id: 'local' as const, label: '本地模型', icon: HardDrive },
           ].map((item) => {
             const Icon = item.icon;
             const isSelected = selectedId === item.id;
@@ -241,23 +241,22 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
                   setFetchedModels([]);
                   setModelsError('');
                 }}
-                className="text-left p-3.5 rounded-xl border transition cursor-pointer flex items-center justify-between gap-2"
+                className="px-3 py-3 rounded-xl border transition cursor-pointer flex items-center justify-center gap-2 whitespace-nowrap"
                 style={{
                   background: isSelected ? 'var(--btn-primary-bg)' : 'var(--bg-subtle)',
                   color: isSelected ? 'var(--btn-primary-fg)' : 'var(--text-primary)',
                   borderColor: isSelected ? 'transparent' : 'var(--border-hairline)',
                 }}
               >
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <Icon className="w-4 h-4 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold flex items-center gap-1.5">
-                      {item.label}
-                      {isActive && <span className="text-[10px] opacity-75">· 使用中</span>}
-                    </div>
-                    <div className="text-[10.5px] opacity-70 truncate mt-0.5">{item.sub}</div>
-                  </div>
-                </div>
+                <Icon className="w-4 h-4 shrink-0" />
+                <span className="text-xs font-semibold">{item.label}</span>
+                {isActive && (
+                  <span
+                    className="w-1.5 h-1.5 rounded-full shrink-0"
+                    style={{ background: isSelected ? 'var(--btn-primary-fg)' : 'var(--ok-fg)' }}
+                    title="当前启用"
+                  />
+                )}
               </button>
             );
           })}
@@ -318,24 +317,24 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
             </div>
           </div>
 
-          {/* Model Name + Fetch Live Model List */}
+          {/* Model Name + Fetch Live Model List (min-w-0 prevents right-edge overflow on mobile!) */}
           <div className="space-y-2.5">
             <label className="block text-xs text-[var(--text-secondary)]">模型名称</label>
-            <div className="flex gap-2">
+            <div className="flex items-stretch gap-2 min-w-0">
               <input
                 value={currentProvider.model}
                 onChange={(e) => updateProviderField('model', e.target.value)}
-                placeholder={selectedId === 'local' ? 'qwen2.5:7b / llava' : 'deepseek-chat / gpt-4o-mini / gemini-2.5-flash'}
-                className="flex-1 px-3.5 py-2.5 rounded-xl zw-input text-sm font-mono"
+                placeholder={selectedId === 'local' ? 'qwen2.5:7b / llava' : 'deepseek-chat / gpt-4o-mini'}
+                className="flex-1 min-w-0 px-3 py-2.5 rounded-xl zw-input text-sm font-mono"
               />
               <button
                 type="button"
                 onClick={handleFetchModels}
                 disabled={fetchingModels}
-                className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl zw-btn-secondary text-xs font-medium shrink-0 cursor-pointer disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl zw-btn-secondary text-xs font-medium shrink-0 whitespace-nowrap cursor-pointer disabled:opacity-50"
               >
                 {fetchingModels ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-                获取模型列表
+                获取列表
               </button>
             </div>
 

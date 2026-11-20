@@ -16,18 +16,17 @@ public class MainActivity extends BridgeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Apply real system bar + display cutout + keyboard insets so the WebView
-        // never overlaps the Android 15/16 status bar or bottom navigation pill.
+        // Only pad system bars & display cutout here.
+        // Do NOT pad IME insets here because the WebView window already resizes for the soft keyboard,
+        // otherwise keyboard height gets applied twice and creates a giant blank gap above the keyboard.
         View rootView = findViewById(android.R.id.content);
         if (rootView != null) {
             ViewCompat.setOnApplyWindowInsetsListener(rootView, (v, windowInsets) -> {
                 Insets bars = windowInsets.getInsets(
-                    WindowInsetsCompat.Type.systemBars()
-                        | WindowInsetsCompat.Type.displayCutout()
-                        | WindowInsetsCompat.Type.ime()
+                    WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout()
                 );
                 v.setPadding(bars.left, bars.top, bars.right, bars.bottom);
-                return WindowInsetsCompat.CONSUMED;
+                return windowInsets;
             });
             ViewCompat.requestApplyInsets(rootView);
         }

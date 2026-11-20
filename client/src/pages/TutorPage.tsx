@@ -185,7 +185,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
       : ['用生活类比帮我讲透核心原理', '提炼这份笔记最易混淆的 3 个考点', '这些知识实际怎么用？'];
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-[calc(100vh-8.5rem)] md:h-[calc(100vh-4.5rem)]">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-[calc(100dvh-8.2rem)] md:h-[calc(100vh-4.5rem)]">
       {toast && (
         <div className="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-xl zw-btn-primary text-xs font-medium shadow-lg">
           {toast}
