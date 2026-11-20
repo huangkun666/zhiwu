@@ -1,0 +1,108 @@
+{
+  "updatedAt": "2026-11-20T09:23:32.916Z",
+  "latestNativeVersion": 2,
+  "apkDownloadUrl": "https://github.com/huangkun666/zhiwu/releases/download/latest-ota/zhiwu-android.apk",
+  "bundlesBySha": {
+    "0a7cfb9": {
+      "sha": "0a7cfb9c4a661c9d5e2a5629a8e5894dd3ab43ed",
+      "shortSha": "0a7cfb9",
+      "branch": "main",
+      "version": "1.0.9",
+      "nativeVersion": 2,
+      "message": "feat(update): 只读仓库、公开免Token、支持分支与提交点选择及跨分支更新提示",
+      "builtAt": "2026-11-20T09:20:17.390Z",
+      "downloadUrl": "https://github.com/huangkun666/zhiwu/releases/download/latest-ota/web-bundle-0a7cfb9.zip"
+    },
+    "71d1c9a": {
+      "sha": "71d1c9a00b9d7a3fa01b53adad6a18589d49f6d7",
+      "shortSha": "71d1c9a",
+      "branch": "main",
+      "version": "1.0.10",
+      "nativeVersion": 2,
+      "message": "perf(update): 采用免限流 ota-index 静态索引，公开仓库零 Token 秒级检查全部分支与提交",
+      "builtAt": "2026-11-20T09:23:32.262Z",
+      "downloadUrl": "https://github.com/huangkun666/zhiwu/releases/download/latest-ota/web-bundle-71d1c9a.zip"
+    }
+  },
+  "branches": [
+    {
+      "name": "main",
+      "headSha": "71d1c9a00b9d7a3fa01b53adad6a18589d49f6d7",
+      "headShortSha": "71d1c9a",
+      "headMessage": "perf(update): 采用免限流 ota-index 静态索引，公开仓库零 Token 秒级检查全部分支与提交",
+      "headDate": "2026-11-20T17:22:10+08:00",
+      "commits": [
+        {
+          "sha": "71d1c9a00b9d7a3fa01b53adad6a18589d49f6d7",
+          "shortSha": "71d1c9a",
+          "message": "perf(update): 采用免限流 ota-index 静态索引，公开仓库零 Token 秒级检查全部分支与提交",
+          "date": "2026-11-20T17:22:10+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "0a7cfb9c4a661c9d5e2a5629a8e5894dd3ab43ed",
+          "shortSha": "0a7cfb9",
+          "message": "feat(update): 只读仓库、公开免Token、支持分支与提交点选择及跨分支更新提示",
+          "date": "2026-11-20T17:18:52+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "253d31f29c05f166bd692562d915bffada17ba10",
+          "shortSha": "253d31f",
+          "message": "feat(ota): 修复安卓离线PDF/Word解析并新增原生App内一键远程热更新模块",
+          "date": "2026-11-20T16:57:08+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "c2c9ad40ca087c09126e543465af41bf393d398b",
+          "shortSha": "c2c9ad4",
+          "message": "fix: 剥离图片笔记正文中的base64解决AI总结截断、修复原始图预览、适配推理模型测试与清理HTML标签",
+          "date": "2026-11-20T16:37:00+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "3cfbe24542ee15ca41966b6f08411da056285557",
+          "shortSha": "3cfbe24",
+          "message": "fix(mobile): 修复安卓键盘弹出双倍留白、打字自动隐藏底栏、模型列表按钮溢出及精简远程/本地卡片",
+          "date": "2026-11-20T15:45:51+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "56f08594cfa53264aca08d29bcb7df20d1ba94d4",
+          "shortSha": "56f0859",
+          "message": "fix(android): 适配 Android 15/16 Edge-to-Edge 状态栏与手势栏安全边距，并同步深浅主题状态栏图标",
+          "date": "2026-11-20T15:32:18+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "8822a02b08b37898748958e31b88504e9d6ad608",
+          "shortSha": "8822a02",
+          "message": "feat: 模型收敛为远程/本地两项、支持拉取模型列表、移除鸡肋局域网入口并新增扫码文件快传",
+          "date": "2026-11-20T15:23:17+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "82e8fc3097e1170734751c7c430f3b9c7b45a2bc",
+          "shortSha": "82e8fc3",
+          "message": "fix: 主题切换改为原子瞬时切换，消除深浅过渡期灰字闪烁",
+          "date": "2026-11-20T15:04:30+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "e8e40aa6fe520fb90e3d6a3a862ce88349077df0",
+          "shortSha": "e8e40aa",
+          "message": "feat: 深浅极简磨砂双主题、可关闭欢迎卡、流式助教、变式闭环与跨端JSON合并同步",
+          "date": "2026-11-20T15:00:41+08:00",
+          "author": "Huang Kun"
+        },
+        {
+          "sha": "9e0c72aae98f35c5497190a7d7bc2c54756d320e",
+          "shortSha": "9e0c72a",
+          "message": "feat: 初始化知悟个人AI学习平台（桌面端 + 安卓独立APK）",
+          "date": "2026-11-20T14:00:59+08:00",
+          "author": "Huang Kun"
+        }
+      ]
+    }
+  ]
+}
