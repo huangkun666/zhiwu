@@ -14,7 +14,13 @@ import {
   upsertConcept,
 } from '../db.js';
 import { parseUploadedFile } from '../services/parser.js';
-import { callVisionOCR, summarizeNoteAI, synthesizeNotesAI } from '../services/ai.js';
+import {
+  callVisionOCR,
+  cleanOcrMarkdown,
+  extractSmartTitle,
+  summarizeNoteAI,
+  synthesizeNotesAI,
+} from '../services/ai.js';
 
 export const notesRouter = Router();
 
@@ -300,17 +306,20 @@ notesRouter.post('/:id/ocr', async (req, res) => {
     const ext = path.extname(fullPath).toLowerCase().replace('.', '') || 'png';
     const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
     const base64 = fs.readFileSync(fullPath).toString('base64');
-    const ocrText = await callVisionOCR(base64, mime);
-    const newContent = `![原始笔记图片](${note.attachment_path})\n\n---\n\n${ocrText}`;
+    const ocrText = cleanOcrMarkdown(await callVisionOCR(base64, mime));
+    const isGenericTitle = /^(JPEG_|IMG_|Screenshot|图片笔记|微信图片|Photo)/i.test(note.title);
+    const newTitle = isGenericTitle ? extractSmartTitle(ocrText, note.title) : note.title;
     const now = nowIso();
-    db.prepare(`UPDATE notes SET content = ?, word_count = ?, updated_at = ? WHERE id = ?`).run(
-      newContent,
-      countWords(newContent),
+    // Clear stale summary_json so outdated error summaries never remain after re-OCR
+    db.prepare(`UPDATE notes SET title = ?, content = ?, summary_json = NULL, word_count = ?, updated_at = ? WHERE id = ?`).run(
+      newTitle,
+      ocrText,
+      countWords(ocrText),
       now,
       note.id
     );
     const tags = JSON.parse(note.tags || '[]');
-    syncNoteFts(note.id, note.title, newContent, tags);
+    syncNoteFts(note.id, newTitle, ocrText, tags);
 
     const updated = db
       .prepare(`SELECT n.*, c.name as category_name, c.color as category_color FROM notes n LEFT JOIN categories c ON n.category_id = c.id WHERE n.id = ?`)

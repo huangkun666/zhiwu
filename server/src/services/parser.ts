@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import mammoth from 'mammoth';
-import { callVisionOCR } from './ai.js';
+import { callVisionOCR, cleanOcrMarkdown, extractSmartTitle } from './ai.js';
 
 const require = createRequire(import.meta.url);
 // Import internal pdf-parse implementation directly to avoid its known test-file loading quirk
@@ -82,14 +82,13 @@ export async function parseUploadedFile(
     const buf = fs.readFileSync(filePath);
     const base64 = buf.toString('base64');
     const resolvedMime = mimeType.startsWith('image/') ? mimeType : `image/${ext.replace('.', '') || 'png'}`;
-    const imgHeader = publicAttachmentUrl ? `![原始笔记图片](${publicAttachmentUrl})\n\n---\n\n` : '';
 
-    // Let AIConfigError (unsupported vision / missing key) propagate so image upload is explicitly blocked with clear guidance
-    const ocrText = await callVisionOCR(base64, resolvedMime);
-    const h1 = ocrText.match(/^#\s+(.+)$/m);
+    // Keep note.content 100% pure Markdown text (image preview is rendered cleanly from attachment_path)
+    const rawOcr = await callVisionOCR(base64, resolvedMime);
+    const ocrText = cleanOcrMarkdown(rawOcr);
     return {
-      title: h1 ? h1[1].trim() : `图片笔记 - ${baseTitle}`,
-      content: `${imgHeader}${ocrText}`,
+      title: extractSmartTitle(ocrText, baseTitle),
+      content: ocrText,
       sourceType: 'image',
     };
   }

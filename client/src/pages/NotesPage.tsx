@@ -476,7 +476,12 @@ export function NotesPage({
                               <h4 className="font-medium text-sm truncate">{n.title}</h4>
                             </div>
                             <p className="text-xs text-[var(--text-muted)] line-clamp-2 mt-1">
-                              {n.summary?.abstract || n.content.replace(/[#*`>!]/g, '').slice(0, 90)}
+                              {n.summary?.abstract ||
+                                n.content
+                                  .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+                                  .replace(/[#*`>!]/g, '')
+                                  .trim()
+                                  .slice(0, 90)}
                             </p>
                             <div className="flex items-center justify-between mt-2 gap-2 text-[10px] text-[var(--text-muted)]">
                               <div className="flex items-center gap-1.5">
@@ -759,6 +764,27 @@ export function NotesPage({
                 </div>
               )}
 
+              {/* Original Image Preview (rendered natively so data: URLs never break!) */}
+              {activeNote.source_type === 'image' && activeNote.attachment_path && !editing && (
+                <details
+                  className="mx-5 sm:mx-6 mt-5 rounded-2xl border overflow-hidden"
+                  style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+                >
+                  <summary className="px-4 py-3 text-xs font-medium text-[var(--text-secondary)] cursor-pointer select-none flex items-center gap-1.5">
+                    <Image className="w-3.5 h-3.5" />
+                    查看原始笔记图片
+                  </summary>
+                  <div className="px-4 pb-4">
+                    <img
+                      src={activeNote.attachment_path}
+                      alt={activeNote.title}
+                      className="max-h-96 mx-auto rounded-xl border"
+                      style={{ borderColor: 'var(--border-hairline)' }}
+                    />
+                  </div>
+                </details>
+              )}
+
               {/* Content Body */}
               <div className="p-5 sm:p-6">
                 {editing ? (
@@ -806,7 +832,12 @@ export function NotesPage({
                     </div>
                   </div>
                 ) : (
-                  <MarkdownView content={activeNote.content} />
+                  <MarkdownView
+                    content={activeNote.content
+                      .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
+                      .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
+                      .trim()}
+                  />
                 )}
               </div>
             </div>

@@ -90,7 +90,12 @@ export function GlobalSearchModal({ open, onClose, onSelectNote }: GlobalSearchM
                     )}
                   </div>
                   <p className="text-xs text-[var(--text-muted)] line-clamp-2 mt-1">
-                    {note.summary?.abstract || note.content.replace(/[#*`>]/g, '').slice(0, 120)}
+                    {note.summary?.abstract ||
+                      note.content
+                        .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+                        .replace(/[#*`>]/g, '')
+                        .trim()
+                        .slice(0, 120)}
                   </p>
                 </div>
               </button>

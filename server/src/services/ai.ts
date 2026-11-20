@@ -141,7 +141,8 @@ async function callOpenAICompat(
   }
 
   const data = (await res.json()) as any;
-  const content = data?.choices?.[0]?.message?.content;
+  const msg = data?.choices?.[0]?.message;
+  const content = msg?.content || msg?.reasoning_content;
   if (!content) {
     throw new Error('模型返回了空内容，请检查模型名称或配额。');
   }
@@ -196,16 +197,45 @@ async function callGemini(
   return text.trim();
 }
 
+export function stripInlineImages(content: string): string {
+  return (content || '')
+    .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
+    .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
+    .trim();
+}
+
+export function cleanOcrMarkdown(raw: string): string {
+  return (raw || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?(?:small|span|div|font|u|center)[^>]*>/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+export function extractSmartTitle(markdown: string, fallbackName: string): string {
+  const h1 = markdown.match(/^#{1,3}\s+(.+)$/m);
+  if (h1?.[1]?.trim()) {
+    return h1[1].replace(/[*`]/g, '').trim().slice(0, 48);
+  }
+  const firstLine = markdown
+    .split('\n')
+    .map((l) => l.replace(/^[-*>\d.\s]+/, '').replace(/[*`]/g, '').trim())
+    .find((l) => l.length >= 4 && !l.startsWith('|') && !l.startsWith('!'));
+  if (firstLine) return firstLine.slice(0, 42);
+  return fallbackName;
+}
+
 export async function callVisionOCR(imageBase64: string, mimeType: string, customPrompt?: string): Promise<string> {
   const provider = assertActiveModelSupportsVision();
   const prompt =
     customPrompt ||
-    `你是一位严谨的学术笔记整理助手。请精准识别这张图片中的所有文字、标题、列表、表格和数学公式，整理为清晰、结构化的 Markdown 笔记。
+    `你是一位严谨的学术笔记整理助手。请精准识别这张图片中的所有文字、标题、列表、表格和数学公式，整理为清晰、结构化的纯 Markdown 笔记。
 要求：
-1. 忠实还原原图信息，不编造不存在的内容；
-2. 数学公式使用标准 LaTeX（行内用 $...$，独立公式用 $$...$$）；
-3. 适当使用 Markdown 标题、无序列表和加粗提升可读性；
-4. 直接输出整理后的 Markdown 正文，不要附加多余寒暄。`;
+1. 第一行请用一级标题 # 概括本页笔记的核心主题；
+2. 忠实还原原图全部文字与表格，不编造不存在的内容；
+3. 数学公式使用标准 LaTeX（行内用 $...$，独立公式用 $$...$$）；
+4. 禁止输出 <small>、<div>、<br>、<span> 等任何 HTML 标签，全部使用纯 Markdown 语法；
+5. 直接输出整理后的 Markdown 正文，不要附加多余寒暄。`;
 
   if (provider.type === 'gemini') {
     const base = (provider.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
@@ -295,10 +325,10 @@ export async function testProviderConnection(provider: AIProviderConfig): Promis
   const start = Date.now();
   const reply = await callLLM(
     [
-      { role: 'system', content: '你是一个测试助手，请用不超过15个字简短回复。' },
+      { role: 'system', content: '请用不超过15个字回复确认连接正常。' },
       { role: 'user', content: '你好，请确认连接正常。' },
     ],
-    { provider, temperature: 0.1, maxTokens: 40 }
+    { provider, temperature: 0.1, maxTokens: 512 }
   );
   return { latencyMs: Date.now() - start, reply };
 }
@@ -373,7 +403,7 @@ export async function summarizeNoteAI(
   content: string,
   existingCategories: string[]
 ): Promise<NoteSummaryResult> {
-  const clipped = content.slice(0, 14000);
+  const clipped = stripInlineImages(content).slice(0, 14000);
   const raw = await callLLM(
     [
       {
@@ -417,7 +447,7 @@ export async function summarizeNoteAI(
 
 export async function synthesizeNotesAI(notes: { title: string; content: string; tags: string[] }[]): Promise<string> {
   const combined = notes
-    .map((n, i) => `### 笔记 ${i + 1}：${n.title}\n标签：${n.tags.join(', ') || '无'}\n${n.content.slice(0, 3500)}`)
+    .map((n, i) => `### 笔记 ${i + 1}：${n.title}\n标签：${n.tags.join(', ') || '无'}\n${stripInlineImages(n.content).slice(0, 3500)}`)
     .join('\n\n---\n\n');
 
   return callLLM(
@@ -464,7 +494,7 @@ export async function generateQuizAI(
   const diffLabel = config.difficulty === 'easy' ? '基础巩固' : config.difficulty === 'hard' ? '挑战拔高（注重综合应用与易错辨析）' : '进阶理解';
   const typesStr = config.types.join(', ');
   const context = notes
-    .map((n) => `[NOTE_ID:${n.id}] 《${n.title}》\n${n.content.slice(0, 3500)}`)
+    .map((n) => `[NOTE_ID:${n.id}] 《${n.title}》\n${stripInlineImages(n.content).slice(0, 3500)}`)
     .join('\n\n---\n\n');
 
   const focusHint =
@@ -675,7 +705,7 @@ export async function generateFlashcardsAI(
       },
       {
         role: 'user',
-        content: `请为以下笔记生成 ${count} 张高质量闪卡。\n标题：${title}\n正文：\n${content.slice(0, 10000)}`,
+        content: `请为以下笔记生成 ${count} 张高质量闪卡。\n标题：${title}\n正文：\n${stripInlineImages(content).slice(0, 10000)}`,
       },
     ],
     { jsonMode: true, temperature: 0.4 }
@@ -711,7 +741,7 @@ function buildTutorMessages(
   userMessage: string
 ): ChatMessage[] {
   const noteContext = notes.length
-    ? notes.map((n, i) => `【参考笔记${i + 1}：${n.title}】\n${n.content.slice(0, 4000)}`).join('\n\n')
+    ? notes.map((n, i) => `【参考笔记${i + 1}：${n.title}】\n${stripInlineImages(n.content).slice(0, 4000)}`).join('\n\n')
     : '（未指定特定笔记，请结合通用知识与学习方法回答）';
 
   const systemPrompt =

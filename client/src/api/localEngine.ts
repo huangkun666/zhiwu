@@ -445,14 +445,47 @@ async function callLLMDirect(
     throw new Error(`模型请求失败 (${res.status}): ${errText.slice(0, 240)}`);
   }
   const data = await res.json();
-  return String(data?.choices?.[0]?.message?.content || '').trim();
+  const msg = data?.choices?.[0]?.message;
+  const content = msg?.content || msg?.reasoning_content;
+  if (!content) throw new Error('模型返回了空内容，请检查模型名称或配额。');
+  return String(content).trim();
+}
+
+function stripInlineImages(content: string): string {
+  return (content || '')
+    .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
+    .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
+    .trim();
+}
+
+function cleanOcrMarkdown(raw: string): string {
+  return (raw || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?(?:small|span|div|font|u|center)[^>]*>/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function extractSmartTitle(markdown: string, fallbackName: string): string {
+  const h1 = markdown.match(/^#{1,3}\s+(.+)$/m);
+  if (h1?.[1]?.trim()) return h1[1].replace(/[*`]/g, '').trim().slice(0, 48);
+  const firstLine = markdown
+    .split('\n')
+    .map((l) => l.replace(/^[-*>\d.\s]+/, '').replace(/[*`]/g, '').trim())
+    .find((l) => l.length >= 4 && !l.startsWith('|') && !l.startsWith('!'));
+  return firstLine ? firstLine.slice(0, 42) : fallbackName;
 }
 
 async function callVisionDirect(provider: AIProviderConfig, base64: string, mimeType: string): Promise<string> {
   if (!provider.supportsVision) {
     throw new Error(`当前模型「${provider.name} (${provider.model})」不支持视觉/图片输入，无法上传图片笔记。请在「设置」中切换支持多模态视觉的模型。`);
   }
-  const prompt = `你是严谨的学术笔记整理助手。请精准识别这张图片中的所有文字、标题、列表、表格和数学公式，整理为清晰结构化的 Markdown 笔记（数学公式用 $...$ 或 $$...$$）。直接输出 Markdown 正文。`;
+  const prompt = `你是严谨的学术笔记整理助手。请精准识别这张图片中的所有文字、标题、列表、表格和数学公式，整理为清晰结构化的纯 Markdown 笔记。
+要求：
+1. 第一行用一级标题 # 概括核心主题；
+2. 忠实还原原图文字与表格，数学公式用 $...$ 或 $$...$$；
+3. 禁止输出 <small>、<div>、<br>、<span> 等任何 HTML 标签，全部使用纯 Markdown；
+4. 直接输出整理后的 Markdown 正文。`;
   if (provider.type === 'gemini') {
     const base = (provider.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
     const url = `${base}/models/${encodeURIComponent(provider.model)}:generateContent?key=${encodeURIComponent(provider.apiKey)}`;
@@ -493,7 +526,10 @@ async function callVisionDirect(provider: AIProviderConfig, base64: string, mime
     throw new Error(`当前模型无法处理图片输入 (${res.status})，请确认其支持多模态视觉：${(await res.text().catch(() => '')).slice(0, 200)}`);
   }
   const data = await res.json();
-  return String(data?.choices?.[0]?.message?.content || '').trim();
+  const msg = data?.choices?.[0]?.message;
+  const content = msg?.content || msg?.reasoning_content;
+  if (!content) throw new Error('模型返回了空内容，请检查模型名称或配额。');
+  return String(content).trim();
 }
 
 // --- On-Device File Parsing (.md, .txt, .docx, .pdf, image) ---
@@ -562,12 +598,12 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
     const provider = requireActiveProvider(settings);
     const base64 = await fileToBase64(file);
     const mime = file.type.startsWith('image/') ? file.type : 'image/jpeg';
-    const ocrText = await callVisionDirect(provider, base64, mime);
+    const ocrText = cleanOcrMarkdown(await callVisionDirect(provider, base64, mime));
     const dataUrl = `data:${mime};base64,${base64}`;
-    const h1 = ocrText.match(/^#\s+(.+)$/m);
+    // Store ONLY pure recognized Markdown in content (keep base64 image cleanly in attachment_path so AI slicing never chops off the text!)
     return {
-      title: h1 ? h1[1].trim() : `图片笔记 - ${baseTitle}`,
-      content: `![原始笔记图片](${dataUrl})\n\n---\n\n${ocrText}`,
+      title: extractSmartTitle(ocrText, baseTitle),
+      content: ocrText,
       sourceType: 'image',
       attachmentDataUrl: dataUrl,
     };
@@ -964,9 +1000,13 @@ export const localApi = {
     const provider = requireActiveProvider(s.settings);
     const [meta, base64] = n.attachment_path.split(',');
     const mime = meta.match(/data:(.*?);/)?.[1] || 'image/jpeg';
-    const ocrText = await callVisionDirect(provider, base64, mime);
-    n.content = `![原始笔记图片](${n.attachment_path})\n\n---\n\n${ocrText}`;
-    n.word_count = countWords(n.content);
+    const ocrText = cleanOcrMarkdown(await callVisionDirect(provider, base64, mime));
+    if (/^(JPEG_|IMG_|Screenshot|图片笔记|微信图片|Photo)/i.test(n.title)) {
+      n.title = extractSmartTitle(ocrText, n.title);
+    }
+    n.content = ocrText;
+    n.summary = null; // clear stale error summary after re-OCR
+    n.word_count = countWords(ocrText);
     n.updated_at = nowIso();
     await saveState(s);
     return enrichNote(s, n);
@@ -977,6 +1017,7 @@ export const localApi = {
     const n = s.notes.find((x) => x.id === id);
     if (!n) throw new Error('笔记不存在');
     const provider = requireActiveProvider(s.settings);
+    const cleanText = stripInlineImages(n.content);
     const raw = await callLLMDirect(
       provider,
       [
@@ -987,7 +1028,7 @@ export const localApi = {
         },
         {
           role: 'user',
-          content: `已有分类：${s.categories.map((c) => c.name).join('、') || '暂无'}\n标题：${n.title}\n正文：\n${n.content.slice(0, 12000)}`,
+          content: `已有分类：${s.categories.map((c) => c.name).join('、') || '暂无'}\n标题：${n.title}\n正文：\n${cleanText.slice(0, 12000)}`,
         },
       ],
       { jsonMode: true, temperature: 0.3 }
@@ -1039,7 +1080,9 @@ export const localApi = {
       ? s.notes.filter((n) => n.category_id === payload.categoryId).slice(0, 10)
       : [];
     if (!target.length) throw new Error('请至少选择 1 篇笔记进行归纳');
-    const combined = target.map((n, i) => `### 笔记${i + 1}：${n.title}\n${n.content.slice(0, 3200)}`).join('\n\n---\n\n');
+    const combined = target
+      .map((n, i) => `### 笔记${i + 1}：${n.title}\n${stripInlineImages(n.content).slice(0, 3200)}`)
+      .join('\n\n---\n\n');
     const md = await callLLMDirect(provider, [
       {
         role: 'system',
@@ -1121,7 +1164,7 @@ export const localApi = {
         {
           role: 'user',
           content: `出 ${count} 题，难度 ${diff}，题型 ${types.join(',')}${focus.length ? `，重点考查：${focus.join('、')}` : ''}\n\n${sourceNotes
-            .map((n) => `[NOTE_ID:${n.id}] 《${n.title}》\n${n.content.slice(0, 3200)}`)
+            .map((n) => `[NOTE_ID:${n.id}] 《${n.title}》\n${stripInlineImages(n.content).slice(0, 3200)}`)
             .join('\n\n')}`,
         },
       ],
@@ -1471,7 +1514,7 @@ export const localApi = {
       provider,
       [
         { role: 'system', content: '从笔记生成原子化主动回忆闪卡，返回JSON：{"cards":[{"front":"问题","back":"答案","hint":"提示","conceptName":"概念"}]}' },
-        { role: 'user', content: `生成 ${count} 张闪卡。\n标题：${n.title}\n${n.content.slice(0, 9000)}` },
+        { role: 'user', content: `生成 ${count} 张闪卡。\n标题：${n.title}\n${stripInlineImages(n.content).slice(0, 9000)}` },
       ],
       { jsonMode: true, temperature: 0.4 }
     );
@@ -1594,7 +1637,7 @@ export const localApi = {
     const noteIds = payload.noteIds?.length ? payload.noteIds : session.note_ids;
     const mode = payload.mode || session.mode;
     const notes = noteIds.length ? s.notes.filter((n) => noteIds.includes(n.id)) : s.notes.slice(0, 3);
-    const ctx = notes.map((n, i) => `【笔记${i + 1}：${n.title}】\n${n.content.slice(0, 3500)}`).join('\n\n');
+    const ctx = notes.map((n, i) => `【笔记${i + 1}：${n.title}】\n${stripInlineImages(n.content).slice(0, 3500)}`).join('\n\n');
     const sys =
       mode === 'feynman'
         ? `你是费曼学习法考官。先肯定准确部分并给出理解度评分，再指出逻辑漏洞并提出1-2个直击要害的苏格拉底式追问。\n\n参考材料：\n${ctx}`
@@ -1653,10 +1696,10 @@ export const localApi = {
     const reply = await callLLMDirect(
       provider,
       [
-        { role: 'system', content: '你是测试助手，用不超过15个字回复。' },
+        { role: 'system', content: '请用不超过15个字回复确认连接正常。' },
         { role: 'user', content: '你好，请确认连接正常。' },
       ],
-      { temperature: 0.1, maxTokens: 40 }
+      { temperature: 0.1, maxTokens: 512 }
     );
     return { ok: true, latencyMs: Date.now() - start, reply };
   },
