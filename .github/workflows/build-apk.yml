@@ -2,13 +2,15 @@ name: Build Zhiwu Android APK & OTA Update
 
 on:
   push:
+    branches-ignore:
+      - ota-index
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: zhiwu-ota-${{ github.ref }}
+  group: zhiwu-ota-publish
   cancel-in-progress: false
 
 jobs:
@@ -17,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Compute build metadata
         id: ver
@@ -106,9 +110,10 @@ jobs:
           path: zhiwu-android.apk
           retention-days: 30
 
-      - name: Publish OTA bundle to persistent Release (latest-ota)
+      - name: Publish OTA bundle & refresh rate-limit-free index (ota-index)
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           APP_VER: ${{ steps.ver.outputs.version }}
           APP_BRANCH: ${{ steps.ver.outputs.branch }}
           APP_SHA: ${{ steps.ver.outputs.full_sha }}
@@ -129,6 +134,7 @@ jobs:
           const { execFileSync } = require('child_process');
           const fs = require('fs');
 
+          const repo = process.env.REPO;
           const rel = JSON.parse(
             execFileSync('gh', ['release', 'view', 'latest-ota', '--json', 'body,assets'], { encoding: 'utf8' })
           );
@@ -155,6 +161,7 @@ jobs:
             nativeVersion: 2,
             message: process.env.APP_MSG,
             builtAt: new Date().toISOString(),
+            downloadUrl: `https://github.com/${repo}/releases/download/latest-ota/web-bundle-${shortSha}.zip`,
           };
 
           if (process.env.IS_MAIN === 'true' || !mainMeta) {
@@ -178,6 +185,17 @@ jobs:
             const shaKey = m ? m[1].toLowerCase().slice(0, 7) : '';
             if (idx < 25) {
               keepSet.add(shaKey);
+              if (!builds[shaKey]) {
+                builds[shaKey] = {
+                  sha: shaKey,
+                  shortSha: shaKey,
+                  nativeVersion: 2,
+                  builtAt: asset.updatedAt || '',
+                  downloadUrl: `https://github.com/${repo}/releases/download/latest-ota/${asset.name}`,
+                };
+              } else {
+                builds[shaKey].downloadUrl = `https://github.com/${repo}/releases/download/latest-ota/${asset.name}`;
+              }
             } else {
               try {
                 execFileSync('gh', ['release', 'delete-asset', 'latest-ota', asset.name, '--yes'], { stdio: 'inherit' });
@@ -201,4 +219,64 @@ jobs:
           execFileSync('gh', ['release', 'edit', 'latest-ota', '--title', `v${mainMeta.version}`, '--notes-file', '/tmp/ota_notes.md'], {
             stdio: 'inherit',
           });
+
+          // Build complete branch + commit index using local git refs (zero API calls)
+          const rawRefs = execFileSync(
+            'git',
+            ['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)', 'refs/remotes/origin'],
+            { encoding: 'utf8' }
+          )
+            .split('\n')
+            .map((s) => s.trim())
+            .filter((s) => s && s !== 'origin/HEAD' && s !== 'origin/ota-index');
+
+          const branches = [];
+          for (const ref of rawRefs.slice(0, 20)) {
+            const name = ref.replace(/^origin\//, '');
+            const logOut = execFileSync(
+              'git',
+              ['log', '-n', '25', '--format=%H%x1f%h%x1f%s%x1f%cI%x1f%an', ref],
+              { encoding: 'utf8' }
+            );
+            const commits = logOut
+              .split('\n')
+              .map((line) => line.trim())
+              .filter(Boolean)
+              .map((line) => {
+                const [sha, sSha, message, date, author] = line.split('\x1f');
+                return { sha, shortSha: (sSha || sha.slice(0, 7)).slice(0, 7), message, date, author };
+              });
+            if (commits.length === 0) continue;
+            branches.push({
+              name,
+              headSha: commits[0].sha,
+              headShortSha: commits[0].shortSha,
+              headMessage: commits[0].message,
+              headDate: commits[0].date,
+              commits,
+            });
+          }
+
+          const indexPayload = {
+            updatedAt: new Date().toISOString(),
+            latestNativeVersion: 2,
+            apkDownloadUrl: `https://github.com/${repo}/releases/download/latest-ota/zhiwu-android.apk`,
+            bundlesBySha: builds,
+            branches,
+          };
+
+          fs.writeFileSync('/tmp/ota_index.json', JSON.stringify(indexPayload, null, 2), 'utf8');
           EOF
+
+          # Push standalone single-commit orphan branch `ota-index` for zero-rate-limit raw.githubusercontent.com reads
+          rm -rf /tmp/ota-index-repo
+          mkdir -p /tmp/ota-index-repo
+          cp /tmp/ota_index.json /tmp/ota-index-repo/index.json
+          cd /tmp/ota-index-repo
+          git init -b ota-index
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.json
+          git commit -m "ota-index: ${APP_BRANCH}@${APP_SHORT_SHA}"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push --force origin ota-index

@@ -27,7 +27,6 @@ import { QrSendModal } from '../components/QrSendModal';
 import type { AIProviderConfig, AISettings } from '../types';
 import {
   checkAllBranchesUpdate,
-  fetchBranchCommits,
   formatRelativeTime,
   getCurrentRef,
   getNativeOtaState,
@@ -70,8 +69,6 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
   const [checkingOta, setCheckingOta] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [selectedBranch, setSelectedBranch] = useState(currentRef.branch);
-  const [branchCommits, setBranchCommits] = useState<RemoteCommitInfo[]>([]);
-  const [loadingCommits, setLoadingCommits] = useState(false);
   const [selectedCommitSha, setSelectedCommitSha] = useState('');
   const [otaProgress, setOtaProgress] = useState('');
   const [otaError, setOtaError] = useState('');
@@ -184,21 +181,12 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
     }
   };
 
-  const loadCommitsForBranch = async (branchName: string, info: UpdateCheckResult) => {
+  const selectBranch = (branchName: string, info: UpdateCheckResult) => {
     setSelectedBranch(branchName);
-    setLoadingCommits(true);
-    setSelectedCommitSha('');
-    try {
-      const commits = await fetchBranchCommits(branchName, info.bundlesBySha, info.currentRef);
-      setBranchCommits(commits);
-      const firstInstallable = commits.find((c) => c.bundle && !c.isCurrent) || commits[0];
-      if (firstInstallable) setSelectedCommitSha(firstInstallable.sha);
-    } catch (e: any) {
-      setBranchCommits([]);
-      setOtaError(e.message || '获取提交记录失败');
-    } finally {
-      setLoadingCommits(false);
-    }
+    const branch = info.branches.find((b) => b.name === branchName);
+    const commits = branch?.commits || [];
+    const firstInstallable = commits.find((c) => c.bundle && !c.isCurrent) || commits[0];
+    setSelectedCommitSha(firstInstallable?.sha || '');
   };
 
   const handleCheckOta = async () => {
@@ -210,7 +198,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
       const defaultBranch = info.branches.some((b) => b.name === selectedBranch)
         ? selectedBranch
         : info.currentBranchInfo?.name || info.branches[0]?.name || 'main';
-      await loadCommitsForBranch(defaultBranch, info);
+      selectBranch(defaultBranch, info);
     } catch (e: any) {
       setOtaError(e.message || '检查更新失败');
     } finally {
@@ -236,6 +224,8 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
     }
   };
 
+  const activeBranchObj = updateInfo?.branches.find((b) => b.name === selectedBranch) || null;
+  const branchCommits = activeBranchObj?.commits || [];
   const selectedCommitObj = branchCommits.find((c) => c.sha === selectedCommitSha) || null;
 
   const filteredModels = modelFilter.trim()
@@ -789,7 +779,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
                         </div>
                         <button
                           type="button"
-                          onClick={() => loadCommitsForBranch(b.name, updateInfo)}
+                          onClick={() => selectBranch(b.name, updateInfo)}
                           className="px-2.5 py-1 rounded-lg zw-btn-secondary text-[11px] shrink-0 cursor-pointer"
                           style={
                             isViewing
@@ -813,7 +803,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
                   <label className="block text-[11px] text-[var(--text-muted)] mb-1">分支</label>
                   <select
                     value={selectedBranch}
-                    onChange={(e) => loadCommitsForBranch(e.target.value, updateInfo)}
+                    onChange={(e) => selectBranch(e.target.value, updateInfo)}
                     className="w-full px-3 py-2 rounded-xl zw-input text-xs font-mono"
                   >
                     {updateInfo.branches.map((b) => (
@@ -834,12 +824,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
                 className="rounded-xl border divide-y max-h-64 overflow-y-auto"
                 style={{ borderColor: 'var(--border-hairline)', background: 'var(--bg-subtle)' }}
               >
-                {loadingCommits ? (
-                  <div className="p-4 flex items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    加载提交记录...
-                  </div>
-                ) : branchCommits.length === 0 ? (
+                {branchCommits.length === 0 ? (
                   <div className="p-4 text-center text-xs text-[var(--text-muted)]">暂无提交记录</div>
                 ) : (
                   branchCommits.map((c) => {

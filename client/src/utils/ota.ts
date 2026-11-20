@@ -1,5 +1,6 @@
 export const OTA_REPO = 'huangkun666/zhiwu';
 export const OTA_REPO_URL = `https://github.com/${OTA_REPO}`;
+const OTA_INDEX_URL = `https://raw.githubusercontent.com/${OTA_REPO}/ota-index/index.json`;
 
 export interface NativeOtaState {
   isNative: boolean;
@@ -27,19 +28,6 @@ export interface OtaBuildEntry {
   downloadUrl: string;
 }
 
-export interface RemoteBranchInfo {
-  name: string;
-  headSha: string;
-  headShortSha: string;
-  headMessage: string;
-  headDate: string;
-  aheadBy: number;
-  behindBy: number;
-  isCurrent: boolean;
-  hasUpdate: boolean;
-  headBundle: OtaBuildEntry | null;
-}
-
 export interface RemoteCommitInfo {
   sha: string;
   shortSha: string;
@@ -50,6 +38,19 @@ export interface RemoteCommitInfo {
   bundle: OtaBuildEntry | null;
   needsApkReinstall: boolean;
   isBuildingLikely: boolean;
+}
+
+export interface RemoteBranchInfo {
+  name: string;
+  headSha: string;
+  headShortSha: string;
+  headMessage: string;
+  headDate: string;
+  aheadBy: number;
+  isCurrent: boolean;
+  hasUpdate: boolean;
+  headBundle: OtaBuildEntry | null;
+  commits: RemoteCommitInfo[];
 }
 
 export interface UpdateCheckResult {
@@ -129,85 +130,11 @@ function savePendingActiveRef(ref: { branch: string; sha: string; shortSha: stri
   }
 }
 
-async function ghFetchJson(path: string): Promise<any> {
-  const res = await fetch(`https://api.github.com/repos/${OTA_REPO}${path}`, {
-    headers: { Accept: 'application/vnd.github+json' },
-  });
-  if (res.status === 403) {
-    throw new Error('GitHub 接口请求次数达到上限，请稍后再试');
-  }
-  if (res.status === 404) {
-    return null;
-  }
-  if (!res.ok) {
-    throw new Error(`远端请求失败 (${res.status})`);
-  }
-  return res.json();
-}
-
-function parseReleaseBundles(rel: any): {
-  bundlesBySha: Record<string, OtaBuildEntry>;
-  apkDownloadUrl: string;
-  latestNativeVersion: number;
-} {
-  const bundlesBySha: Record<string, OtaBuildEntry> = {};
-  let apkDownloadUrl = `${OTA_REPO_URL}/releases/tag/latest-ota`;
-  let latestNativeVersion = 2;
-
-  if (!rel) {
-    return { bundlesBySha, apkDownloadUrl, latestNativeVersion };
-  }
-
-  const body = String(rel.body || '');
-  let manifestMap: Record<string, any> = {};
-
-  const buildsMatch = body.match(/<!--ZHIWU_BUILDS:(.*?)-->/);
-  if (buildsMatch?.[1]) {
-    try {
-      manifestMap = JSON.parse(buildsMatch[1]) || {};
-    } catch {
-      // ignore
-    }
-  }
-
-  const metaMatch = body.match(/<!--ZHIWU_META:(.*?)-->/);
-  if (metaMatch?.[1]) {
-    try {
-      const meta = JSON.parse(metaMatch[1]);
-      if (meta?.nativeVersion) latestNativeVersion = Number(meta.nativeVersion);
-    } catch {
-      // ignore
-    }
-  }
-
-  const assets: any[] = rel.assets || [];
-  const apkAsset = assets.find((a) => a.name === 'zhiwu-android.apk');
-  if (apkAsset?.browser_download_url) {
-    apkDownloadUrl = apkAsset.browser_download_url;
-  }
-
-  for (const asset of assets) {
-    const m = String(asset.name || '').match(/^web-bundle-([0-9a-f]{7,})\.zip$/i);
-    if (!m) continue;
-    const shortSha = m[1].toLowerCase().slice(0, 7);
-    const meta = manifestMap[shortSha] || {};
-    bundlesBySha[shortSha] = {
-      shortSha,
-      sha: meta.sha || shortSha,
-      branch: meta.branch,
-      version: meta.version,
-      nativeVersion: Number(meta.nativeVersion || latestNativeVersion || 2),
-      message: meta.message,
-      builtAt: meta.builtAt || asset.updated_at || '',
-      downloadUrl: asset.browser_download_url,
-    };
-  }
-
-  return { bundlesBySha, apkDownloadUrl, latestNativeVersion };
-}
-
-function firstLine(msg: string): string {
-  return String(msg || '').split('\n')[0].trim();
+function matchesSha(sha: string, ref: ActiveRefInfo): boolean {
+  if (!ref.sha || !sha) return false;
+  const a = sha.toLowerCase();
+  const b = ref.sha.toLowerCase();
+  return a === b || a.startsWith(b) || b.startsWith(a.slice(0, 7));
 }
 
 export function formatRelativeTime(iso: string): string {
@@ -227,96 +154,119 @@ export function formatRelativeTime(iso: string): string {
 
 export async function checkAllBranchesUpdate(): Promise<UpdateCheckResult> {
   const currentRef = getCurrentRef();
+  const native = getNativeOtaState();
 
-  const [rel, rawBranches] = await Promise.all([
-    ghFetchJson('/releases/tags/latest-ota'),
-    ghFetchJson('/branches?per_page=20'),
-  ]);
+  const res = await fetch(`${OTA_INDEX_URL}?t=${Date.now()}`, { cache: 'no-store' });
+  if (!res.ok) {
+    throw new Error(`检查更新失败 (${res.status})`);
+  }
+  const index = await res.json();
 
-  if (!Array.isArray(rawBranches) || rawBranches.length === 0) {
-    throw new Error('未获取到远端分支信息');
+  const rawBundles: Record<string, any> = index.bundlesBySha || {};
+  const bundlesBySha: Record<string, OtaBuildEntry> = {};
+  for (const [k, v] of Object.entries(rawBundles)) {
+    const key = k.toLowerCase().slice(0, 7);
+    bundlesBySha[key] = {
+      shortSha: key,
+      sha: v.sha || key,
+      branch: v.branch,
+      version: v.version,
+      nativeVersion: Number(v.nativeVersion || index.latestNativeVersion || 2),
+      message: v.message,
+      builtAt: v.builtAt || '',
+      downloadUrl: v.downloadUrl || `${OTA_REPO_URL}/releases/download/latest-ota/web-bundle-${key}.zip`,
+    };
   }
 
-  const { bundlesBySha, apkDownloadUrl, latestNativeVersion } = parseReleaseBundles(rel);
+  const rawBranches: any[] = Array.isArray(index.branches) ? index.branches : [];
+  if (rawBranches.length === 0) {
+    throw new Error('远端暂无可用分支');
+  }
 
-  // Sort current branch first, then main/master, then alphabetical
-  const sortedRaw = [...rawBranches].sort((a, b) => {
-    if (a.name === currentRef.branch) return -1;
-    if (b.name === currentRef.branch) return 1;
-    if (a.name === 'main' || a.name === 'master') return -1;
-    if (b.name === 'main' || b.name === 'master') return 1;
-    return a.name.localeCompare(b.name);
+  // Build ancestor commit set of current running commit (from whichever branch contains it)
+  const currentAncestors = new Set<string>();
+  if (currentRef.sha) {
+    for (const rb of rawBranches) {
+      const list: any[] = rb.commits || [];
+      const hitIdx = list.findIndex((c) => matchesSha(String(c.sha || ''), currentRef));
+      if (hitIdx >= 0) {
+        for (let i = hitIdx; i < list.length; i++) {
+          currentAncestors.add(String(list[i].sha || '').toLowerCase());
+        }
+      }
+    }
+  }
+
+  const now = Date.now();
+  const branches: RemoteBranchInfo[] = rawBranches.map((rb: any) => {
+    const rawCommits: any[] = rb.commits || [];
+    const commits: RemoteCommitInfo[] = rawCommits.map((c: any, idx: number) => {
+      const sha = String(c.sha || '');
+      const shortSha = String(c.shortSha || sha.slice(0, 7)).slice(0, 7);
+      const bundle = bundlesBySha[shortSha.toLowerCase()] || null;
+      const isCurrent = matchesSha(sha, currentRef);
+      const date = String(c.date || '');
+      const ageMs = date ? now - new Date(date).getTime() : Infinity;
+      const isBuildingLikely = !bundle && idx === 0 && ageMs < 6 * 60 * 1000;
+      return {
+        sha,
+        shortSha,
+        message: String(c.message || shortSha),
+        date,
+        author: String(c.author || ''),
+        isCurrent,
+        bundle,
+        needsApkReinstall: Boolean(bundle && bundle.nativeVersion > native.nativeVersion),
+        isBuildingLikely,
+      };
+    });
+
+    const headSha = String(rb.headSha || commits[0]?.sha || '');
+    const headShortSha = String(rb.headShortSha || headSha.slice(0, 7)).slice(0, 7);
+    const isCurrent = rb.name === currentRef.branch;
+
+    let aheadBy = 0;
+    if (!currentRef.sha) {
+      aheadBy = commits.length > 0 ? 1 : 0;
+    } else if (matchesSha(headSha, currentRef)) {
+      aheadBy = 0;
+    } else {
+      const hitIdx = commits.findIndex((c) => c.isCurrent);
+      if (hitIdx > 0) {
+        aheadBy = hitIdx;
+      } else if (currentAncestors.has(headSha.toLowerCase())) {
+        // Branch head is an ancestor of current running commit -> behind, not an update
+        aheadBy = 0;
+      } else {
+        // Diverged branch with commits not in current running history
+        const unseen = commits.filter((c) => !currentAncestors.has(c.sha.toLowerCase())).length;
+        aheadBy = unseen > 0 ? unseen : 1;
+      }
+    }
+
+    return {
+      name: String(rb.name),
+      headSha,
+      headShortSha,
+      headMessage: String(rb.headMessage || commits[0]?.message || headShortSha),
+      headDate: String(rb.headDate || commits[0]?.date || ''),
+      aheadBy,
+      isCurrent,
+      hasUpdate: aheadBy > 0,
+      headBundle: bundlesBySha[headShortSha.toLowerCase()] || null,
+      commits,
+    };
   });
 
-  // Limit detailed inspection to top 10 branches to stay light on GitHub API quota
-  const targetBranches = sortedRaw.slice(0, 10);
-
-  const branches: RemoteBranchInfo[] = await Promise.all(
-    targetBranches.map(async (b: any) => {
-      const headSha = String(b.commit?.sha || '');
-      const headShortSha = headSha.slice(0, 7);
-      const isCurrent = b.name === currentRef.branch;
-      const headBundle = bundlesBySha[headShortSha.toLowerCase()] || null;
-
-      let aheadBy = 0;
-      let behindBy = 0;
-      let headMessage = headBundle?.message || '';
-      let headDate = headBundle?.builtAt || '';
-
-      const sameAsCurrent =
-        Boolean(currentRef.sha) &&
-        (headSha === currentRef.sha || headSha.startsWith(currentRef.sha) || currentRef.sha.startsWith(headShortSha));
-
-      if (sameAsCurrent) {
-        // Already on this exact commit; fetch commit detail only if message is missing
-        if (!headMessage && headSha) {
-          const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
-          headMessage = firstLine(c?.commit?.message || '');
-          headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
-        }
-      } else if (currentRef.sha && /^[0-9a-f]{7,40}$/i.test(currentRef.sha)) {
-        const cmp = await ghFetchJson(`/compare/${currentRef.sha}...${headSha}`).catch(() => null);
-        if (cmp) {
-          aheadBy = Number(cmp.ahead_by || 0);
-          behindBy = Number(cmp.behind_by || 0);
-          const lastCommit = cmp.commits?.[cmp.commits.length - 1];
-          if (lastCommit) {
-            headMessage = firstLine(lastCommit.commit?.message || '');
-            headDate = lastCommit.commit?.committer?.date || lastCommit.commit?.author?.date || '';
-          } else {
-            const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
-            headMessage = firstLine(c?.commit?.message || '');
-            headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
-          }
-        } else {
-          // Unrelated history or unknown base commit
-          aheadBy = 1;
-          const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
-          headMessage = firstLine(c?.commit?.message || '');
-          headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
-        }
-      } else {
-        // Local dev build without embedded commit SHA: treat remote head as newer
-        aheadBy = 1;
-        const c = await ghFetchJson(`/commits/${headSha}`).catch(() => null);
-        headMessage = firstLine(c?.commit?.message || '');
-        headDate = c?.commit?.committer?.date || c?.commit?.author?.date || '';
-      }
-
-      return {
-        name: b.name,
-        headSha,
-        headShortSha,
-        headMessage: headMessage || headShortSha,
-        headDate,
-        aheadBy,
-        behindBy,
-        isCurrent,
-        hasUpdate: !sameAsCurrent && aheadBy > 0,
-        headBundle,
-      };
-    })
-  );
+  // Sort: current branch first, then main/master, then branches with updates, then alphabetical
+  branches.sort((a, b) => {
+    if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
+    if ((a.name === 'main' || a.name === 'master') !== (b.name === 'main' || b.name === 'master')) {
+      return a.name === 'main' || a.name === 'master' ? -1 : 1;
+    }
+    if (a.hasUpdate !== b.hasUpdate) return a.hasUpdate ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
 
   const currentBranchInfo = branches.find((b) => b.isCurrent) || branches[0] || null;
   const otherUpdatedBranches = branches.filter((b) => !b.isCurrent && b.hasUpdate);
@@ -328,44 +278,9 @@ export async function checkAllBranchesUpdate(): Promise<UpdateCheckResult> {
     currentBranchInfo,
     otherUpdatedBranches,
     bundlesBySha,
-    apkDownloadUrl,
-    latestNativeVersion,
+    apkDownloadUrl: index.apkDownloadUrl || `${OTA_REPO_URL}/releases/download/latest-ota/zhiwu-android.apk`,
+    latestNativeVersion: Number(index.latestNativeVersion || 2),
   };
-}
-
-export async function fetchBranchCommits(
-  branch: string,
-  bundlesBySha: Record<string, OtaBuildEntry>,
-  currentRef: ActiveRefInfo
-): Promise<RemoteCommitInfo[]> {
-  const native = getNativeOtaState();
-  const raw = await ghFetchJson(`/commits?sha=${encodeURIComponent(branch)}&per_page=15`);
-  if (!Array.isArray(raw)) return [];
-
-  const now = Date.now();
-  return raw.map((item: any, idx: number) => {
-    const sha = String(item.sha || '');
-    const shortSha = sha.slice(0, 7);
-    const date = item.commit?.committer?.date || item.commit?.author?.date || '';
-    const bundle = bundlesBySha[shortSha.toLowerCase()] || null;
-    const isCurrent =
-      Boolean(currentRef.sha) &&
-      (sha === currentRef.sha || sha.startsWith(currentRef.sha) || currentRef.sha.startsWith(shortSha));
-    const ageMs = date ? now - new Date(date).getTime() : Infinity;
-    const isBuildingLikely = !bundle && idx === 0 && ageMs < 6 * 60 * 1000;
-
-    return {
-      sha,
-      shortSha,
-      message: firstLine(item.commit?.message || shortSha),
-      date,
-      author: item.commit?.author?.name || '',
-      isCurrent,
-      bundle,
-      needsApkReinstall: Boolean(bundle && bundle.nativeVersion > native.nativeVersion),
-      isBuildingLikely,
-    };
-  });
 }
 
 export function triggerNativeCommitUpdate(
