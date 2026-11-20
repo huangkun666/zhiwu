@@ -11,19 +11,26 @@ import { ReviewPage } from './pages/ReviewPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { TutorPage } from './pages/TutorPage';
 import type { ActiveModelCapability, Category, PageId } from './types';
+import { applyTheme, getSavedTheme, type ThemeMode } from './utils/theme';
 
 export default function App() {
   const [page, setPage] = useState<PageId>('home');
   const [pageContext, setPageContext] = useState<any>(null);
+  const [theme, setTheme] = useState<ThemeMode>(getSavedTheme);
   const [categories, setCategories] = useState<Category[]>([]);
   const [badges, setBadges] = useState({ dueReviews: 0, activeMistakes: 0 });
   const [activeCapability, setActiveCapability] = useState<ActiveModelCapability | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
 
-  // Global modals
   const [importOpen, setImportOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [qrOpen, setQrOpen] = useState(false);
+
+  const handleToggleTheme = (next?: ThemeMode) => {
+    const resolved: ThemeMode = next || (theme === 'dark' ? 'light' : 'dark');
+    setTheme(resolved);
+    applyTheme(resolved);
+  };
 
   const refreshGlobal = useCallback(async () => {
     try {
@@ -50,7 +57,6 @@ export default function App() {
     refreshGlobal();
   }, [refreshGlobal]);
 
-  // Global Ctrl+K shortcut for instant full-text search
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
@@ -72,6 +78,8 @@ export default function App() {
     <>
       <Layout
         page={page}
+        theme={theme}
+        onToggleTheme={() => handleToggleTheme()}
         onNavigate={(p) => handleNavigate(p)}
         onOpenImport={() => setImportOpen(true)}
         onOpenSearch={() => setSearchOpen(true)}
@@ -106,8 +114,14 @@ export default function App() {
           />
         )}
         {page === 'review' && <ReviewPage onRefreshGlobal={refreshGlobal} />}
-        {page === 'tutor' && <TutorPage initialContext={pageContext} />}
-        {page === 'settings' && <SettingsPage onSettingsChanged={refreshGlobal} />}
+        {page === 'tutor' && <TutorPage initialContext={pageContext} onRefreshGlobal={refreshGlobal} />}
+        {page === 'settings' && (
+          <SettingsPage
+            theme={theme}
+            onSelectTheme={(m) => handleToggleTheme(m)}
+            onSettingsChanged={refreshGlobal}
+          />
+        )}
       </Layout>
 
       <QuickImportModal

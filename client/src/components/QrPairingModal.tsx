@@ -45,45 +45,54 @@ export function QrPairingModal({ open, onClose }: QrPairingModalProps) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 backdrop-blur-[2px] p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 backdrop-blur-sm p-4"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-[#E8E5DF] overflow-hidden"
+        className="w-full max-w-md zw-modal rounded-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-[#EFECE6]">
+        <div
+          className="flex items-center justify-between px-5 py-4 border-b"
+          style={{ borderColor: 'var(--border-hairline)' }}
+        >
           <div className="flex items-center gap-2">
-            <Smartphone className="w-5 h-5 text-[#3B5BDB]" />
-            <h3 className="font-bold text-[#1C1B18]">安卓手机端扫码直连</h3>
+            <Smartphone className="w-4 h-4 text-[var(--text-secondary)]" />
+            <h3 className="font-semibold text-sm">局域网手机扫码访问</h3>
           </div>
-          <button onClick={onClose} className="p-1.5 rounded-lg text-[#6F6B63] hover:bg-[#F5F3EE]">
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer"
+          >
             <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="p-5 text-center space-y-4">
           {info?.qrDataUrl ? (
-            <div className="inline-block p-3 bg-white rounded-2xl border border-[#E8E5DF] shadow-sm">
-              <img src={info.qrDataUrl} alt="手机访问二维码" className="w-48 h-48 mx-auto" />
+            <div className="inline-block p-3 bg-white rounded-2xl border border-black/10">
+              <img src={info.qrDataUrl} alt="手机访问二维码" className="w-44 h-44 mx-auto" />
             </div>
           ) : (
-            <div className="w-48 h-48 mx-auto rounded-2xl bg-[#F5F3EE] flex items-center justify-center text-xs text-[#7A756C]">
+            <div
+              className="w-44 h-44 mx-auto rounded-2xl flex items-center justify-center text-xs text-[var(--text-muted)]"
+              style={{ background: 'var(--bg-subtle)' }}
+            >
               正在获取局域网地址...
             </div>
           )}
 
           {info?.adapters && info.adapters.length > 1 && (
             <div className="text-left">
-              <label className="block text-[11px] font-medium text-[#7A756C] mb-1">切换网卡地址（优先选择 WLAN / 以太网）</label>
+              <label className="block text-[11px] text-[var(--text-muted)] mb-1">切换网卡（优先选择 WLAN）</label>
               <select
                 value={selectedIp}
                 onChange={(e) => loadInfo(e.target.value)}
-                className="w-full px-3 py-2 rounded-xl border border-[#E5E2DC] bg-[#FAF9F6] text-xs"
+                className="w-full px-3 py-2 rounded-xl zw-input text-xs"
               >
                 {info.adapters.map((a) => (
                   <option key={a.address} value={a.address}>
-                    {a.name} ({a.address}){a.isVirtual ? ' [虚拟网卡]' : ''}
+                    {a.name} ({a.address}){a.isVirtual ? ' [虚拟]' : ''}
                   </option>
                 ))}
               </select>
@@ -91,25 +100,21 @@ export function QrPairingModal({ open, onClose }: QrPairingModalProps) {
           )}
 
           {info?.mobileUrl && (
-            <div className="flex items-center gap-2 bg-[#F5F3EE] rounded-xl px-3 py-2 text-left">
-              <Wifi className="w-4 h-4 text-[#0F766E] shrink-0" />
-              <code className="text-xs font-mono text-[#1C1B18] flex-1 truncate">{info.mobileUrl}</code>
+            <div
+              className="flex items-center gap-2 rounded-xl px-3 py-2 text-left border"
+              style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+            >
+              <Wifi className="w-4 h-4 text-[var(--text-muted)] shrink-0" />
+              <code className="text-xs font-mono flex-1 truncate">{info.mobileUrl}</code>
               <button
                 onClick={copyUrl}
-                className="px-2.5 py-1 rounded-lg bg-white border border-[#E5E2DC] text-xs font-medium text-[#1C1B18] hover:bg-[#FAF9F6] flex items-center gap-1 cursor-pointer"
+                className="px-2.5 py-1 rounded-lg zw-btn-secondary text-xs flex items-center gap-1 cursor-pointer"
               >
-                {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 {copied ? '已复制' : '复制'}
               </button>
             </div>
           )}
-
-          <div className="text-left bg-[#F3F5FC] rounded-xl p-3.5 text-xs text-[#2E3A67] space-y-1.5 leading-relaxed">
-            <p className="font-semibold text-[#1E2B58]">安装为安卓原生风格 App（PWA）：</p>
-            <p>1. 确保手机与电脑连接在<strong>同一个 Wi-Fi</strong>（外出随时访问可使用 Tailscale 组网或部署到轻量云主机）。</p>
-            <p>2. 用安卓 Chrome / Edge 浏览器扫码或输入上方地址打开。</p>
-            <p>3. 点击浏览器右上角菜单 → <strong>「添加到主屏幕 / 安装应用」</strong>，即可全屏使用并支持<strong>手机直接拍照记笔记</strong>！</p>
-          </div>
         </div>
       </div>
     </div>

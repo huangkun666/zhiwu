@@ -1574,6 +1574,23 @@ export const localApi = {
     return { userMessage, assistantMessage };
   },
 
+  async sendTutorMessageStream(
+    sessionId: string,
+    payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' },
+    onDelta: (delta: string) => void
+  ) {
+    // On Android CapacitorHttp (native bridge), stream chunks or fall back cleanly with smooth reveal
+    const res = await localApi.sendTutorMessage(sessionId, payload);
+    const text = res.assistantMessage.content;
+    // Progressive chunk emit so UI renders fluidly
+    const step = Math.max(8, Math.ceil(text.length / 28));
+    for (let i = 0; i < text.length; i += step) {
+      onDelta(text.slice(i, i + step));
+      await new Promise((r) => setTimeout(r, 12));
+    }
+    return res;
+  },
+
   async deleteTutorSession(sessionId: string) {
     const s = await loadState();
     s.tutorSessions = s.tutorSessions.filter((x) => x.id !== sessionId);
@@ -1623,8 +1640,33 @@ export const localApi = {
     if (!parsed || !Array.isArray(parsed.notes)) {
       throw new Error('备份文件格式无效，请选择知悟导出的 JSON 备份文件。');
     }
-    const merged: LocalDBState = { ...createEmptyState(), ...parsed };
-    await saveState(merged);
-    return { ok: true, notesCount: merged.notes.length };
+    const current = await loadState();
+    let notesMerged = 0;
+
+    // Smart merge by ID so mobile & desktop notes never clobber each other
+    const mergeById = <T extends { id: string; updated_at?: string }>(existing: T[], incoming: T[] = []) => {
+      const map = new Map(existing.map((x) => [x.id, x]));
+      for (const item of incoming) {
+        if (!item?.id) continue;
+        const prev = map.get(item.id);
+        if (!prev || (item.updated_at && prev.updated_at && item.updated_at > prev.updated_at)) {
+          map.set(item.id, item);
+          if (existing === (current.notes as unknown as T[])) notesMerged++;
+        }
+      }
+      return Array.from(map.values());
+    };
+
+    current.categories = mergeById(current.categories, parsed.categories || []);
+    current.notes = mergeById(current.notes, parsed.notes || []);
+    current.syntheses = mergeById(current.syntheses, parsed.syntheses || []);
+    current.concepts = mergeById(current.concepts, parsed.concepts || []);
+    current.conceptLinks = mergeById(current.conceptLinks, parsed.conceptLinks || []);
+    current.flashcards = mergeById(current.flashcards, parsed.flashcards || []);
+    current.mistakes = mergeById(current.mistakes, parsed.mistakes || []);
+    current.studyLogs = mergeById(current.studyLogs, parsed.studyLogs || []);
+
+    await saveState(current);
+    return { ok: true, notesCount: notesMerged || parsed.notes.length };
   },
 };

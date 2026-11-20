@@ -35,28 +35,37 @@ export function PracticePage({
   }, [initialContext]);
 
   return (
-    <div className="space-y-5">
-      {/* Converged Top Switcher */}
-      <div className="inline-flex p-1 rounded-xl bg-[#EFECE6]">
+    <div className="space-y-6">
+      <div
+        className="inline-flex p-1 rounded-xl border"
+        style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+      >
         <button
           onClick={() => setSubTab('quiz')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
-            subTab === 'quiz' ? 'bg-white text-[#141311] shadow-sm' : 'text-[#6F6B63] hover:text-[#1C1B18]'
-          }`}
+          className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer"
+          style={{
+            background: subTab === 'quiz' ? 'var(--bg-card-solid)' : 'transparent',
+            color: subTab === 'quiz' ? 'var(--text-primary)' : 'var(--text-muted)',
+          }}
         >
           <FileCheck2 className="w-3.5 h-3.5" />
           动态出题
         </button>
         <button
           onClick={() => setSubTab('mistakes')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
-            subTab === 'mistakes' ? 'bg-white text-[#141311] shadow-sm' : 'text-[#6F6B63] hover:text-[#1C1B18]'
-          }`}
+          className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer"
+          style={{
+            background: subTab === 'mistakes' ? 'var(--bg-card-solid)' : 'transparent',
+            color: subTab === 'mistakes' ? 'var(--text-primary)' : 'var(--text-muted)',
+          }}
         >
-          <AlertTriangle className="w-3.5 h-3.5 text-red-500" />
-          错题集与解析
+          <AlertTriangle className="w-3.5 h-3.5" />
+          错题集
           {activeMistakesCount > 0 && (
-            <span className="ml-0.5 px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 text-[10px] font-bold">
+            <span
+              className="ml-0.5 px-1.5 py-0.2 rounded-md text-[10px] font-semibold tabular-nums"
+              style={{ background: 'var(--danger-bg)', color: 'var(--danger-fg)' }}
+            >
               {activeMistakesCount}
             </span>
           )}

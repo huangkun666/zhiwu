@@ -26,26 +26,32 @@ export function HomePage({
   }, [initialSubTab]);
 
   return (
-    <div className="space-y-5">
-      {/* Converged Top Switcher */}
-      <div className="inline-flex p-1 rounded-xl bg-[#EFECE6]">
+    <div className="space-y-6">
+      <div
+        className="inline-flex p-1 rounded-xl border"
+        style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+      >
         <button
           onClick={() => setSubTab('overview')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
-            subTab === 'overview' ? 'bg-white text-[#141311] shadow-sm' : 'text-[#6F6B63] hover:text-[#1C1B18]'
-          }`}
+          className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer"
+          style={{
+            background: subTab === 'overview' ? 'var(--bg-card-solid)' : 'transparent',
+            color: subTab === 'overview' ? 'var(--text-primary)' : 'var(--text-muted)',
+          }}
         >
           <LayoutDashboard className="w-3.5 h-3.5" />
           学习概览
         </button>
         <button
           onClick={() => setSubTab('graph')}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
-            subTab === 'graph' ? 'bg-white text-[#141311] shadow-sm' : 'text-[#6F6B63] hover:text-[#1C1B18]'
-          }`}
+          className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer"
+          style={{
+            background: subTab === 'graph' ? 'var(--bg-card-solid)' : 'transparent',
+            color: subTab === 'graph' ? 'var(--text-primary)' : 'var(--text-muted)',
+          }}
         >
           <Network className="w-3.5 h-3.5" />
-          知识图谱与诊断
+          知识图谱
         </button>
       </div>
 

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  BookMarked,
   BookOpen,
+  FilePlus2,
   GraduationCap,
   Loader2,
   MessageSquareText,
@@ -20,9 +22,10 @@ interface TutorPageProps {
     title?: string;
     initialPrompt?: string;
   } | null;
+  onRefreshGlobal?: () => void;
 }
 
-export function TutorPage({ initialContext }: TutorPageProps) {
+export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   const [sessions, setSessions] = useState<TutorSession[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
   const [activeSession, setActiveSession] = useState<TutorSession | null>(null);
@@ -31,8 +34,15 @@ export function TutorPage({ initialContext }: TutorPageProps) {
   const [selectedNoteIds, setSelectedNoteIds] = useState<string[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
   const [showContextPicker, setShowContextPicker] = useState(false);
+  const [toast, setToast] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2800);
+  };
 
   const loadSessions = async () => {
     const [sessList, noteList] = await Promise.all([api.getTutorSessions(), api.getNotes()]);
@@ -64,24 +74,19 @@ export function TutorPage({ initialContext }: TutorPageProps) {
     });
     setSessions((p) => [sess, ...p]);
     await openSession(sess.id);
-    if (opts?.initialPrompt) {
-      setInput(opts.initialPrompt);
-    }
+    if (opts?.initialPrompt) setInput(opts.initialPrompt);
   };
 
   useEffect(() => {
     loadSessions().then(({ sessList }) => {
-      if (initialContext) {
-        startNewSession(initialContext);
-      } else if (sessList.length > 0) {
-        openSession(sessList[0].id);
-      }
+      if (initialContext) startNewSession(initialContext);
+      else if (sessList.length > 0) openSession(sessList[0].id);
     });
   }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, sending]);
+  }, [messages, streamingText, sending]);
 
   const handleSend = async (customText?: string) => {
     const text = (customText ?? input).trim();
@@ -89,17 +94,15 @@ export function TutorPage({ initialContext }: TutorPageProps) {
 
     let session = activeSession;
     if (!session) {
-      session = await api.createTutorSession({
-        mode,
-        noteIds: selectedNoteIds,
-        title: text.slice(0, 22),
-      });
+      session = await api.createTutorSession({ mode, noteIds: selectedNoteIds, title: text.slice(0, 22) });
       setSessions((p) => [session!, ...p]);
       setActiveSession(session);
     }
 
     setInput('');
     setSending(true);
+    setStreamingText('');
+
     const optimisticUser: TutorMessage = {
       id: `temp-${Date.now()}`,
       session_id: session.id,
@@ -110,13 +113,15 @@ export function TutorPage({ initialContext }: TutorPageProps) {
     setMessages((prev) => [...prev, optimisticUser]);
 
     try {
-      const res = await api.sendTutorMessage(session.id, {
-        message: text,
-        noteIds: selectedNoteIds,
-        mode,
-      });
+      const res = await api.sendTutorMessageStream(
+        session.id,
+        { message: text, noteIds: selectedNoteIds, mode },
+        (delta) => setStreamingText((prev) => prev + delta)
+      );
+      setStreamingText('');
       setMessages((prev) => [...prev.filter((m) => m.id !== optimisticUser.id), res.userMessage, res.assistantMessage]);
     } catch (e: any) {
+      setStreamingText('');
       setMessages((prev) => [
         ...prev,
         {
@@ -132,26 +137,77 @@ export function TutorPage({ initialContext }: TutorPageProps) {
     }
   };
 
+  // Closed-loop沉淀: Save an AI reply directly as a Flashcard
+  const handleSaveAsFlashcard = async (msgIndex: number) => {
+    const aiMsg = messages[msgIndex];
+    const prevUser = [...messages.slice(0, msgIndex)].reverse().find((m) => m.role === 'user');
+    const front = prevUser?.content?.slice(0, 140) || activeSession?.title || '费曼对话要点';
+    try {
+      await api.createFlashcard({
+        front,
+        back: aiMsg.content.slice(0, 1200),
+        noteId: selectedNoteIds[0] || null,
+        conceptName: activeSession?.title || '助教沉淀',
+      });
+      onRefreshGlobal?.();
+      showToast('已一键存为记忆闪卡，加入复习计划！');
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
+
+  // Closed-loop沉淀: Append AI insight back into linked note (or create a new note)
+  const handleAppendToNote = async (aiContent: string) => {
+    try {
+      const targetNoteId = selectedNoteIds[0];
+      if (targetNoteId) {
+        const note = await api.getNote(targetNoteId);
+        const appended = `${note.content}\n\n---\n\n### 费曼助教延伸笔记（${new Date().toLocaleDateString()}）\n\n${aiContent}`;
+        await api.updateNote(note.id, { content: appended });
+        showToast(`已追加沉淀到《${note.title}》`);
+      } else {
+        await api.createNote({
+          title: `助教沉淀：${activeSession?.title || '学习思考'}`,
+          content: aiContent,
+          tags: ['费曼沉淀'],
+        });
+        showToast('已保存为新笔记');
+      }
+      onRefreshGlobal?.();
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
+
   const quickPrompts =
     mode === 'feynman'
-      ? ['请给我出一道开放式追问，检验我是否真懂了这篇笔记', '我用大白话复述一下核心原理，你帮我挑刺打分', '这个知识点最容易在哪些边界条件下被误用？']
-      : ['用生活中的通俗类比帮我讲透核心原理', '帮我提炼这份笔记里最容易混淆的 3 个考点', '这些知识在实际场景中怎么应用？'];
+      ? ['给我出一道追问，检验我是否真懂了', '我用大白话复述一遍，你帮我挑刺打分', '这个概念最容易在什么边界条件下误用？']
+      : ['用生活类比帮我讲透核心原理', '提炼这份笔记最易混淆的 3 个考点', '这些知识实际怎么用？'];
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-[calc(100vh-8.5rem)] md:h-[calc(100vh-4rem)]">
-      {/* Left Sessions Sidebar (Desktop) */}
-      <div className="hidden lg:flex lg:col-span-3 flex-col rounded-2xl bg-white border border-[#EAE6DF] overflow-hidden">
-        <div className="p-3.5 border-b border-[#EFECE6] space-y-2">
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-[calc(100vh-8.5rem)] md:h-[calc(100vh-4.5rem)]">
+      {toast && (
+        <div className="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-xl zw-btn-primary text-xs font-medium shadow-lg">
+          {toast}
+        </div>
+      )}
+
+      {/* Sessions Sidebar */}
+      <div className="hidden lg:flex lg:col-span-3 flex-col rounded-2xl zw-card overflow-hidden">
+        <div
+          className="p-3 border-b space-y-2"
+          style={{ borderColor: 'var(--border-hairline)' }}
+        >
           <button
             onClick={() => startNewSession({ mode: 'feynman' })}
-            className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[#0F766E] text-white text-xs font-semibold hover:bg-[#0D625B] cursor-pointer"
+            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
           >
-            <GraduationCap className="w-4 h-4" />
-            新建费曼考官演练
+            <GraduationCap className="w-3.5 h-3.5" />
+            新建费曼考官
           </button>
           <button
             onClick={() => startNewSession({ mode: 'qa' })}
-            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl bg-[#F3F5FC] text-[#3B5BDB] text-xs font-semibold hover:bg-[#E8EDFA] cursor-pointer"
+            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
             新建笔记答疑
@@ -163,13 +219,15 @@ export function TutorPage({ initialContext }: TutorPageProps) {
             <div
               key={s.id}
               onClick={() => openSession(s.id)}
-              className={`group flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-xs cursor-pointer transition ${
-                activeSession?.id === s.id ? 'bg-[#F3F5FC] text-[#3B5BDB] font-semibold' : 'hover:bg-[#F5F3EE] text-[#4A4741]'
-              }`}
+              className="group flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-xs cursor-pointer transition"
+              style={{
+                background: activeSession?.id === s.id ? 'var(--bg-active)' : 'transparent',
+                color: activeSession?.id === s.id ? 'var(--text-primary)' : 'var(--text-secondary)',
+              }}
             >
               <div className="min-w-0 flex-1">
-                <div className="truncate">{s.title}</div>
-                <div className="text-[10px] text-[#8A857C]">
+                <div className="truncate font-medium">{s.title}</div>
+                <div className="text-[10px] text-[var(--text-muted)]">
                   {s.mode === 'feynman' ? '费曼考官' : '深度答疑'}
                 </div>
               </div>
@@ -183,7 +241,7 @@ export function TutorPage({ initialContext }: TutorPageProps) {
                     setMessages([]);
                   }
                 }}
-                className="opacity-0 group-hover:opacity-100 p-1 text-[#9C978E] hover:text-red-600"
+                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger-fg)]"
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
@@ -192,61 +250,60 @@ export function TutorPage({ initialContext }: TutorPageProps) {
         </div>
       </div>
 
-      {/* Main Chat Panel */}
-      <div className="lg:col-span-9 flex flex-col rounded-2xl bg-white border border-[#EAE6DF] overflow-hidden">
-        {/* Chat Header */}
-        <div className="px-4 py-3 border-b border-[#EFECE6] flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <div className="flex bg-[#F5F3EE] p-1 rounded-xl">
-              <button
-                onClick={() => setMode('feynman')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer flex items-center gap-1 ${
-                  mode === 'feynman' ? 'bg-white text-[#0F766E] shadow-sm' : 'text-[#6F6B63]'
-                }`}
-              >
-                <GraduationCap className="w-3.5 h-3.5" />
-                费曼考官
-              </button>
-              <button
-                onClick={() => setMode('qa')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer flex items-center gap-1 ${
-                  mode === 'qa' ? 'bg-white text-[#3B5BDB] shadow-sm' : 'text-[#6F6B63]'
-                }`}
-              >
-                <MessageSquareText className="w-3.5 h-3.5" />
-                深度答疑
-              </button>
-            </div>
+      {/* Chat Area */}
+      <div className="lg:col-span-9 flex flex-col rounded-2xl zw-card overflow-hidden">
+        <div
+          className="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-2"
+          style={{ borderColor: 'var(--border-hairline)' }}
+        >
+          <div
+            className="flex p-1 rounded-xl"
+            style={{ background: 'var(--bg-subtle)' }}
+          >
+            <button
+              onClick={() => setMode('feynman')}
+              className="px-3 py-1 rounded-lg text-xs font-medium transition cursor-pointer flex items-center gap-1"
+              style={{
+                background: mode === 'feynman' ? 'var(--bg-card-solid)' : 'transparent',
+                color: mode === 'feynman' ? 'var(--text-primary)' : 'var(--text-muted)',
+              }}
+            >
+              <GraduationCap className="w-3.5 h-3.5" />
+              费曼考官
+            </button>
+            <button
+              onClick={() => setMode('qa')}
+              className="px-3 py-1 rounded-lg text-xs font-medium transition cursor-pointer flex items-center gap-1"
+              style={{
+                background: mode === 'qa' ? 'var(--bg-card-solid)' : 'transparent',
+                color: mode === 'qa' ? 'var(--text-primary)' : 'var(--text-muted)',
+              }}
+            >
+              <MessageSquareText className="w-3.5 h-3.5" />
+              深度答疑
+            </button>
           </div>
 
           <div className="flex items-center gap-2">
             <button
               onClick={() => setShowContextPicker(!showContextPicker)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium border cursor-pointer ${
-                selectedNoteIds.length > 0
-                  ? 'bg-[#F3F5FC] border-[#3B5BDB]/30 text-[#3B5BDB]'
-                  : 'bg-[#FAF9F6] border-[#E5E2DC] text-[#524F49]'
-              }`}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl zw-btn-secondary text-xs cursor-pointer"
             >
               <BookOpen className="w-3.5 h-3.5" />
               参考笔记 ({selectedNoteIds.length || '自动'})
             </button>
-            <button
-              onClick={() => startNewSession()}
-              className="lg:hidden p-2 rounded-xl bg-[#F5F3EE] text-[#1C1B18]"
-              title="新对话"
-            >
+            <button onClick={() => startNewSession()} className="lg:hidden p-2 rounded-xl zw-btn-secondary" title="新对话">
               <Plus className="w-4 h-4" />
             </button>
           </div>
         </div>
 
-        {/* Collapsible Context Note Picker */}
         {showContextPicker && (
-          <div className="px-4 py-3 bg-[#FAF9F6] border-b border-[#EFECE6] max-h-40 overflow-y-auto">
-            <div className="text-[11px] font-semibold text-[#6F6B63] mb-2">
-              勾选你想让助教重点参考的学习笔记（不选则默认参考最近更新的笔记）：
-            </div>
+          <div
+            className="px-4 py-3 border-b max-h-36 overflow-y-auto"
+            style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+          >
+            <div className="text-[11px] text-[var(--text-muted)] mb-2">勾选参考笔记（不选则默认参考最近笔记）：</div>
             <div className="flex flex-wrap gap-1.5">
               {notes.map((n) => {
                 const active = selectedNoteIds.includes(n.id);
@@ -256,9 +313,12 @@ export function TutorPage({ initialContext }: TutorPageProps) {
                     onClick={() =>
                       setSelectedNoteIds((p) => (p.includes(n.id) ? p.filter((x) => x !== n.id) : [...p, n.id]))
                     }
-                    className={`px-2.5 py-1 rounded-lg text-xs border transition cursor-pointer ${
-                      active ? 'bg-[#3B5BDB] border-[#3B5BDB] text-white' : 'bg-white border-[#E5E2DC] text-[#4A4741]'
-                    }`}
+                    className="px-2.5 py-1 rounded-lg text-xs border transition cursor-pointer"
+                    style={{
+                      background: active ? 'var(--btn-primary-bg)' : 'var(--bg-card-solid)',
+                      color: active ? 'var(--btn-primary-fg)' : 'var(--text-secondary)',
+                      borderColor: active ? 'transparent' : 'var(--border-hairline)',
+                    }}
                   >
                     {n.title}
                   </button>
@@ -268,62 +328,92 @@ export function TutorPage({ initialContext }: TutorPageProps) {
           </div>
         )}
 
-        {/* Messages Stream */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
           {messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-3 py-8">
-              <div className="w-12 h-12 rounded-2xl bg-[#EEF8F6] text-[#0F766E] flex items-center justify-center">
-                <Sparkles className="w-6 h-6" />
-              </div>
-              <h3 className="font-bold text-base text-[#141311]">
+            <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-2.5 py-8">
+              <Sparkles className="w-7 h-7 text-[var(--text-muted)]" />
+              <h3 className="font-semibold text-sm">
                 {mode === 'feynman' ? '费曼学习法：用输出倒逼深度理解' : '专属笔记助教：随时追问不留死角'}
               </h3>
-              <p className="text-xs text-[#7A756C] leading-relaxed">
-                {mode === 'feynman'
-                  ? '试着用你自己的语言解释一个刚刚学过的概念，AI 会像严格又温柔的考官一样发现漏洞并层层追问。'
-                  : '针对你导入的任何一篇笔记提问，支持举例类比、对比辨析和公式拆解。'}
+              <p className="text-xs text-[var(--text-muted)] leading-relaxed">
+                对话中的精炼结论可直接一键「存为闪卡」或「追加到笔记」，真正沉淀进你的知识库。
               </p>
             </div>
           ) : (
-            messages.map((m) => (
+            messages.map((m, idx) => (
               <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div
-                  className={`max-w-[88%] sm:max-w-[78%] rounded-2xl px-4 py-3 text-sm ${
-                    m.role === 'user'
-                      ? 'bg-[#3B5BDB] text-white rounded-br-md'
-                      : 'bg-[#FAF9F6] border border-[#EAE6DF] text-[#1C1B18] rounded-bl-md'
-                  }`}
-                >
-                  {m.role === 'user' ? (
-                    <div className="whitespace-pre-wrap leading-relaxed">{m.content}</div>
-                  ) : (
-                    <MarkdownView content={m.content} className="text-sm" />
+                <div className="max-w-[88%] sm:max-w-[78%] space-y-1.5">
+                  <div
+                    className={`rounded-2xl px-4 py-3 text-sm ${
+                      m.role === 'user' ? 'zw-btn-primary rounded-br-md' : 'border rounded-bl-md'
+                    }`}
+                    style={
+                      m.role === 'assistant'
+                        ? { background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }
+                        : undefined
+                    }
+                  >
+                    {m.role === 'user' ? (
+                      <div className="whitespace-pre-wrap leading-relaxed">{m.content}</div>
+                    ) : (
+                      <MarkdownView content={m.content} className="text-sm" />
+                    )}
+                  </div>
+                  {/* Closed-loop沉淀 actions on AI messages */}
+                  {m.role === 'assistant' && idx > 0 && (
+                    <div className="flex items-center gap-2 pl-1 text-[11px] text-[var(--text-muted)]">
+                      <button
+                        onClick={() => handleSaveAsFlashcard(idx)}
+                        className="inline-flex items-center gap-1 hover:text-[var(--text-primary)] cursor-pointer transition"
+                      >
+                        <BookMarked className="w-3 h-3" /> 存为闪卡
+                      </button>
+                      <span>·</span>
+                      <button
+                        onClick={() => handleAppendToNote(m.content)}
+                        className="inline-flex items-center gap-1 hover:text-[var(--text-primary)] cursor-pointer transition"
+                      >
+                        <FilePlus2 className="w-3 h-3" /> 追加到笔记
+                      </button>
+                    </div>
                   )}
                 </div>
               </div>
             ))
           )}
 
+          {/* Live Streaming Assistant Bubble */}
           {sending && (
             <div className="flex justify-start">
-              <div className="px-4 py-3 rounded-2xl bg-[#FAF9F6] border border-[#EAE6DF] text-xs text-[#6F6B63] flex items-center gap-2">
-                <Loader2 className="w-4 h-4 animate-spin text-[#3B5BDB]" />
-                正在结合你的笔记深度思考...
+              <div
+                className="max-w-[88%] sm:max-w-[78%] rounded-2xl rounded-bl-md px-4 py-3 border text-sm"
+                style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+              >
+                {streamingText ? (
+                  <MarkdownView content={streamingText} className="text-sm" />
+                ) : (
+                  <span className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    思考中...
+                  </span>
+                )}
               </div>
             </div>
           )}
           <div ref={bottomRef} />
         </div>
 
-        {/* Starter Chips & Input Box */}
-        <div className="p-3 sm:p-4 border-t border-[#EFECE6] bg-[#FAF9F6] space-y-2.5">
+        <div
+          className="p-3 sm:p-4 border-t space-y-2.5"
+          style={{ borderColor: 'var(--border-hairline)', background: 'var(--bg-subtle)' }}
+        >
           {messages.length <= 1 && (
             <div className="flex gap-1.5 overflow-x-auto pb-1">
               {quickPrompts.map((qp, i) => (
                 <button
                   key={i}
                   onClick={() => handleSend(qp)}
-                  className="shrink-0 px-3 py-1.5 rounded-full bg-white border border-[#E5E2DC] text-[11px] text-[#4A4741] hover:border-[#3B5BDB] hover:text-[#3B5BDB] cursor-pointer"
+                  className="shrink-0 px-3 py-1.5 rounded-full zw-btn-secondary text-[11px] cursor-pointer"
                 >
                   {qp}
                 </button>
@@ -344,15 +434,15 @@ export function TutorPage({ initialContext }: TutorPageProps) {
               rows={2}
               placeholder={
                 mode === 'feynman'
-                  ? '用你自己的话解释一个概念，或让考官开始向你提问... (Enter 发送)'
-                  : '输入你想请教的问题... (Enter 发送)'
+                  ? '用自己的话解释概念，或让考官向你提问... (Enter 发送)'
+                  : '输入想请教的问题... (Enter 发送)'
               }
-              className="flex-1 px-3.5 py-2.5 rounded-xl bg-white border border-[#DDD8CE] text-sm focus:outline-none focus:border-[#3B5BDB] resize-none"
+              className="flex-1 px-3.5 py-2.5 rounded-xl zw-input text-sm resize-none"
             />
             <button
               onClick={() => handleSend()}
               disabled={sending || !input.trim()}
-              className="p-3 rounded-xl bg-[#3B5BDB] text-white hover:bg-[#2F4AC2] disabled:opacity-50 cursor-pointer shrink-0"
+              className="p-3 rounded-xl zw-btn-primary disabled:opacity-45 cursor-pointer shrink-0"
             >
               <Send className="w-4 h-4" />
             </button>

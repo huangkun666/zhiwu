@@ -158,6 +158,48 @@ const serverApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  sendTutorMessageStream: async (
+    sessionId: string,
+    payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' },
+    onDelta: (delta: string) => void
+  ): Promise<{ userMessage: TutorMessage; assistantMessage: TutorMessage }> => {
+    const res = await fetch(`/api/tutor/sessions/${sessionId}/chat-stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok || !res.body) {
+      return serverApi.sendTutorMessage(sessionId, payload);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalResult: { userMessage: TutorMessage; assistantMessage: TutorMessage } | null = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line.startsWith('data:')) continue;
+        try {
+          const evt = JSON.parse(line.slice(5).trim());
+          if (evt.error) throw new Error(evt.error);
+          if (evt.delta) onDelta(evt.delta);
+          if (evt.done && evt.userMessage && evt.assistantMessage) {
+            finalResult = { userMessage: evt.userMessage, assistantMessage: evt.assistantMessage };
+          }
+        } catch (err: any) {
+          if (err?.message && !err.message.includes('JSON')) throw err;
+        }
+      }
+    }
+    if (!finalResult) throw new Error('流式响应中断，请重试。');
+    return finalResult;
+  },
   deleteTutorSession: (sessionId: string) =>
     request<{ ok: boolean }>(`/api/tutor/sessions/${sessionId}`, { method: 'DELETE' }),
 
@@ -183,8 +225,17 @@ const serverApi = {
       qrDataUrl: string;
     }>(`/api/settings/network${qs ? `?${qs}` : ''}`);
   },
-  exportJsonBackup: localApi.exportJsonBackup,
-  importJsonBackup: localApi.importJsonBackup,
+  exportJsonBackup: async (): Promise<string> => {
+    const data = await request<any>('/api/settings/export-json');
+    return JSON.stringify(data, null, 2);
+  },
+  importJsonBackup: async (jsonText: string): Promise<{ ok: boolean; notesCount: number }> => {
+    const parsed = JSON.parse(jsonText);
+    return request<{ ok: boolean; notesCount: number }>('/api/settings/import-json', {
+      method: 'POST',
+      body: JSON.stringify(parsed),
+    });
+  },
 };
 
 export const api = IS_STANDALONE_MODE ? localApi : serverApi;

@@ -648,6 +648,16 @@ export async function tutorChatAI(
   history: { role: 'user' | 'assistant'; content: string }[],
   userMessage: string
 ): Promise<string> {
+  const messages = buildTutorMessages(mode, notes, history, userMessage);
+  return callLLM(messages, { temperature: mode === 'feynman' ? 0.55 : 0.4 });
+}
+
+function buildTutorMessages(
+  mode: 'qa' | 'feynman',
+  notes: { title: string; content: string }[],
+  history: { role: 'user' | 'assistant'; content: string }[],
+  userMessage: string
+): ChatMessage[] {
   const noteContext = notes.length
     ? notes.map((n, i) => `【参考笔记${i + 1}：${n.title}】\n${n.content.slice(0, 4000)}`).join('\n\n')
     : '（未指定特定笔记，请结合通用知识与学习方法回答）';
@@ -668,11 +678,89 @@ ${noteContext}`
 参考学习材料：
 ${noteContext}`;
 
-  const messages: ChatMessage[] = [
+  return [
     { role: 'system', content: systemPrompt },
     ...history.slice(-12).map((h) => ({ role: h.role, content: h.content })),
     { role: 'user', content: userMessage },
   ];
+}
 
-  return callLLM(messages, { temperature: mode === 'feynman' ? 0.55 : 0.4 });
+export async function tutorChatStreamAI(
+  mode: 'qa' | 'feynman',
+  notes: { title: string; content: string }[],
+  history: { role: 'user' | 'assistant'; content: string }[],
+  userMessage: string,
+  onDelta: (chunk: string) => void
+): Promise<string> {
+  const provider = getActiveProvider();
+  const messages = buildTutorMessages(mode, notes, history, userMessage);
+  const temperature = mode === 'feynman' ? 0.55 : 0.4;
+
+  let res: Response;
+  if (provider.type === 'gemini') {
+    const base = (provider.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+    const url = `${base}/models/${encodeURIComponent(provider.model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(provider.apiKey)}`;
+    const systemParts = messages.filter((m) => m.role === 'system').map((m) => ({ text: m.content }));
+    const contents = messages
+      .filter((m) => m.role !== 'system')
+      .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents,
+        ...(systemParts.length ? { systemInstruction: { parts: systemParts } } : {}),
+        generationConfig: { temperature },
+      }),
+    });
+  } else {
+    const base = provider.baseUrl.replace(/\/+$/, '');
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (provider.apiKey) headers['Authorization'] = `Bearer ${provider.apiKey}`;
+    res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: provider.model, messages, temperature, stream: true }),
+    });
+  }
+
+  if (!res.ok || !res.body) {
+    // Graceful fallback to non-streaming call
+    const full = await callLLM(messages, { provider, temperature });
+    onDelta(full);
+    return full;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line.startsWith('data:')) continue;
+      const dataStr = line.slice(5).trim();
+      if (!dataStr || dataStr === '[DONE]') continue;
+      try {
+        const json = JSON.parse(dataStr);
+        const delta =
+          provider.type === 'gemini'
+            ? json?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || '').join('') || ''
+            : json?.choices?.[0]?.delta?.content || '';
+        if (delta) {
+          fullText += delta;
+          onDelta(delta);
+        }
+      } catch {
+        // ignore partial JSON chunks
+      }
+    }
+  }
+  return fullText.trim();
 }

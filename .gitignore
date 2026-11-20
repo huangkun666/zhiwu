@@ -5,4 +5,5 @@ client/dist/
 data/
 .env
 *.log
+*.apk
 .DS_Store

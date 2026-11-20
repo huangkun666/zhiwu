@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { db, logStudyActivity, nowIso, uid } from '../db.js';
-import { tutorChatAI } from '../services/ai.js';
+import { tutorChatAI, tutorChatStreamAI } from '../services/ai.js';
 
 export const tutorRouter = Router();
 
@@ -120,6 +120,74 @@ tutorRouter.post('/sessions/:id/chat', async (req, res) => {
     });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || '助教回复失败' });
+  }
+});
+
+// Streaming chat endpoint (SSE) for instant typewriter UX
+tutorRouter.post('/sessions/:id/chat-stream', async (req, res) => {
+  const session = db.prepare(`SELECT * FROM tutor_sessions WHERE id = ?`).get(req.params.id) as any;
+  if (!session) return res.status(404).json({ error: '会话不存在' });
+
+  const message = String(req.body?.message || '').trim();
+  if (!message) return res.status(400).json({ error: '消息内容不能为空' });
+
+  const noteIds: string[] = Array.isArray(req.body?.noteIds)
+    ? req.body.noteIds
+    : JSON.parse(session.note_ids || '[]');
+  const mode: 'qa' | 'feynman' = req.body?.mode === 'feynman' || session.mode === 'feynman' ? 'feynman' : 'qa';
+
+  let notes: { title: string; content: string }[] = [];
+  if (noteIds.length > 0) {
+    const ph = noteIds.map(() => '?').join(',');
+    notes = db.prepare(`SELECT title, content FROM notes WHERE id IN (${ph})`).all(...noteIds) as any[];
+  } else {
+    notes = db.prepare(`SELECT title, content FROM notes ORDER BY updated_at DESC LIMIT 4`).all() as any[];
+  }
+
+  const history = db
+    .prepare(`SELECT role, content FROM tutor_messages WHERE session_id = ? ORDER BY created_at ASC`)
+    .all(session.id) as { role: 'user' | 'assistant'; content: string }[];
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  try {
+    const reply = await tutorChatStreamAI(mode, notes, history, message, (delta) => {
+      res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+    });
+
+    const t1 = nowIso();
+    const userMsgId = uid();
+    db.prepare(
+      `INSERT INTO tutor_messages (id, session_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)`
+    ).run(userMsgId, session.id, message, t1);
+
+    const t2 = new Date(Date.now() + 10).toISOString();
+    const aiMsgId = uid();
+    db.prepare(
+      `INSERT INTO tutor_messages (id, session_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)`
+    ).run(aiMsgId, session.id, reply, t2);
+
+    db.prepare(`UPDATE tutor_sessions SET note_ids = ?, mode = ?, updated_at = ? WHERE id = ?`).run(
+      JSON.stringify(noteIds),
+      mode,
+      t2,
+      session.id
+    );
+    logStudyActivity('tutor_chat', session.id, null, 60);
+
+    res.write(
+      `data: ${JSON.stringify({
+        done: true,
+        userMessage: { id: userMsgId, session_id: session.id, role: 'user', content: message, created_at: t1 },
+        assistantMessage: { id: aiMsgId, session_id: session.id, role: 'assistant', content: reply, created_at: t2 },
+      })}\n\n`
+    );
+    res.end();
+  } catch (err: any) {
+    res.write(`data: ${JSON.stringify({ error: err?.message || '助教回复失败' })}\n\n`);
+    res.end();
   }
 });
 

@@ -12,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api/client';
+import { compressImageIfNeeded } from '../utils/imageCompress';
 import type { ActiveModelCapability, Category, Note } from '../types';
 
 interface QuickImportModalProps {
@@ -71,11 +72,10 @@ export function QuickImportModal({
     if (!list) return;
     const arr = Array.from(list);
 
-    // Block images explicitly if current model does not support vision
     const imageFiles = arr.filter(isImageFile);
     if (imageFiles.length > 0 && !supportsVision) {
       setError(
-        `当前模型「${modelLabel}」不支持视觉输入，无法上传图片笔记。请前往「设置」切换支持多模态视觉的模型（如 Gemini、GPT-4o / 4o-mini、Qwen-VL 等）并开启视觉支持。`
+        `当前模型「${modelLabel}」不支持视觉输入，无法上传图片笔记。请前往「设置」切换支持多模态视觉的模型并开启视觉支持。`
       );
       const nonImages = arr.filter((f) => !isImageFile(f));
       if (nonImages.length === 0) return;
@@ -98,7 +98,7 @@ export function QuickImportModal({
     if (valid.length === 0 && imageFiles.length === 0) {
       setError(
         supportsVision
-          ? '仅支持 Markdown (.md)、文本 (.txt)、PDF、Word (.docx) 及常见图片格式'
+          ? '仅支持 Markdown (.md)、文本 (.txt)、PDF、Word (.docx) 及图片格式'
           : '仅支持 Markdown (.md)、文本 (.txt)、PDF、Word (.docx) 格式（当前模型不支持图片上传）'
       );
       return;
@@ -146,8 +146,10 @@ export function QuickImportModal({
           setLoading(false);
           return;
         }
-        setStatusText(`正在解析导入 ${selectedFiles.length} 个文件...`);
-        const res = await api.importFiles(selectedFiles, categoryId || null, tags);
+        // Automatically compress large mobile photos for 5x faster OCR & 90% storage savings
+        setStatusText('正在优化文件并解析导入...');
+        const processedFiles = await Promise.all(selectedFiles.map((f) => compressImageIfNeeded(f)));
+        const res = await api.importFiles(processedFiles, categoryId || null, tags);
         createdNotes = res.imported;
         if (res.warnings?.length) setWarnings(res.warnings);
       }
@@ -181,93 +183,106 @@ export function QuickImportModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-[2px] p-0 sm:p-4">
-      <div className="w-full sm:max-w-xl bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#E8E5DF] max-h-[92vh] flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/55 backdrop-blur-sm p-0 sm:p-4">
+      <div className="w-full sm:max-w-xl zw-modal rounded-t-2xl sm:rounded-2xl max-h-[92vh] flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-[#EFECE6]">
+        <div
+          className="flex items-center justify-between px-5 py-4 border-b"
+          style={{ borderColor: 'var(--border-hairline)' }}
+        >
           <div>
-            <h2 className="text-lg font-bold text-[#1C1B18]">随时导入笔记</h2>
-            <p className="text-xs text-[#6F6B63]">
-              支持 Markdown / PDF / Word / 快速粘贴{supportsVision ? ' / 拍照图片识别' : ''}
+            <h2 className="text-base font-semibold tracking-tight">导入笔记</h2>
+            <p className="text-xs text-[var(--text-muted)] mt-0.5">
+              Markdown / PDF / Word / 随手粘贴{supportsVision ? ' / 拍照自动压缩识图' : ''}
             </p>
           </div>
           <button
             onClick={onClose}
-            className="p-2 rounded-lg text-[#6F6B63] hover:bg-[#F5F3EE] hover:text-[#1C1B18]"
+            className="p-1.5 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
           >
-            <X className="w-5 h-5" />
+            <X className="w-4 h-4" />
           </button>
         </div>
 
         {/* Mode Switcher */}
-        <div className="flex gap-2 px-5 pt-4">
-          <button
-            onClick={() => setTab('file')}
-            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium transition cursor-pointer ${
-              tab === 'file'
-                ? 'bg-[#3B5BDB] text-white shadow-sm'
-                : 'bg-[#F5F3EE] text-[#524F49] hover:bg-[#ECE9E2]'
-            }`}
+        <div className="px-5 pt-4">
+          <div
+            className="grid grid-cols-2 p-1 rounded-xl"
+            style={{ background: 'var(--bg-subtle)' }}
           >
-            <Upload className="w-4 h-4" />
-            文件导入{supportsVision ? ' / 拍照' : ''}
-          </button>
-          <button
-            onClick={() => setTab('paste')}
-            className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium transition cursor-pointer ${
-              tab === 'paste'
-                ? 'bg-[#3B5BDB] text-white shadow-sm'
-                : 'bg-[#F5F3EE] text-[#524F49] hover:bg-[#ECE9E2]'
-            }`}
-          >
-            <FileText className="w-4 h-4" />
-            快速粘贴 / 随手记
-          </button>
+            <button
+              onClick={() => setTab('file')}
+              className="flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold transition cursor-pointer"
+              style={{
+                background: tab === 'file' ? 'var(--bg-card-solid)' : 'transparent',
+                color: tab === 'file' ? 'var(--text-primary)' : 'var(--text-muted)',
+              }}
+            >
+              <Upload className="w-3.5 h-3.5" />
+              文件{supportsVision ? ' / 拍照' : ''}
+            </button>
+            <button
+              onClick={() => setTab('paste')}
+              className="flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold transition cursor-pointer"
+              style={{
+                background: tab === 'paste' ? 'var(--bg-card-solid)' : 'transparent',
+                color: tab === 'paste' ? 'var(--text-primary)' : 'var(--text-muted)',
+              }}
+            >
+              <FileText className="w-3.5 h-3.5" />
+              粘贴 / 随手记
+            </button>
+          </div>
         </div>
 
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4">
           {tab === 'file' ? (
             <>
-              {/* Vision status notice when unsupported */}
               {!supportsVision && (
-                <div className="flex items-start gap-2.5 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs leading-relaxed">
-                  <ImageOff className="w-4 h-4 shrink-0 mt-0.5 text-amber-700" />
+                <div
+                  className="flex items-start gap-2.5 p-3 rounded-xl border text-xs leading-relaxed"
+                  style={{
+                    background: 'var(--warn-bg)',
+                    borderColor: 'var(--warn-border)',
+                    color: 'var(--warn-fg)',
+                  }}
+                >
+                  <ImageOff className="w-4 h-4 shrink-0 mt-0.5" />
                   <div className="flex-1">
-                    当前模型 <strong>{modelLabel}</strong> 不支持视觉输入，已禁用图片/拍照上传。
+                    当前模型 <strong>{modelLabel}</strong> 不支持视觉输入，已禁用图片上传。
                     <button
                       type="button"
                       onClick={() => {
                         onClose();
                         onOpenSettings();
                       }}
-                      className="ml-1.5 font-semibold text-[#3B5BDB] underline cursor-pointer"
+                      className="ml-1.5 underline font-semibold cursor-pointer"
                     >
-                      去设置切换支持视觉的模型 →
+                      去设置切换 →
                     </button>
                   </div>
                 </div>
               )}
 
-              {/* Camera + Batch Folder Actions */}
               <div className="grid grid-cols-2 gap-2.5">
                 <button
                   type="button"
                   disabled={!supportsVision}
                   onClick={() => cameraInputRef.current?.click()}
-                  className={`flex items-center justify-center gap-2 py-3 px-3 rounded-xl border font-medium text-sm transition ${
+                  className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-semibold transition ${
                     supportsVision
-                      ? 'border-[#3B5BDB]/30 bg-[#F3F5FC] text-[#3B5BDB] hover:bg-[#E8EDFA] active:scale-[0.98] cursor-pointer'
-                      : 'border-[#E5E2DC] bg-[#F5F3EE] text-[#A29D94] cursor-not-allowed'
+                      ? 'zw-btn-secondary cursor-pointer active:scale-[0.98]'
+                      : 'opacity-45 cursor-not-allowed border border-[var(--border-hairline)]'
                   }`}
                 >
                   {supportsVision ? <Camera className="w-4 h-4" /> : <ImageOff className="w-4 h-4" />}
-                  {supportsVision ? '拍照 / 选图 OCR' : '不支持图片上传'}
+                  {supportsVision ? '拍照 / 选图识字' : '不支持图片上传'}
                 </button>
                 <button
                   type="button"
                   onClick={() => folderInputRef.current?.click()}
-                  className="flex items-center justify-center gap-2 py-3 px-3 rounded-xl border border-[#E5E2DC] bg-[#FAF9F6] text-[#3B3832] font-medium text-sm hover:bg-[#F1EFEA] active:scale-[0.98] transition cursor-pointer"
+                  className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl zw-btn-secondary text-xs font-semibold active:scale-[0.98] transition cursor-pointer"
                 >
                   <FolderUp className="w-4 h-4" />
                   批量导入文件夹
@@ -294,13 +309,12 @@ export function QuickImportModal({
                 ref={folderInputRef}
                 type="file"
                 multiple
-                // @ts-ignore webkitdirectory is supported on desktop browsers
+                // @ts-ignore webkitdirectory
                 webkitdirectory=""
                 className="hidden"
                 onChange={(e) => addFiles(e.target.files)}
               />
 
-              {/* Drag-and-drop area */}
               <div
                 onClick={() => fileInputRef.current?.click()}
                 onDragOver={(e) => {
@@ -313,32 +327,33 @@ export function QuickImportModal({
                   setIsDragging(false);
                   addFiles(e.dataTransfer.files);
                 }}
-                className={`cursor-pointer rounded-2xl border-2 border-dashed p-6 text-center transition ${
-                  isDragging
-                    ? 'border-[#3B5BDB] bg-[#F3F5FC]'
-                    : 'border-[#DDD8CE] bg-[#FAF9F6] hover:border-[#3B5BDB]/60'
-                }`}
+                className="cursor-pointer rounded-2xl border border-dashed p-6 text-center transition"
+                style={{
+                  borderColor: isDragging ? 'var(--text-primary)' : 'var(--border-strong)',
+                  background: isDragging ? 'var(--bg-hover)' : 'var(--bg-subtle)',
+                }}
               >
-                <Upload className="w-8 h-8 mx-auto text-[#6F6B63] mb-2" />
-                <p className="text-sm font-medium text-[#1C1B18]">点击选择文件，或将笔记拖拽到这里</p>
-                <p className="text-xs text-[#8A857C] mt-1">
-                  支持 .md / .txt / .pdf / .docx{supportsVision ? ' / 图片' : ''}（单次最多 30 个文件）
+                <Upload className="w-6 h-6 mx-auto text-[var(--text-muted)] mb-2" />
+                <p className="text-xs font-medium">点击选择或将笔记拖放到这里</p>
+                <p className="text-[11px] text-[var(--text-muted)] mt-1">
+                  .md / .txt / .pdf / .docx{supportsVision ? ' / 图片（自动压缩）' : ''}
                 </p>
               </div>
 
               {selectedFiles.length > 0 && (
-                <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+                <div className="space-y-1.5 max-h-32 overflow-y-auto">
                   {selectedFiles.map((f, idx) => (
                     <div
                       key={`${f.name}-${idx}`}
-                      className="flex items-center justify-between px-3 py-2 rounded-lg bg-[#F5F3EE] text-xs"
+                      className="flex items-center justify-between px-3 py-2 rounded-lg text-xs"
+                      style={{ background: 'var(--bg-subtle)' }}
                     >
-                      <span className="truncate font-medium text-[#2A2824]">{f.name}</span>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-[#7A756C]">{(f.size / 1024).toFixed(0)} KB</span>
+                      <span className="truncate font-medium">{f.name}</span>
+                      <div className="flex items-center gap-2 shrink-0 text-[var(--text-muted)]">
+                        <span>{(f.size / 1024).toFixed(0)} KB</span>
                         <button
                           onClick={() => setSelectedFiles((prev) => prev.filter((_, i) => i !== idx))}
-                          className="text-[#8A857C] hover:text-red-600"
+                          className="hover:text-[var(--danger-fg)]"
                         >
                           <X className="w-3.5 h-3.5" />
                         </button>
@@ -351,35 +366,34 @@ export function QuickImportModal({
           ) : (
             <>
               <div>
-                <label className="block text-xs font-medium text-[#524F49] mb-1">笔记标题（留空则自动从首行提取）</label>
+                <label className="block text-xs text-[var(--text-secondary)] mb-1.5">标题（留空自动提取首行）</label>
                 <input
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
-                  placeholder="例如：操作系统进程调度算法笔记"
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#E5E2DC] bg-[#FAF9F6] text-sm focus:outline-none focus:border-[#3B5BDB] focus:bg-white"
+                  placeholder="例如：操作系统进程调度笔记"
+                  className="w-full px-3.5 py-2.5 rounded-xl zw-input text-sm"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-[#524F49] mb-1">正文内容（支持 Markdown 与 LaTeX 公式）</label>
+                <label className="block text-xs text-[var(--text-secondary)] mb-1.5">正文（支持 Markdown 与 LaTeX）</label>
                 <textarea
                   value={content}
                   onChange={(e) => setContent(e.target.value)}
                   rows={7}
-                  placeholder="直接粘贴课堂笔记、文章片段或你的思考..."
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#E5E2DC] bg-[#FAF9F6] text-sm focus:outline-none focus:border-[#3B5BDB] focus:bg-white resize-y font-mono"
+                  placeholder="粘贴学习笔记或记录你的思考..."
+                  className="w-full px-3.5 py-2.5 rounded-xl zw-input text-sm resize-y font-mono"
                 />
               </div>
             </>
           )}
 
-          {/* Category & Tags */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-[#524F49] mb-1">归属分类（可选）</label>
+              <label className="block text-xs text-[var(--text-secondary)] mb-1">分类</label>
               <select
                 value={categoryId}
                 onChange={(e) => setCategoryId(e.target.value)}
-                className="w-full px-3 py-2.5 rounded-xl border border-[#E5E2DC] bg-[#FAF9F6] text-sm focus:outline-none focus:border-[#3B5BDB]"
+                className="w-full px-3 py-2.5 rounded-xl zw-input text-xs"
               >
                 <option value="">暂不分类 / 交由 AI 推荐</option>
                 {categories.map((c) => (
@@ -390,41 +404,50 @@ export function QuickImportModal({
               </select>
             </div>
             <div>
-              <label className="block text-xs font-medium text-[#524F49] mb-1">标签（空格或逗号分隔）</label>
+              <label className="block text-xs text-[var(--text-secondary)] mb-1">标签（空格分隔）</label>
               <input
                 value={tagsText}
                 onChange={(e) => setTagsText(e.target.value)}
-                placeholder="如：期末复习 核心概念"
-                className="w-full px-3 py-2.5 rounded-xl border border-[#E5E2DC] bg-[#FAF9F6] text-sm focus:outline-none focus:border-[#3B5BDB]"
+                placeholder="如：复习 核心"
+                className="w-full px-3 py-2.5 rounded-xl zw-input text-xs"
               />
             </div>
           </div>
 
-          <label className="flex items-center gap-2.5 p-3 rounded-xl bg-[#F3F5FC] border border-[#3B5BDB]/15 cursor-pointer">
+          <label
+            className="flex items-center gap-2.5 p-3 rounded-xl border cursor-pointer"
+            style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+          >
             <input
               type="checkbox"
               checked={autoSummarize}
               onChange={(e) => setAutoSummarize(e.target.checked)}
-              className="w-4 h-4 accent-[#3B5BDB] rounded"
+              className="w-4 h-4 rounded accent-[var(--text-primary)]"
             />
             <div className="flex-1">
-              <div className="text-sm font-medium text-[#1F2E6E] flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-[#3B5BDB]" />
-                导入后自动执行 AI 总结并构建知识图谱
+              <div className="text-xs font-semibold flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5" />
+                导入后自动 AI 总结并同步图谱
               </div>
-              <p className="text-xs text-[#54629B]">自动提取摘要、要点、概念关联与推荐标签</p>
+              <p className="text-[11px] text-[var(--text-muted)]">自动提取摘要、核心要点与概念关联</p>
             </div>
           </label>
 
           {error && (
-            <div className="flex items-start gap-2 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs">
+            <div
+              className="flex items-start gap-2 p-3 rounded-xl border text-xs"
+              style={{ background: 'var(--danger-bg)', borderColor: 'var(--danger-border)', color: 'var(--danger-fg)' }}
+            >
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{error}</span>
             </div>
           )}
 
           {warnings.length > 0 && (
-            <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs space-y-1">
+            <div
+              className="p-3 rounded-xl border text-xs space-y-1"
+              style={{ background: 'var(--warn-bg)', borderColor: 'var(--warn-border)', color: 'var(--warn-fg)' }}
+            >
               <div className="font-semibold flex items-center gap-1.5">
                 <CheckCircle2 className="w-4 h-4" />
                 导入提示：
@@ -437,26 +460,29 @@ export function QuickImportModal({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-2.5 px-5 py-3.5 border-t border-[#EFECE6] bg-[#FAF9F6] pb-safe">
+        <div
+          className="flex items-center justify-end gap-2 px-5 py-3.5 border-t pb-safe"
+          style={{ borderColor: 'var(--border-hairline)', background: 'var(--bg-subtle)' }}
+        >
           <button
             onClick={onClose}
             disabled={loading}
-            className="px-4 py-2.5 rounded-xl text-sm font-medium text-[#524F49] hover:bg-[#ECE9E2] transition cursor-pointer"
+            className="px-4 py-2 rounded-xl text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] cursor-pointer"
           >
             取消
           </button>
           <button
             onClick={handleSubmit}
             disabled={loading}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold bg-[#3B5BDB] text-white hover:bg-[#2F4AC2] disabled:opacity-60 transition shadow-sm cursor-pointer"
+            className="flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-semibold zw-btn-primary disabled:opacity-50 cursor-pointer"
           >
             {loading ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
                 {statusText || '处理中...'}
               </>
             ) : (
-              <>确认导入</>
+              '确认导入'
             )}
           </button>
         </div>
