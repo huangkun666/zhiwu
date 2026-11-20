@@ -12,6 +12,7 @@ import { graphRouter } from './routes/graph.js';
 import { tutorRouter } from './routes/tutor.js';
 import { dashboardRouter } from './routes/dashboard.js';
 import { getLocalIPv4Addresses, settingsRouter } from './routes/settings.js';
+import { transferRouter } from './routes/transfer.js';
 
 initDatabase();
 
@@ -34,6 +35,7 @@ app.use('/api/flashcards', flashcardsRouter);
 app.use('/api/graph', graphRouter);
 app.use('/api/tutor', tutorRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/transfer', transferRouter);
 
 // Serve built frontend in single-port production mode (ideal for Desktop + Android LAN/Cloud!)
 const clientDistDir = path.join(PROJECT_ROOT, 'client', 'dist');

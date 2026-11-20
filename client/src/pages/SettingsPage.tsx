@@ -2,23 +2,25 @@ import { useEffect, useState } from 'react';
 import {
   Camera,
   CheckCircle2,
+  Cloud,
   Cpu,
-  Database,
   Download,
   Eye,
   EyeOff,
+  HardDrive,
   ImageOff,
   Loader2,
   Moon,
-  Plus,
+  QrCode,
+  RefreshCw,
   Save,
-  Smartphone,
   Sun,
   Upload,
-  Wifi,
   Zap,
 } from 'lucide-react';
 import { api, IS_STANDALONE_MODE } from '../api/client';
+import { QrScannerModal } from '../components/QrScannerModal';
+import { QrSendModal } from '../components/QrSendModal';
 import type { AIProviderConfig, AISettings } from '../types';
 import type { ThemeMode } from '../utils/theme';
 
@@ -32,28 +34,26 @@ const VISION_MODEL_HINT = /gemini|gpt-4o|gpt-4\.1|vl|vision|llava|omni|claude-3|
 
 export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: SettingsPageProps) {
   const [settings, setSettings] = useState<AISettings | null>(null);
-  const [selectedId, setSelectedId] = useState<string>('deepseek');
+  const [selectedId, setSelectedId] = useState<'remote' | 'local'>('remote');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [seeding, setSeeding] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
   const [savedToast, setSavedToast] = useState(false);
 
-  const [netInfo, setNetInfo] = useState<{ mobileUrl: string; qrDataUrl: string; ips: string[] } | null>(null);
+  // Live fetched model list
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [modelFilter, setModelFilter] = useState('');
+  const [modelsError, setModelsError] = useState('');
+  const [qrSendOpen, setQrSendOpen] = useState(false);
+  const [qrScanOpen, setQrScanOpen] = useState(false);
 
   useEffect(() => {
     api.getSettings().then((s) => {
       setSettings(s);
-      setSelectedId(s.activeProviderId || s.providers[0]?.id || 'deepseek');
+      setSelectedId(s.activeProviderId === 'local' ? 'local' : 'remote');
     });
-    if (!IS_STANDALONE_MODE) {
-      const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
-      api
-        .getNetworkInfo(port)
-        .then(setNetInfo)
-        .catch(() => {});
-    }
   }, []);
 
   if (!settings) {
@@ -75,26 +75,13 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
             else if (/deepseek-chat|deepseek-reasoner|qwen-plus|qwen-turbo|qwen-max/i.test(value))
               next.supportsVision = false;
           }
+          if (field === 'type' && value === 'gemini' && (!p.baseUrl || p.baseUrl.includes('deepseek') || p.baseUrl.includes('openai'))) {
+            next.baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
+          }
           return next;
         }),
       };
     });
-  };
-
-  const addCustomProvider = () => {
-    const id = `custom-${Date.now().toString(36)}`;
-    const next: AIProviderConfig = {
-      id,
-      name: '自定义兼容接口',
-      type: 'openai',
-      baseUrl: 'https://api.example.com/v1',
-      apiKey: '',
-      model: 'gpt-4o-mini',
-      supportsVision: true,
-      requiresKey: true,
-    };
-    setSettings((prev) => (prev ? { ...prev, providers: [...prev.providers, next] } : prev));
-    setSelectedId(id);
   };
 
   const handleSave = async (makeActive = false) => {
@@ -130,6 +117,24 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
     }
   };
 
+  const handleFetchModels = async () => {
+    setFetchingModels(true);
+    setModelsError('');
+    setModelFilter('');
+    try {
+      const res = await api.fetchModels(currentProvider);
+      setFetchedModels(res.models || []);
+      if (!res.models?.length) {
+        setModelsError('接口返回了空的模型列表，请手动输入模型名称。');
+      }
+    } catch (e: any) {
+      setFetchedModels([]);
+      setModelsError(e.message || '获取模型列表失败');
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
   const handleExportJson = async () => {
     const json = await api.exportJsonBackup();
     const blob = new Blob([json], { type: 'application/json' });
@@ -152,18 +157,22 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
     }
   };
 
+  const filteredModels = modelFilter.trim()
+    ? fetchedModels.filter((m) => m.toLowerCase().includes(modelFilter.trim().toLowerCase()))
+    : fetchedModels;
+
   return (
-    <div className="max-w-4xl space-y-6">
+    <div className="max-w-3xl space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
         <p className="text-xs text-[var(--text-muted)] mt-1">
-          外观主题、单一 AI 模型与电脑/手机跨端通用备份。
+          深浅主题、AI 模型与跨端通用备份。
         </p>
       </div>
 
       {/* Dual Minimal Theme Switcher */}
       <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-3.5">
-        <h2 className="font-semibold text-sm">外观与质感主题</h2>
+        <h2 className="font-semibold text-sm">外观主题</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <button
             onClick={() => onSelectTheme('dark')}
@@ -207,72 +216,79 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
         </div>
       </div>
 
-      {/* Unified Single-Model AI Config */}
+      {/* Clean 2-Slot AI Model Config: Remote vs Local */}
       <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <Cpu className="w-4 h-4 text-[var(--text-secondary)]" />
-            <h2 className="font-semibold text-sm">AI 模型配置（单一模型）</h2>
-          </div>
-          <button
-            onClick={addCustomProvider}
-            className="flex items-center gap-1 px-3 py-1.5 rounded-xl zw-btn-secondary text-xs cursor-pointer"
-          >
-            <Plus className="w-3.5 h-3.5" /> 自定义接口
-          </button>
+        <div className="flex items-center gap-2">
+          <Cpu className="w-4 h-4 text-[var(--text-secondary)]" />
+          <h2 className="font-semibold text-sm">AI 模型配置</h2>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          {settings.providers.map((p) => {
-            const isSelected = p.id === currentProvider.id;
-            const isActive = p.id === settings.activeProviderId;
+        {/* Remote vs Local Switcher */}
+        <div className="grid grid-cols-2 gap-2.5">
+          {[
+            { id: 'remote' as const, label: '远程模型', sub: 'API Key · 任意云端接口', icon: Cloud },
+            { id: 'local' as const, label: '本地模型', sub: 'Ollama / LM Studio / vLLM', icon: HardDrive },
+          ].map((item) => {
+            const Icon = item.icon;
+            const isSelected = selectedId === item.id;
+            const isActive = settings.activeProviderId === item.id;
             return (
               <button
-                key={p.id}
+                key={item.id}
                 onClick={() => {
-                  setSelectedId(p.id);
+                  setSelectedId(item.id);
                   setTestResult(null);
+                  setFetchedModels([]);
+                  setModelsError('');
                 }}
-                className="px-3.5 py-2 rounded-xl text-xs font-medium border transition flex items-center gap-1.5 cursor-pointer"
+                className="text-left p-3.5 rounded-xl border transition cursor-pointer flex items-center justify-between gap-2"
                 style={{
                   background: isSelected ? 'var(--btn-primary-bg)' : 'var(--bg-subtle)',
-                  color: isSelected ? 'var(--btn-primary-fg)' : 'var(--text-secondary)',
+                  color: isSelected ? 'var(--btn-primary-fg)' : 'var(--text-primary)',
                   borderColor: isSelected ? 'transparent' : 'var(--border-hairline)',
                 }}
               >
-                {p.name}
-                {isActive && (
-                  <span className="text-[10px] opacity-75">· 默认</span>
-                )}
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <Icon className="w-4 h-4 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold flex items-center gap-1.5">
+                      {item.label}
+                      {isActive && <span className="text-[10px] opacity-75">· 使用中</span>}
+                    </div>
+                    <div className="text-[10.5px] opacity-70 truncate mt-0.5">{item.sub}</div>
+                  </div>
+                </div>
               </button>
             );
           })}
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
-          <div>
-            <label className="block text-xs text-[var(--text-secondary)] mb-1">配置名称</label>
-            <input
-              value={currentProvider.name}
-              onChange={(e) => updateProviderField('name', e.target.value)}
-              className="w-full px-3.5 py-2.5 rounded-xl zw-input text-sm"
-            />
-          </div>
+        {/* Provider Form */}
+        <div className="space-y-4">
+          {selectedId === 'remote' && (
+            <div>
+              <label className="block text-xs text-[var(--text-secondary)] mb-1.5">接口协议</label>
+              <select
+                value={currentProvider.type}
+                onChange={(e) => {
+                  updateProviderField('type', e.target.value as 'openai' | 'gemini');
+                  setFetchedModels([]);
+                }}
+                className="w-full px-3.5 py-2.5 rounded-xl zw-input text-xs"
+              >
+                <option value="openai">OpenAI 兼容协议（DeepSeek / 通义千问 / OpenAI / 中转站通用）</option>
+                <option value="gemini">Google Gemini 原生协议</option>
+              </select>
+            </div>
+          )}
 
           <div>
-            <label className="block text-xs text-[var(--text-secondary)] mb-1">协议类型</label>
-            <select
-              value={currentProvider.type}
-              onChange={(e) => updateProviderField('type', e.target.value as 'openai' | 'gemini')}
-              className="w-full px-3.5 py-2.5 rounded-xl zw-input text-sm"
-            >
-              <option value="openai">OpenAI 兼容协议 (DeepSeek / 通义 / Ollama)</option>
-              <option value="gemini">Google Gemini 原生协议</option>
-            </select>
-          </div>
-
-          <div className="sm:col-span-2">
-            <label className="block text-xs text-[var(--text-secondary)] mb-1">API Base URL</label>
+            <label className="block text-xs text-[var(--text-secondary)] mb-1.5">
+              API Base URL
+              <span className="text-[var(--text-muted)] ml-1.5">
+                {selectedId === 'local' ? '（如 http://127.0.0.1:11434/v1）' : '（如 https://api.deepseek.com/v1）'}
+              </span>
+            </label>
             <input
               value={currentProvider.baseUrl}
               onChange={(e) => updateProviderField('baseUrl', e.target.value)}
@@ -280,14 +296,16 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
             />
           </div>
 
-          <div className="sm:col-span-2">
-            <label className="block text-xs text-[var(--text-secondary)] mb-1">API Key</label>
+          <div>
+            <label className="block text-xs text-[var(--text-secondary)] mb-1.5">
+              API Key {selectedId === 'local' && <span className="text-[var(--text-muted)]">（本地服务留空或填 ollama 即可）</span>}
+            </label>
             <div className="relative">
               <input
                 type={showKey ? 'text' : 'password'}
                 value={currentProvider.apiKey}
                 onChange={(e) => updateProviderField('apiKey', e.target.value)}
-                placeholder="sk-..."
+                placeholder={selectedId === 'local' ? 'ollama（可选）' : 'sk-...'}
                 className="w-full pl-3.5 pr-10 py-2.5 rounded-xl zw-input text-sm font-mono"
               />
               <button
@@ -300,40 +318,105 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
             </div>
           </div>
 
-          <div className="sm:col-span-2">
-            <label className="block text-xs text-[var(--text-secondary)] mb-1">模型名称（统一用于全部功能）</label>
-            <input
-              value={currentProvider.model}
-              onChange={(e) => updateProviderField('model', e.target.value)}
-              placeholder="deepseek-chat / qwen-vl-plus / gemini-2.5-flash / gpt-4o-mini"
-              className="w-full px-3.5 py-2.5 rounded-xl zw-input text-sm font-mono"
-            />
+          {/* Model Name + Fetch Live Model List */}
+          <div className="space-y-2.5">
+            <label className="block text-xs text-[var(--text-secondary)]">模型名称</label>
+            <div className="flex gap-2">
+              <input
+                value={currentProvider.model}
+                onChange={(e) => updateProviderField('model', e.target.value)}
+                placeholder={selectedId === 'local' ? 'qwen2.5:7b / llava' : 'deepseek-chat / gpt-4o-mini / gemini-2.5-flash'}
+                className="flex-1 px-3.5 py-2.5 rounded-xl zw-input text-sm font-mono"
+              />
+              <button
+                type="button"
+                onClick={handleFetchModels}
+                disabled={fetchingModels}
+                className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl zw-btn-secondary text-xs font-medium shrink-0 cursor-pointer disabled:opacity-50"
+              >
+                {fetchingModels ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                获取模型列表
+              </button>
+            </div>
+
+            {modelsError && (
+              <div
+                className="p-2.5 rounded-xl border text-xs"
+                style={{ background: 'var(--danger-bg)', borderColor: 'var(--danger-border)', color: 'var(--danger-fg)' }}
+              >
+                {modelsError}
+              </div>
+            )}
+
+            {fetchedModels.length > 0 && (
+              <div
+                className="p-3 rounded-xl border space-y-2"
+                style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-[var(--text-muted)]">
+                    已获取 {fetchedModels.length} 个可用模型，点击选用：
+                  </span>
+                  {fetchedModels.length > 8 && (
+                    <input
+                      value={modelFilter}
+                      onChange={(e) => setModelFilter(e.target.value)}
+                      placeholder="筛选模型..."
+                      className="w-36 px-2.5 py-1 rounded-lg zw-input text-[11px]"
+                    />
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto pr-0.5">
+                  {filteredModels.map((m) => {
+                    const active = currentProvider.model === m;
+                    return (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => updateProviderField('model', m)}
+                        className="px-2.5 py-1 rounded-lg text-[11px] font-mono border transition cursor-pointer"
+                        style={{
+                          background: active ? 'var(--btn-primary-bg)' : 'var(--bg-card-solid)',
+                          color: active ? 'var(--btn-primary-fg)' : 'var(--text-secondary)',
+                          borderColor: active ? 'transparent' : 'var(--border-hairline)',
+                        }}
+                      >
+                        {m}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
-          <div className="sm:col-span-2">
-            <label
-              className="flex items-start gap-3 p-3.5 rounded-xl border cursor-pointer"
-              style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
-            >
-              <input
-                type="checkbox"
-                checked={Boolean(currentProvider.supportsVision)}
-                onChange={(e) => updateProviderField('supportsVision', e.target.checked)}
-                className="w-4 h-4 mt-0.5 rounded accent-[var(--text-primary)]"
-              />
-              <div className="flex-1">
-                <div className="text-xs font-semibold flex items-center gap-1.5">
-                  {currentProvider.supportsVision ? <Camera className="w-3.5 h-3.5" /> : <ImageOff className="w-3.5 h-3.5 text-[var(--text-muted)]" />}
-                  此模型支持图片 / 视觉输入（多模态）
-                </div>
-                <p className="text-[11px] text-[var(--text-muted)] mt-0.5">
-                  {currentProvider.supportsVision
-                    ? '已开启：支持电脑上传图片与手机拍照自动压缩识字。'
-                    : '未开启：导入面板将禁止图片上传并明确提示不支持视觉输入。'}
-                </p>
+          {/* Vision Capability Toggle */}
+          <label
+            className="flex items-start gap-3 p-3.5 rounded-xl border cursor-pointer"
+            style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
+          >
+            <input
+              type="checkbox"
+              checked={Boolean(currentProvider.supportsVision)}
+              onChange={(e) => updateProviderField('supportsVision', e.target.checked)}
+              className="w-4 h-4 mt-0.5 rounded accent-[var(--text-primary)]"
+            />
+            <div className="flex-1">
+              <div className="text-xs font-semibold flex items-center gap-1.5">
+                {currentProvider.supportsVision ? (
+                  <Camera className="w-3.5 h-3.5" />
+                ) : (
+                  <ImageOff className="w-3.5 h-3.5 text-[var(--text-muted)]" />
+                )}
+                此模型支持图片 / 视觉输入（多模态）
               </div>
-            </label>
-          </div>
+              <p className="text-[11px] text-[var(--text-muted)] mt-0.5">
+                {currentProvider.supportsVision
+                  ? '已开启：允许上传图片与手机拍照自动压缩识字。'
+                  : '未开启：导入面板将禁止上传图片并明确提示不支持视觉输入。'}
+              </p>
+            </div>
+          </label>
         </div>
 
         {testResult && (
@@ -381,27 +464,44 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
               disabled={saving}
               className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
             >
-              保存并设为默认
+              保存并启用
             </button>
           </div>
         </div>
       </div>
 
-      {/* Unified Cross-Device Sync & Backup (Desktop SQLite <-> Android APK!) */}
+      {/* Unified Cross-Device Sync & QR File Transfer */}
       <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-4">
         <div>
-          <h2 className="font-semibold text-sm">跨端数据互通与备份（电脑 ↔ 安卓 APK 通用）</h2>
+          <h2 className="font-semibold text-sm">跨端快传与通用备份（电脑 ↔ 安卓 APK）</h2>
           <p className="text-xs text-[var(--text-muted)] mt-0.5">
-            两端采用同一套 JSON 同步格式，导入时按笔记 ID 智能增量合并，不会覆盖原有内容。
+            支持同 Wi-Fi 扫码直接互传文件或全量同步笔记，亦支持 JSON 文件智能增量合并。
           </p>
         </div>
         <div className="flex flex-wrap gap-2.5">
+          {!IS_STANDALONE_MODE ? (
+            <button
+              onClick={() => setQrSendOpen(true)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
+            >
+              <QrCode className="w-3.5 h-3.5" />
+              生成扫码快传码（传给手机）
+            </button>
+          ) : (
+            <button
+              onClick={() => setQrScanOpen(true)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
+            >
+              <QrCode className="w-3.5 h-3.5" />
+              扫码从电脑导入 / 同步
+            </button>
+          )}
           <button
             onClick={handleExportJson}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
-            导出通用 JSON 备份
+            导出 JSON 备份
           </button>
           <label className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer">
             <Upload className="w-3.5 h-3.5" />
@@ -424,50 +524,15 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
               下载原始 SQLite (.db)
             </a>
           )}
-          <button
-            disabled={seeding}
-            onClick={async () => {
-              setSeeding(true);
-              try {
-                await api.seedSampleData();
-                alert('示例数据加载完成！');
-                onSettingsChanged?.();
-              } catch (e: any) {
-                alert(e.message);
-              } finally {
-                setSeeding(false);
-              }
-            }}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer"
-          >
-            <Database className="w-3.5 h-3.5" />
-            {seeding ? '加载中...' : '空库加载示例数据'}
-          </button>
         </div>
       </div>
 
-      {/* Desktop LAN QR Card */}
-      {!IS_STANDALONE_MODE && netInfo?.qrDataUrl && (
-        <div className="rounded-2xl zw-card p-5 sm:p-6 flex flex-col sm:flex-row items-center gap-5">
-          <img src={netInfo.qrDataUrl} alt="局域网扫码" className="w-32 h-32 p-2 bg-white rounded-xl shrink-0" />
-          <div className="space-y-2 text-xs text-[var(--text-secondary)]">
-            <div className="font-semibold text-sm text-[var(--text-primary)] flex items-center gap-1.5">
-              <Smartphone className="w-4 h-4" />
-              局域网手机扫码访问
-            </div>
-            <div
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg font-mono text-xs border"
-              style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
-            >
-              <Wifi className="w-3.5 h-3.5" />
-              {netInfo.mobileUrl}
-            </div>
-            <p className="text-[11px] text-[var(--text-muted)]">
-              同 Wi-Fi 可扫码直接浏览本机版；出门在外直接使用已打包的独立安卓 APK，数据可通过上方通用 JSON 随时合并。
-            </p>
-          </div>
-        </div>
-      )}
+      <QrSendModal open={qrSendOpen} onClose={() => setQrSendOpen(false)} />
+      <QrScannerModal
+        open={qrScanOpen}
+        onClose={() => setQrScanOpen(false)}
+        onCompleted={() => onSettingsChanged?.()}
+      />
     </div>
   );
 }

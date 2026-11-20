@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from './api/client';
 import { GlobalSearchModal } from './components/GlobalSearchModal';
 import { Layout } from './components/Layout';
-import { QrPairingModal } from './components/QrPairingModal';
 import { QuickImportModal } from './components/QuickImportModal';
 import { HomePage } from './pages/HomePage';
 import { NotesPage } from './pages/NotesPage';
@@ -24,7 +23,6 @@ export default function App() {
 
   const [importOpen, setImportOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  const [qrOpen, setQrOpen] = useState(false);
 
   const handleToggleTheme = (next?: ThemeMode) => {
     const resolved: ThemeMode = next || (theme === 'dark' ? 'light' : 'dark');
@@ -83,7 +81,6 @@ export default function App() {
         onNavigate={(p) => handleNavigate(p)}
         onOpenImport={() => setImportOpen(true)}
         onOpenSearch={() => setSearchOpen(true)}
-        onOpenQr={() => setQrOpen(true)}
         badges={badges}
       >
         {page === 'home' && (
@@ -143,8 +140,6 @@ export default function App() {
         onClose={() => setSearchOpen(false)}
         onSelectNote={(noteId) => handleNavigate('notes', { noteId })}
       />
-
-      <QrPairingModal open={qrOpen} onClose={() => setQrOpen(false)} />
     </>
   );
 }

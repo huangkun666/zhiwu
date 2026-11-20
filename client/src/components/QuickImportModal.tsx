@@ -7,12 +7,14 @@ import {
   FolderUp,
   ImageOff,
   Loader2,
+  QrCode,
   Sparkles,
   Upload,
   X,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { compressImageIfNeeded } from '../utils/imageCompress';
+import { QrScannerModal } from './QrScannerModal';
 import type { ActiveModelCapability, Category, Note } from '../types';
 
 interface QuickImportModalProps {
@@ -47,6 +49,7 @@ export function QuickImportModal({
   const [statusText, setStatusText] = useState('');
   const [error, setError] = useState('');
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [scannerOpen, setScannerOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -265,27 +268,35 @@ export function QuickImportModal({
                 </div>
               )}
 
-              <div className="grid grid-cols-2 gap-2.5">
+              <div className="grid grid-cols-3 gap-2">
                 <button
                   type="button"
                   disabled={!supportsVision}
                   onClick={() => cameraInputRef.current?.click()}
-                  className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-semibold transition ${
+                  className={`flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl text-xs font-semibold transition ${
                     supportsVision
                       ? 'zw-btn-secondary cursor-pointer active:scale-[0.98]'
                       : 'opacity-45 cursor-not-allowed border border-[var(--border-hairline)]'
                   }`}
                 >
-                  {supportsVision ? <Camera className="w-4 h-4" /> : <ImageOff className="w-4 h-4" />}
-                  {supportsVision ? '拍照 / 选图识字' : '不支持图片上传'}
+                  {supportsVision ? <Camera className="w-3.5 h-3.5 shrink-0" /> : <ImageOff className="w-3.5 h-3.5 shrink-0" />}
+                  <span className="truncate">{supportsVision ? '拍照识字' : '不支持图'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScannerOpen(true)}
+                  className="flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl zw-btn-secondary text-xs font-semibold active:scale-[0.98] transition cursor-pointer"
+                >
+                  <QrCode className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate">扫码导入</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => folderInputRef.current?.click()}
-                  className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl zw-btn-secondary text-xs font-semibold active:scale-[0.98] transition cursor-pointer"
+                  className="flex items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl zw-btn-secondary text-xs font-semibold active:scale-[0.98] transition cursor-pointer"
                 >
-                  <FolderUp className="w-4 h-4" />
-                  批量导入文件夹
+                  <FolderUp className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate">文件夹</span>
                 </button>
               </div>
 
@@ -487,6 +498,15 @@ export function QuickImportModal({
           </button>
         </div>
       </div>
+
+      <QrScannerModal
+        open={scannerOpen}
+        onClose={() => setScannerOpen(false)}
+        onCompleted={(res) => {
+          onImported(res.notes || []);
+          onClose();
+        }}
+      />
     </div>
   );
 }

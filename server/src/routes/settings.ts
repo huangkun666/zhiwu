@@ -13,7 +13,7 @@ import {
   uid,
   upsertConcept,
 } from '../db.js';
-import { getActiveModelCapability, testProviderConnection } from '../services/ai.js';
+import { fetchProviderModels, getActiveModelCapability, testProviderConnection } from '../services/ai.js';
 
 export const settingsRouter = Router();
 
@@ -86,6 +86,18 @@ settingsRouter.post('/test-ai', async (req, res) => {
     res.json({ ok: true, ...result });
   } catch (err: any) {
     res.status(400).json({ ok: false, error: err?.message || '连接测试失败' });
+  }
+});
+
+// Fetch live model list from remote or local endpoint
+settingsRouter.post('/models', async (req, res) => {
+  const { provider } = req.body || {};
+  if (!provider) return res.status(400).json({ error: '缺少模型配置参数' });
+  try {
+    const models = await fetchProviderModels(provider);
+    res.json({ ok: true, models });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, error: err?.message || '获取模型列表失败' });
   }
 });
 

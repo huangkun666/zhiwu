@@ -9,10 +9,8 @@ import {
   Plus,
   Search,
   Settings,
-  Smartphone,
   Sun,
 } from 'lucide-react';
-import { IS_STANDALONE_MODE } from '../api/client';
 import type { PageId } from '../types';
 import type { ThemeMode } from '../utils/theme';
 
@@ -23,7 +21,6 @@ interface LayoutProps {
   onNavigate: (page: PageId) => void;
   onOpenImport: () => void;
   onOpenSearch: () => void;
-  onOpenQr: () => void;
   badges: { dueReviews: number; activeMistakes: number };
   children: React.ReactNode;
 }
@@ -48,7 +45,6 @@ export function Layout({
   onNavigate,
   onOpenImport,
   onOpenSearch,
-  onOpenQr,
   badges,
   children,
 }: LayoutProps) {
@@ -157,14 +153,14 @@ export function Layout({
           })}
         </nav>
 
-        {/* Quiet Footer */}
+        {/* Quiet Footer: Settings only */}
         <div
-          className="p-3 border-t flex items-center gap-1.5"
+          className="p-3 border-t"
           style={{ borderColor: 'var(--border-hairline)' }}
         >
           <button
             onClick={() => onNavigate('settings')}
-            className="flex-1 flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-medium transition cursor-pointer"
+            className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-xl text-xs font-medium transition cursor-pointer"
             style={{
               background: page === 'settings' ? 'var(--bg-active)' : 'var(--bg-subtle)',
               color: page === 'settings' ? 'var(--text-primary)' : 'var(--text-secondary)',
@@ -173,16 +169,6 @@ export function Layout({
             <Settings className="w-3.5 h-3.5" />
             设置
           </button>
-          {!IS_STANDALONE_MODE && (
-            <button
-              onClick={onOpenQr}
-              className="flex-1 flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl text-xs font-medium transition cursor-pointer"
-              style={{ background: 'var(--bg-subtle)', color: 'var(--text-secondary)' }}
-            >
-              <Smartphone className="w-3.5 h-3.5" />
-              扫码
-            </button>
-          )}
         </div>
       </aside>
 

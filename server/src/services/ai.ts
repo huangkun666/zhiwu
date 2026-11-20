@@ -303,6 +303,58 @@ export async function testProviderConnection(provider: AIProviderConfig): Promis
   return { latencyMs: Date.now() - start, reply };
 }
 
+export async function fetchProviderModels(provider: AIProviderConfig): Promise<string[]> {
+  const base = (provider.baseUrl || '').trim().replace(/\/+$/, '');
+  if (!base) throw new Error('请先填写 API Base URL');
+
+  if (provider.type === 'gemini') {
+    if (!provider.apiKey?.trim()) throw new Error('请先填写 Gemini API Key');
+    const url = `${base}/models?key=${encodeURIComponent(provider.apiKey.trim())}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.text().catch(() => '');
+      throw new Error(`获取模型列表失败 (${res.status}): ${err.slice(0, 200)}`);
+    }
+    const data = (await res.json()) as any;
+    const list: string[] = (data?.models || [])
+      .filter((m: any) => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent'))
+      .map((m: any) => String(m.name || '').replace(/^models\//, ''))
+      .filter(Boolean);
+    return Array.from(new Set(list)).sort();
+  }
+
+  // OpenAI-compatible GET /models (with fallback to Ollama /api/tags)
+  const headers: Record<string, string> = {};
+  if (provider.apiKey?.trim()) {
+    headers['Authorization'] = `Bearer ${provider.apiKey.trim()}`;
+  }
+
+  try {
+    const res = await fetch(`${base}/models`, { headers });
+    if (res.ok) {
+      const data = (await res.json()) as any;
+      const arr = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
+      const ids: string[] = arr.map((m: any) => String(m?.id || m?.name || '')).filter(Boolean);
+      if (ids.length > 0) return Array.from(new Set(ids)).sort();
+    } else if (provider.id !== 'local') {
+      const err = await res.text().catch(() => '');
+      throw new Error(`获取模型列表失败 (${res.status}): ${err.slice(0, 200)}`);
+    }
+  } catch (err: any) {
+    if (provider.id !== 'local') throw err;
+  }
+
+  // Fallback for local Ollama native endpoint (/api/tags)
+  const origin = base.replace(/\/v1$/i, '');
+  const ollamaRes = await fetch(`${origin}/api/tags`);
+  if (!ollamaRes.ok) {
+    throw new Error(`无法连接本地模型服务 (${ollamaRes.status})，请确认 Ollama / LM Studio 已启动。`);
+  }
+  const ollamaData = (await ollamaRes.json()) as any;
+  const localModels: string[] = (ollamaData?.models || []).map((m: any) => String(m?.name || m?.model || '')).filter(Boolean);
+  return Array.from(new Set(localModels)).sort();
+}
+
 // --- Domain AI Tasks ---
 
 export interface NoteSummaryResult {

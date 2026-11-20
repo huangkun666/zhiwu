@@ -62,8 +62,8 @@ interface LocalDBState {
 
 const DEFAULT_PROVIDERS: AIProviderConfig[] = [
   {
-    id: 'deepseek',
-    name: 'DeepSeek',
+    id: 'remote',
+    name: '远程模型',
     type: 'openai',
     baseUrl: 'https://api.deepseek.com/v1',
     apiKey: '',
@@ -72,41 +72,73 @@ const DEFAULT_PROVIDERS: AIProviderConfig[] = [
     requiresKey: true,
   },
   {
-    id: 'qwen',
-    name: '通义千问 (Qwen)',
+    id: 'local',
+    name: '本地模型',
     type: 'openai',
-    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    apiKey: '',
-    model: 'qwen-plus',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    apiKey: 'ollama',
+    model: 'qwen2.5:7b',
     supportsVision: false,
-    requiresKey: true,
-  },
-  {
-    id: 'gemini',
-    name: 'Google Gemini',
-    type: 'gemini',
-    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    apiKey: '',
-    model: 'gemini-2.5-flash',
-    supportsVision: true,
-    requiresKey: true,
-  },
-  {
-    id: 'openai',
-    name: 'OpenAI',
-    type: 'openai',
-    baseUrl: 'https://api.openai.com/v1',
-    apiKey: '',
-    model: 'gpt-4o-mini',
-    supportsVision: true,
-    requiresKey: true,
+    requiresKey: false,
   },
 ];
+
+function normalizeLocalSettings(settings: AISettings): AISettings {
+  const raw = Array.isArray(settings?.providers) ? (settings.providers as any[]) : [];
+  const existingRemote = raw.find((p) => p.id === 'remote');
+  const existingLocal = raw.find((p) => p.id === 'local');
+  if (existingRemote && existingLocal) {
+    return {
+      ...settings,
+      activeProviderId: settings.activeProviderId === 'local' ? 'local' : 'remote',
+      providers: [
+        { ...DEFAULT_PROVIDERS[0], ...existingRemote, id: 'remote', name: '远程模型', requiresKey: true },
+        { ...DEFAULT_PROVIDERS[1], ...existingLocal, id: 'local', name: '本地模型', requiresKey: false },
+      ],
+    };
+  }
+  const legacyActive = raw.find((p) => p.id === settings.activeProviderId);
+  const legacyRemote =
+    (legacyActive && legacyActive.id !== 'ollama' ? legacyActive : null) ||
+    raw.find((p) => p.id !== 'ollama' && p.apiKey?.trim()) ||
+    raw.find((p) => p.id !== 'ollama');
+  const legacyLocal = raw.find((p) => p.id === 'ollama');
+  return {
+    ...settings,
+    activeProviderId: settings.activeProviderId === 'ollama' || settings.activeProviderId === 'local' ? 'local' : 'remote',
+    providers: [
+      legacyRemote
+        ? {
+            id: 'remote',
+            name: '远程模型',
+            type: legacyRemote.type === 'gemini' ? 'gemini' : 'openai',
+            baseUrl: legacyRemote.baseUrl || DEFAULT_PROVIDERS[0].baseUrl,
+            apiKey: legacyRemote.apiKey || '',
+            model: legacyRemote.model || DEFAULT_PROVIDERS[0].model,
+            supportsVision: Boolean(legacyRemote.supportsVision),
+            requiresKey: true,
+          }
+        : DEFAULT_PROVIDERS[0],
+      legacyLocal
+        ? {
+            id: 'local',
+            name: '本地模型',
+            type: 'openai',
+            baseUrl: legacyLocal.baseUrl || DEFAULT_PROVIDERS[1].baseUrl,
+            apiKey: legacyLocal.apiKey || 'ollama',
+            model: legacyLocal.model || DEFAULT_PROVIDERS[1].model,
+            supportsVision: Boolean(legacyLocal.supportsVision),
+            requiresKey: false,
+          }
+        : DEFAULT_PROVIDERS[1],
+    ],
+  };
+}
 
 function createEmptyState(): LocalDBState {
   return {
     settings: {
-      activeProviderId: 'deepseek',
+      activeProviderId: 'remote',
       providers: DEFAULT_PROVIDERS,
       dailyGoalMinutes: 30,
       dailyReviewTarget: 20,
@@ -151,7 +183,9 @@ async function loadState(): Promise<LocalDBState> {
       req.onerror = () => reject(req.error);
     });
     if (saved) {
-      cachedState = { ...createEmptyState(), ...saved };
+      const merged = { ...createEmptyState(), ...saved };
+      merged.settings = normalizeLocalSettings(merged.settings);
+      cachedState = merged;
       return cachedState;
     }
   } catch {
@@ -159,7 +193,9 @@ async function loadState(): Promise<LocalDBState> {
     try {
       const raw = localStorage.getItem(STATE_KEY);
       if (raw) {
-        cachedState = { ...createEmptyState(), ...JSON.parse(raw) };
+        const merged = { ...createEmptyState(), ...JSON.parse(raw) };
+        merged.settings = normalizeLocalSettings(merged.settings);
+        cachedState = merged;
         return cachedState!;
       }
     } catch {
@@ -1623,6 +1659,48 @@ export const localApi = {
       { temperature: 0.1, maxTokens: 40 }
     );
     return { ok: true, latencyMs: Date.now() - start, reply };
+  },
+
+  async fetchModels(provider: AIProviderConfig): Promise<{ ok: boolean; models: string[] }> {
+    const base = (provider.baseUrl || '').trim().replace(/\/+$/, '');
+    if (!base) throw new Error('请先填写 API Base URL');
+
+    if (provider.type === 'gemini') {
+      if (!provider.apiKey?.trim()) throw new Error('请先填写 Gemini API Key');
+      const res = await fetch(`${base}/models?key=${encodeURIComponent(provider.apiKey.trim())}`);
+      if (!res.ok) throw new Error(`获取模型列表失败 (${res.status})`);
+      const data = await res.json();
+      const models: string[] = (data?.models || [])
+        .filter((m: any) => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent'))
+        .map((m: any) => String(m.name || '').replace(/^models\//, ''))
+        .filter(Boolean);
+      return { ok: true, models: Array.from(new Set(models)).sort() };
+    }
+
+    const headers: Record<string, string> = {};
+    if (provider.apiKey?.trim()) headers['Authorization'] = `Bearer ${provider.apiKey.trim()}`;
+
+    try {
+      const res = await fetch(`${base}/models`, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        const arr = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
+        const ids: string[] = arr.map((m: any) => String(m?.id || m?.name || '')).filter(Boolean);
+        if (ids.length > 0) return { ok: true, models: Array.from(new Set(ids)).sort() };
+      } else if (provider.id !== 'local') {
+        throw new Error(`获取模型列表失败 (${res.status})`);
+      }
+    } catch (err: any) {
+      if (provider.id !== 'local') throw err;
+    }
+
+    // Ollama native fallback
+    const origin = base.replace(/\/v1$/i, '');
+    const ollamaRes = await fetch(`${origin}/api/tags`);
+    if (!ollamaRes.ok) throw new Error(`无法连接本地模型服务 (${ollamaRes.status})`);
+    const ollamaData = await ollamaRes.json();
+    const localModels: string[] = (ollamaData?.models || []).map((m: any) => String(m?.name || m?.model || '')).filter(Boolean);
+    return { ok: true, models: Array.from(new Set(localModels)).sort() };
   },
 
   async getNetworkInfo() {

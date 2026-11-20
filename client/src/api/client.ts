@@ -211,6 +211,11 @@ const serverApi = {
       method: 'POST',
       body: JSON.stringify({ provider }),
     }),
+  fetchModels: (provider: AIProviderConfig) =>
+    request<{ ok: boolean; models: string[] }>('/api/settings/models', {
+      method: 'POST',
+      body: JSON.stringify({ provider }),
+    }),
   getNetworkInfo: (port?: string, ip?: string) => {
     const sp = new URLSearchParams();
     if (port) sp.set('port', port);

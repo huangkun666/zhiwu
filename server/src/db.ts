@@ -43,13 +43,13 @@ export interface AISettings {
 }
 
 export const DEFAULT_AI_SETTINGS: AISettings = {
-  activeProviderId: 'deepseek',
+  activeProviderId: 'remote',
   dailyGoalMinutes: 30,
   dailyReviewTarget: 20,
   providers: [
     {
-      id: 'deepseek',
-      name: 'DeepSeek',
+      id: 'remote',
+      name: '远程模型',
       type: 'openai',
       baseUrl: 'https://api.deepseek.com/v1',
       apiKey: '',
@@ -58,38 +58,8 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
       requiresKey: true,
     },
     {
-      id: 'qwen',
-      name: '通义千问 (Qwen)',
-      type: 'openai',
-      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-      apiKey: '',
-      model: 'qwen-plus',
-      supportsVision: false,
-      requiresKey: true,
-    },
-    {
-      id: 'gemini',
-      name: 'Google Gemini',
-      type: 'gemini',
-      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-      apiKey: '',
-      model: 'gemini-2.5-flash',
-      supportsVision: true,
-      requiresKey: true,
-    },
-    {
-      id: 'openai',
-      name: 'OpenAI',
-      type: 'openai',
-      baseUrl: 'https://api.openai.com/v1',
-      apiKey: '',
-      model: 'gpt-4o-mini',
-      supportsVision: true,
-      requiresKey: true,
-    },
-    {
-      id: 'ollama',
-      name: '本地 Ollama',
+      id: 'local',
+      name: '本地模型',
       type: 'openai',
       baseUrl: 'http://127.0.0.1:11434/v1',
       apiKey: 'ollama',
@@ -345,30 +315,66 @@ export function getAISettings(): AISettings {
   if (!row) return DEFAULT_AI_SETTINGS;
   try {
     const parsed = JSON.parse(row.value) as Partial<AISettings>;
-    const rawProviders =
-      parsed.providers && parsed.providers.length > 0 ? (parsed.providers as any[]) : DEFAULT_AI_SETTINGS.providers;
-    // Migrate legacy chatModel/visionModel fields seamlessly into unified model + supportsVision
-    const providers: AIProviderConfig[] = rawProviders.map((p) => {
-      const model = String(p.model ?? p.chatModel ?? '').trim();
-      const supportsVision =
-        typeof p.supportsVision === 'boolean'
-          ? p.supportsVision
-          : p.id === 'gemini' || p.id === 'openai' || /vl|vision|4o|gemini|claude-3|llava|omni/i.test(model);
+    const rawProviders = Array.isArray(parsed.providers) ? (parsed.providers as any[]) : [];
+
+    // Already migrated to clean 2-slot ('remote' & 'local') model settings
+    const existingRemote = rawProviders.find((p) => p.id === 'remote');
+    const existingLocal = rawProviders.find((p) => p.id === 'local');
+
+    if (existingRemote && existingLocal) {
       return {
-        id: p.id,
-        name: p.name,
-        type: p.type === 'gemini' ? 'gemini' : 'openai',
-        baseUrl: p.baseUrl || '',
-        apiKey: p.apiKey || '',
-        model,
-        supportsVision,
-        requiresKey: p.requiresKey,
+        ...DEFAULT_AI_SETTINGS,
+        ...parsed,
+        activeProviderId: parsed.activeProviderId === 'local' ? 'local' : 'remote',
+        providers: [
+          { ...DEFAULT_AI_SETTINGS.providers[0], ...existingRemote, id: 'remote', name: '远程模型', requiresKey: true },
+          { ...DEFAULT_AI_SETTINGS.providers[1], ...existingLocal, id: 'local', name: '本地模型', requiresKey: false },
+        ],
       };
-    });
+    }
+
+    // Migrate legacy multi-vendor presets smoothly into 'remote' + 'local' without losing saved API keys
+    const legacyActive = rawProviders.find((p) => p.id === parsed.activeProviderId);
+    const legacyRemote =
+      (legacyActive && legacyActive.id !== 'ollama' ? legacyActive : null) ||
+      rawProviders.find((p) => p.id !== 'ollama' && p.apiKey?.trim()) ||
+      rawProviders.find((p) => p.id !== 'ollama');
+    const legacyLocal = rawProviders.find((p) => p.id === 'ollama');
+
+    const remote: AIProviderConfig = legacyRemote
+      ? {
+          id: 'remote',
+          name: '远程模型',
+          type: legacyRemote.type === 'gemini' ? 'gemini' : 'openai',
+          baseUrl: legacyRemote.baseUrl || DEFAULT_AI_SETTINGS.providers[0].baseUrl,
+          apiKey: legacyRemote.apiKey || '',
+          model: String(legacyRemote.model ?? legacyRemote.chatModel ?? DEFAULT_AI_SETTINGS.providers[0].model),
+          supportsVision:
+            typeof legacyRemote.supportsVision === 'boolean'
+              ? legacyRemote.supportsVision
+              : /gemini|4o|vl|vision|omni/i.test(String(legacyRemote.model ?? legacyRemote.chatModel ?? '')),
+          requiresKey: true,
+        }
+      : DEFAULT_AI_SETTINGS.providers[0];
+
+    const local: AIProviderConfig = legacyLocal
+      ? {
+          id: 'local',
+          name: '本地模型',
+          type: 'openai',
+          baseUrl: legacyLocal.baseUrl || DEFAULT_AI_SETTINGS.providers[1].baseUrl,
+          apiKey: legacyLocal.apiKey || 'ollama',
+          model: String(legacyLocal.model ?? legacyLocal.chatModel ?? DEFAULT_AI_SETTINGS.providers[1].model),
+          supportsVision: Boolean(legacyLocal.supportsVision),
+          requiresKey: false,
+        }
+      : DEFAULT_AI_SETTINGS.providers[1];
+
     return {
       ...DEFAULT_AI_SETTINGS,
       ...parsed,
-      providers,
+      activeProviderId: parsed.activeProviderId === 'ollama' || parsed.activeProviderId === 'local' ? 'local' : 'remote',
+      providers: [remote, local],
     };
   } catch {
     return DEFAULT_AI_SETTINGS;
