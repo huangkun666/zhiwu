@@ -167,7 +167,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <button
             onClick={() => onSelectTheme('dark')}
-            className="text-left p-4 rounded-xl border transition cursor-pointer flex items-center justify-between"
+            className="text-left text-[var(--text-primary)] p-4 rounded-xl border transition cursor-pointer flex items-center justify-between"
             style={{
               background: theme === 'dark' ? 'var(--bg-active)' : 'var(--bg-subtle)',
               borderColor: theme === 'dark' ? 'var(--border-strong)' : 'var(--border-hairline)',
@@ -187,7 +187,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
 
           <button
             onClick={() => onSelectTheme('light')}
-            className="text-left p-4 rounded-xl border transition cursor-pointer flex items-center justify-between"
+            className="text-left text-[var(--text-primary)] p-4 rounded-xl border transition cursor-pointer flex items-center justify-between"
             style={{
               background: theme === 'light' ? 'var(--bg-active)' : 'var(--bg-subtle)',
               borderColor: theme === 'light' ? 'var(--border-strong)' : 'var(--border-hairline)',

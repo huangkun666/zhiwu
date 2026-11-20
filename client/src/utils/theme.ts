@@ -13,7 +13,15 @@ export function getSavedTheme(): ThemeMode {
 }
 
 export function applyTheme(mode: ThemeMode) {
-  document.documentElement.setAttribute('data-theme', mode);
+  const root = document.documentElement;
+  root.classList.add('theme-switching');
+  root.setAttribute('data-theme', mode);
+  // Force synchronous reflow so all CSS vars snap atomically with zero mid-fade contrast flash
+  void window.getComputedStyle(root).color;
+  requestAnimationFrame(() => {
+    root.classList.remove('theme-switching');
+  });
+
   const metaTheme = document.querySelector('meta[name="theme-color"]');
   if (metaTheme) {
     metaTheme.setAttribute('content', mode === 'dark' ? '#09090B' : '#ECEEF2');

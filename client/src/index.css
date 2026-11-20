@@ -127,13 +127,22 @@
     background-image: var(--bg-sheen);
     background-attachment: fixed;
     color: var(--text-primary);
-    transition: background-color 0.25s ease, color 0.2s ease;
+  }
+
+  button {
+    color: inherit;
   }
 
   select option {
     background-color: var(--bg-card-solid);
     color: var(--text-primary);
   }
+}
+
+/* Atomic zero-flicker theme switch (prevents mid-transition gray-on-gray frames) */
+.theme-switching,
+.theme-switching * {
+  transition: none !important;
 }
 
 /* Reusable Material Primitives */
