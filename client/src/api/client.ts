@@ -59,6 +59,16 @@ const serverApi = {
     id: string,
     payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean }
   ) => request<Note>(`/api/notes/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  appendNoteChat: (id: string, excerptId: string, content: string) =>
+    request<Note>(`/api/notes/${id}/chat-excerpts/${encodeURIComponent(excerptId)}`, {
+      method: 'PUT', body: JSON.stringify({ content }),
+    }),
+  removeNoteChat: (id: string, excerptId: string) =>
+    request<Note>(`/api/notes/${id}/chat-excerpts/${encodeURIComponent(excerptId)}`, { method: 'DELETE' }),
+  removeLegacyNoteChat: (id: string, offset: number, block: string, updatedAt: string) =>
+    request<Note>(`/api/notes/${id}/legacy-chat-excerpts/${offset}`, {
+      method: 'DELETE', body: JSON.stringify({ block, updatedAt }),
+    }),
   deleteNote: (id: string) => request<{ ok: boolean }>(`/api/notes/${id}`, { method: 'DELETE' }),
   importFiles: (files: File[], categoryId?: string | null, tags?: string[]) => {
     const fd = new FormData();

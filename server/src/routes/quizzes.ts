@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db, logStudyActivity, nowIso, uid, updateConceptMastery } from '../db.js';
 import { generateQuizAI, gradeShortAnswerAI } from '../services/ai.js';
+import { noteStudyText } from '../shared/noteContent.js';
 
 export const quizzesRouter = Router();
 
@@ -92,7 +93,7 @@ quizzesRouter.post('/generate', async (req, res) => {
 
   try {
     const generated = await generateQuizAI(
-      sourceNotes.map((n) => ({ id: n.id, title: n.title, content: n.content })),
+      sourceNotes.map((n) => ({ id: n.id, title: n.title, content: noteStudyText(n) })),
       {
         count: safeCount,
         difficulty: ['easy', 'medium', 'hard'].includes(difficulty) ? difficulty : 'medium',

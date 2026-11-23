@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
 import { db, nowIso, UPLOADS_DIR } from '../db.js';
+import { readChatExcerpts } from '../shared/noteContent.js';
 import { getLocalNetworkAdapters } from './settings.js';
 
 export const transferRouter = Router();
@@ -51,6 +52,7 @@ function buildExportSnapshot() {
     ...n,
     tags: JSON.parse(n.tags || '[]'),
     summary: n.summary_json ? JSON.parse(n.summary_json) : null,
+    chat_excerpts: readChatExcerpts(n.chat_excerpts),
     is_pinned: Boolean(n.is_pinned),
   }));
   const syntheses = (db.prepare(`SELECT * FROM syntheses`).all() as any[]).map((s) => ({

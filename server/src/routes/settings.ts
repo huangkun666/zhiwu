@@ -14,6 +14,7 @@ import {
   upsertConcept,
 } from '../db.js';
 import { fetchProviderModels, getActiveModelCapability, testProviderConnection } from '../services/ai.js';
+import { noteStudyText, readChatExcerpts } from '../shared/noteContent.js';
 
 export const settingsRouter = Router();
 
@@ -143,6 +144,7 @@ settingsRouter.get('/export-json', (_req, res) => {
     ...n,
     tags: JSON.parse(n.tags || '[]'),
     summary: n.summary_json ? JSON.parse(n.summary_json) : null,
+    chat_excerpts: readChatExcerpts(n.chat_excerpts),
     is_pinned: Boolean(n.is_pinned),
   }));
   const syntheses = (db.prepare(`SELECT * FROM syntheses`).all() as any[]).map((s) => ({
@@ -206,27 +208,33 @@ settingsRouter.post('/import-json', (req, res) => {
     const incomingUpdated = n.updated_at || now;
     if (!existing || incomingUpdated > existing.updated_at) {
       const tags = Array.isArray(n.tags) ? n.tags : [];
+      const content = n.content || '';
+      const sourceContent = typeof n.source_content === 'string' ? n.source_content : null;
+      const chatExcerpts = readChatExcerpts(n.chat_excerpts);
+      const studyText = noteStudyText({ content, source_content: sourceContent, chat_excerpts: chatExcerpts });
       db.prepare(
         `INSERT OR REPLACE INTO notes (
-          id, title, content, summary_json, category_id, tags, source_type, source_filename,
-          attachment_path, word_count, is_pinned, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          id, title, content, source_content, chat_excerpts, summary_json, category_id, tags, source_type,
+          source_filename, attachment_path, word_count, is_pinned, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         n.id,
         n.title,
-        n.content || '',
+        content,
+        sourceContent,
+        JSON.stringify(chatExcerpts),
         n.summary ? JSON.stringify(n.summary) : null,
         n.category_id || null,
         JSON.stringify(tags),
         n.source_type || 'markdown',
         n.source_filename || null,
         n.attachment_path || null,
-        n.word_count || countWords(n.content || ''),
+        countWords(studyText),
         n.is_pinned ? 1 : 0,
         n.created_at || now,
         incomingUpdated
       );
-      syncNoteFts(n.id, n.title, n.content || '', tags);
+      syncNoteFts(n.id, n.title, studyText, tags);
       notesMerged++;
     }
   }

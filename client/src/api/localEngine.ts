@@ -1,4 +1,5 @@
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt } from '../../../server/src/shared/noteContent';
+import { loadPdf } from '../utils/pdf';
 import type {
   ActiveModelCapability,
   AIProviderConfig,
@@ -159,6 +160,8 @@ function createEmptyState(): LocalDBState {
 }
 
 let cachedState: LocalDBState | null = null;
+let loadingState: Promise<LocalDBState> | null = null;
+let useLocalStorage = false;
 
 function openIDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -173,56 +176,60 @@ function openIDB(): Promise<IDBDatabase> {
   });
 }
 
-async function loadState(): Promise<LocalDBState> {
-  if (cachedState) return cachedState;
+function loadState(): Promise<LocalDBState> {
+  if (cachedState) return Promise.resolve(cachedState);
+  return (loadingState ??= readState().finally(() => { loadingState = null; }));
+}
+
+async function readState(): Promise<LocalDBState> {
+  let saved: LocalDBState | undefined;
   try {
     const db = await openIDB();
-    const saved = await new Promise<LocalDBState | undefined>((resolve, reject) => {
-      const tx = db.transaction(IDB_STORE, 'readonly');
-      const req = tx.objectStore(IDB_STORE).get(STATE_KEY);
-      req.onsuccess = () => resolve(req.result as LocalDBState | undefined);
-      req.onerror = () => reject(req.error);
-    });
-    if (saved) {
-      const merged = { ...createEmptyState(), ...saved };
-      merged.settings = normalizeLocalSettings(merged.settings);
-      cachedState = merged;
-      return cachedState;
+    try {
+      saved = await new Promise<LocalDBState | undefined>((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STORE).get(STATE_KEY);
+        req.onsuccess = () => resolve(req.result as LocalDBState | undefined);
+        req.onerror = () => reject(req.error);
+      });
+      useLocalStorage = false;
+    } finally {
+      db.close();
     }
   } catch {
-    // fallback to localStorage
+    useLocalStorage = true;
     try {
       const raw = localStorage.getItem(STATE_KEY);
-      if (raw) {
-        const merged = { ...createEmptyState(), ...JSON.parse(raw) };
-        merged.settings = normalizeLocalSettings(merged.settings);
-        cachedState = merged;
-        return cachedState!;
-      }
+      if (raw) saved = JSON.parse(raw) as LocalDBState;
     } catch {
-      // ignore
+      // Use an empty library when browser storage cannot be read.
     }
   }
-  cachedState = createEmptyState();
+  cachedState = { ...createEmptyState(), ...saved };
+  cachedState.settings = normalizeLocalSettings(cachedState.settings);
   return cachedState;
 }
 
 async function saveState(state: LocalDBState): Promise<void> {
-  cachedState = state;
   try {
-    const db = await openIDB();
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(IDB_STORE, 'readwrite');
-      tx.objectStore(IDB_STORE).put(state, STATE_KEY);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  } catch {
-    try {
+    if (useLocalStorage) {
       localStorage.setItem(STATE_KEY, JSON.stringify(state));
-    } catch {
-      // ignore quota error
+      return;
     }
+    const db = await openIDB();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(state, STATE_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onabort = () => reject(tx.error);
+      });
+    } finally {
+      db.close();
+    }
+  } catch (error) {
+    if (cachedState === state) cachedState = null;
+    throw new Error('无法保存到设备，请检查可用的存储空间后重试', { cause: error });
   }
 }
 
@@ -551,6 +558,7 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
   content: string;
   sourceType: Note['source_type'];
   attachmentDataUrl?: string;
+  warning?: string;
 }> {
   const name = file.name;
   const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')).toLowerCase() : '';
@@ -559,39 +567,54 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
   if (ext === '.md' || ext === '.markdown' || ext === '.txt' || file.type.startsWith('text/')) {
     const text = await file.text();
     const h1 = text.match(/^#\s+(.+)$/m);
-    return { title: h1 ? h1[1].trim() : baseTitle, content: text.trim(), sourceType: ext === '.txt' ? 'text' : 'markdown' };
+    return { title: h1 ? h1[1].trim() : baseTitle, content: text, sourceType: ext === '.txt' ? 'text' : 'markdown' };
   }
 
-  if (ext === '.docx') {
-    const mammothMod: any = await import('mammoth');
+  const wordMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === '.docx' || file.type === wordMime) {
+    const mammothMod = await import('mammoth');
     const mammoth = mammothMod.default || mammothMod;
     const arrayBuffer = await file.arrayBuffer();
     const res = await mammoth.extractRawText({ arrayBuffer });
-    return { title: baseTitle, content: (res.value || '').trim() || `> 已导入 Word 文档：\`${name}\``, sourceType: 'docx' };
+    return {
+      title: baseTitle,
+      content: res.value.trim(),
+      sourceType: 'docx',
+      attachmentDataUrl: `data:${wordMime};base64,${await fileToBase64(file)}`,
+    };
   }
 
   if (ext === '.pdf' || file.type === 'application/pdf') {
-    const pdfjs = await import('pdfjs-dist');
-    if (!pdfjs.GlobalWorkerOptions.workerSrc) {
-      pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (!new TextDecoder().decode(bytes.subarray(0, 1024)).includes('%PDF-')) {
+      throw new Error('文件内容不是有效的 PDF');
     }
-    const arrayBuffer = await file.arrayBuffer();
-    const loadingTask = pdfjs.getDocument({ data: new Uint8Array(arrayBuffer) });
-    const pdf = await loadingTask.promise;
-    const pages: string[] = [];
-    for (let i = 1; i <= Math.min(pdf.numPages, 80); i++) {
-      const page = await pdf.getPage(i);
-      const tc = await page.getTextContent();
-      const line = tc.items.map((it: any) => it.str || '').join(' ').replace(/\s{2,}/g, ' ').trim();
-      if (line) pages.push(line);
+    let loadingTask: Awaited<ReturnType<typeof loadPdf>> | undefined;
+    let text = '';
+    let warning: string | undefined;
+    try {
+      loadingTask = await loadPdf(bytes);
+      const pdf = await loadingTask.promise;
+      const pages: string[] = [];
+      for (let i = 1; i <= Math.min(pdf.numPages, 80); i++) {
+        const page = await pdf.getPage(i);
+        const { items } = await page.getTextContent();
+        const pageText = items.map((item) => 'str' in item ? `${item.str}${item.hasEOL ? '\n' : ' '}` : '').join('').trim();
+        if (pageText) pages.push(pageText);
+      }
+      text = pages.join('\n\n');
+      if (!text) warning = 'PDF 没有可提取的文本，可以预览原始页面';
+    } catch {
+      warning = 'PDF 文本提取失败，仍可尝试预览或下载原文件';
+    } finally {
+      await loadingTask?.destroy().catch(() => {});
     }
-    const text = pages.join('\n\n').trim();
     return {
       title: baseTitle,
-      content: text
-        ? `> 来源 PDF：\`${name}\`（共 ${pdf.numPages} 页）\n\n${text}`
-        : `> 来源 PDF：\`${name}\`（共 ${pdf.numPages} 页，未提取到可选中文字层，可能是纯扫描图片版 PDF，建议截图后用拍照识图导入）`,
+      content: text,
       sourceType: 'pdf',
+      attachmentDataUrl: `data:application/pdf;base64,${await fileToBase64(file)}`,
+      warning,
     };
   }
 
@@ -621,7 +644,20 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
 
 function enrichNote(state: LocalDBState, n: Note): Note {
   const cat = state.categories.find((c) => c.id === n.category_id);
-  return { ...n, category_name: cat?.name || null, category_color: cat?.color || null };
+  return { ...n, chat_excerpts: readChatExcerpts(n.chat_excerpts), category_name: cat?.name || null, category_color: cat?.color || null };
+}
+
+function requireNote(state: LocalDBState, id: string): Note {
+  const note = state.notes.find((item) => item.id === id);
+  if (!note) throw new Error('笔记不存在');
+  return note;
+}
+
+async function saveNoteText(state: LocalDBState, note: Note): Promise<Note> {
+  note.word_count = countWords(noteStudyText(note));
+  note.updated_at = nextNoteUpdatedAt(note.updated_at);
+  await saveState(state);
+  return enrichNote(state, note);
 }
 
 function normalizeChoiceAnswer(ans: string): string {
@@ -887,7 +923,7 @@ export const localApi = {
       list = list.filter(
         (n) =>
           n.title.toLowerCase().includes(q) ||
-          n.content.toLowerCase().includes(q) ||
+          noteStudyText(n).toLowerCase().includes(q) ||
           n.tags.some((t) => t.toLowerCase().includes(q))
       );
     }
@@ -903,9 +939,7 @@ export const localApi = {
 
   async getNote(id: string): Promise<Note> {
     const s = await loadState();
-    const n = s.notes.find((x) => x.id === id);
-    if (!n) throw new Error('笔记不存在');
-    return enrichNote(s, n);
+    return enrichNote(s, requireNote(s, id));
   },
 
   async getTags(): Promise<{ name: string; count: number }[]> {
@@ -941,19 +975,47 @@ export const localApi = {
 
   async updateNote(id: string, payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean }): Promise<Note> {
     const s = await loadState();
-    const n = s.notes.find((x) => x.id === id);
-    if (!n) throw new Error('笔记不存在');
+    const n = requireNote(s, id);
     if (payload.title !== undefined) n.title = payload.title.trim() || n.title;
-    if (payload.content !== undefined) {
-      n.content = payload.content;
-      n.word_count = countWords(payload.content);
-    }
+    if (payload.content !== undefined) n.content = payload.content;
     if (payload.categoryId !== undefined) n.category_id = payload.categoryId || null;
     if (payload.tags !== undefined) n.tags = payload.tags;
     if (payload.isPinned !== undefined) n.is_pinned = payload.isPinned;
-    n.updated_at = nowIso();
-    await saveState(s);
-    return enrichNote(s, n);
+    return saveNoteText(s, n);
+  },
+
+  async appendNoteChat(id: string, excerptId: string, content: string): Promise<Note> {
+    if (!content.trim()) throw new Error('聊天内容不能为空');
+    const s = await loadState();
+    const note = requireNote(s, id);
+    const excerpts = readChatExcerpts(note.chat_excerpts);
+    if (excerpts.some((excerpt) => excerpt.id === excerptId)) return enrichNote(s, note);
+    note.chat_excerpts = [...excerpts, { id: excerptId, content, created_at: nowIso() }];
+    return saveNoteText(s, note);
+  },
+
+  async removeNoteChat(id: string, excerptId: string): Promise<Note> {
+    const s = await loadState();
+    const note = requireNote(s, id);
+    const excerpts = readChatExcerpts(note.chat_excerpts);
+    const remaining = excerpts.filter((excerpt) => excerpt.id !== excerptId);
+    if (remaining.length === excerpts.length) return enrichNote(s, note);
+    note.chat_excerpts = remaining;
+    return saveNoteText(s, note);
+  },
+
+  async removeLegacyNoteChat(id: string, offset: number, block: string, updatedAt: string): Promise<Note> {
+    const s = await loadState();
+    const note = requireNote(s, id);
+    if (updatedAt !== note.updated_at) throw new Error('笔记已更新，请重新打开笔记后再试');
+    const removal = removeLegacyChatExcerpt(note.content, offset, block, () =>
+      Object.values(s.tutorMessages).flatMap((messages) =>
+        messages.filter((message) => message.role === 'assistant').map((message) => message.content)
+      )
+    );
+    if ('error' in removal) throw new Error(removal.error);
+    note.content = removal.content;
+    return saveNoteText(s, note);
   },
 
   async deleteNote(id: string) {
@@ -964,17 +1026,20 @@ export const localApi = {
   },
 
   async importFiles(files: File[], categoryId?: string | null, tags?: string[]) {
-    const s = await loadState();
+    const { settings } = await loadState();
     const imported: Note[] = [];
     const warnings: string[] = [];
     for (const f of files) {
       try {
-        const parsed = await parseFileOnDevice(f, s.settings);
+        const parsed = await parseFileOnDevice(f, settings);
+        if (parsed.warning) warnings.push(`${f.name}：${parsed.warning}`);
         const now = nowIso();
+        const isImage = parsed.sourceType === 'image';
         const note: Note = {
           id: uid(),
           title: parsed.title,
-          content: parsed.content,
+          content: isImage ? parsed.content : '',
+          source_content: isImage ? null : parsed.content,
           summary: null,
           category_id: categoryId || null,
           tags: tags || [],
@@ -986,9 +1051,7 @@ export const localApi = {
           created_at: now,
           updated_at: now,
         };
-        s.notes.unshift(note);
-        logStudy(s, 'note_import', note.id);
-        imported.push(enrichNote(s, note));
+        imported.push(note);
       } catch (e: any) {
         warnings.push(`${f.name}：${e.message || '解析失败'}`);
       }
@@ -996,14 +1059,19 @@ export const localApi = {
     if (imported.length === 0 && warnings.length > 0) {
       throw new Error(warnings.join('；'));
     }
+    const s = await loadState();
+    for (const note of imported) {
+      s.notes.unshift(note);
+      logStudy(s, 'note_import', note.id);
+    }
     await saveState(s);
-    return { imported, warnings };
+    return { imported: imported.map((note) => enrichNote(s, note)), warnings };
   },
 
   async rerunOcr(id: string): Promise<Note> {
     const s = await loadState();
     const n = s.notes.find((x) => x.id === id);
-    if (!n || !n.attachment_path?.startsWith('data:')) throw new Error('该笔记没有关联图片附件');
+    if (!n || n.source_type !== 'image' || !n.attachment_path?.startsWith('data:')) throw new Error('该笔记没有关联图片附件');
     const provider = requireActiveProvider(s.settings);
     const [meta, base64] = n.attachment_path.split(',');
     const mime = meta.match(/data:(.*?);/)?.[1] || 'image/jpeg';
@@ -1013,10 +1081,7 @@ export const localApi = {
     }
     n.content = ocrText;
     n.summary = null; // clear stale error summary after re-OCR
-    n.word_count = countWords(ocrText);
-    n.updated_at = nowIso();
-    await saveState(s);
-    return enrichNote(s, n);
+    return saveNoteText(s, n);
   },
 
   async summarizeNote(id: string, applyMeta = true): Promise<Note> {
@@ -1024,7 +1089,7 @@ export const localApi = {
     const n = s.notes.find((x) => x.id === id);
     if (!n) throw new Error('笔记不存在');
     const provider = requireActiveProvider(s.settings);
-    const cleanText = stripInlineImages(n.content);
+    const cleanText = stripInlineImages(noteStudyText(n));
     const raw = await callLLMDirect(
       provider,
       [
@@ -1088,7 +1153,7 @@ export const localApi = {
       : [];
     if (!target.length) throw new Error('请至少选择 1 篇笔记进行归纳');
     const combined = target
-      .map((n, i) => `### 笔记${i + 1}：${n.title}\n${stripInlineImages(n.content).slice(0, 3200)}`)
+      .map((n, i) => `### 笔记${i + 1}：${n.title}\n${stripInlineImages(noteStudyText(n)).slice(0, 3200)}`)
       .join('\n\n---\n\n');
     const md = await callLLMDirect(provider, [
       {
@@ -1171,7 +1236,7 @@ export const localApi = {
         {
           role: 'user',
           content: `出 ${count} 题，难度 ${diff}，题型 ${types.join(',')}${focus.length ? `，重点考查：${focus.join('、')}` : ''}\n\n${sourceNotes
-            .map((n) => `[NOTE_ID:${n.id}] 《${n.title}》\n${stripInlineImages(n.content).slice(0, 3200)}`)
+            .map((n) => `[NOTE_ID:${n.id}] 《${n.title}》\n${stripInlineImages(noteStudyText(n)).slice(0, 3200)}`)
             .join('\n\n')}`,
         },
       ],
@@ -1521,7 +1586,7 @@ export const localApi = {
       provider,
       [
         { role: 'system', content: '从笔记生成原子化主动回忆闪卡，返回JSON：{"cards":[{"front":"问题","back":"答案","hint":"提示","conceptName":"概念"}]}' },
-        { role: 'user', content: `生成 ${count} 张闪卡。\n标题：${n.title}\n${stripInlineImages(n.content).slice(0, 9000)}` },
+        { role: 'user', content: `生成 ${count} 张闪卡。\n标题：${n.title}\n${stripInlineImages(noteStudyText(n)).slice(0, 9000)}` },
       ],
       { jsonMode: true, temperature: 0.4 }
     );
@@ -1644,7 +1709,7 @@ export const localApi = {
     const noteIds = payload.noteIds?.length ? payload.noteIds : session.note_ids;
     const mode = payload.mode || session.mode;
     const notes = noteIds.length ? s.notes.filter((n) => noteIds.includes(n.id)) : s.notes.slice(0, 3);
-    const ctx = notes.map((n, i) => `【笔记${i + 1}：${n.title}】\n${stripInlineImages(n.content).slice(0, 3500)}`).join('\n\n');
+    const ctx = notes.map((n, i) => `【笔记${i + 1}：${n.title}】\n${stripInlineImages(noteStudyText(n)).slice(0, 3500)}`).join('\n\n');
     const sys =
       mode === 'feynman'
         ? `你是费曼学习法考官。先肯定准确部分并给出理解度评分，再指出逻辑漏洞并提出1-2个直击要害的苏格拉底式追问。\n\n参考材料：\n${ctx}`

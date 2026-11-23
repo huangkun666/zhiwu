@@ -19,8 +19,7 @@ export interface ParsedFileResult {
 export async function parseUploadedFile(
   filePath: string,
   originalName: string,
-  mimeType: string,
-  publicAttachmentUrl?: string
+  mimeType: string
 ): Promise<ParsedFileResult> {
   const ext = path.extname(originalName).toLowerCase();
   const baseTitle = path.basename(originalName, ext).trim() || '未命名笔记';
@@ -33,7 +32,7 @@ export async function parseUploadedFile(
     const title = h1 ? h1[1].trim() : baseTitle;
     return {
       title,
-      content: raw.trim(),
+      content: raw,
       sourceType: ext === '.txt' ? 'text' : 'markdown',
     };
   }
@@ -41,21 +40,19 @@ export async function parseUploadedFile(
   // 2. PDF
   if (ext === '.pdf' || mimeType === 'application/pdf') {
     const buf = fs.readFileSync(filePath);
-    const parsed = await pdfParse(buf);
-    const cleaned = (parsed.text || '')
-      .replace(/\r\n/g, '\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-
-    const content = cleaned
-      ? `> 来源文件：\`${originalName}\`（共 ${parsed.numpages || '?'} 页）\n\n${cleaned}`
-      : `> 来源 PDF 文件：\`${originalName}\`（未能提取到纯文本，可能是扫描版 PDF，建议截图后使用「拍照/图片导入」通过视觉模型识别）`;
-
-    return {
-      title: baseTitle,
-      content,
-      sourceType: 'pdf',
-    };
+    if (!buf.subarray(0, 1024).includes('%PDF-')) throw new Error('文件内容不是有效的 PDF');
+    try {
+      const parsed = await pdfParse(buf);
+      const content = (parsed.text || '').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      return {
+        title: baseTitle,
+        content,
+        sourceType: 'pdf',
+        warning: content ? undefined : 'PDF 没有可提取的文本，可以预览原始页面',
+      };
+    } catch {
+      return { title: baseTitle, content: '', sourceType: 'pdf', warning: 'PDF 文本提取失败，仍可尝试预览或下载原文件' };
+    }
   }
 
   // 3. Word (.docx)
@@ -69,7 +66,7 @@ export async function parseUploadedFile(
 
     return {
       title: baseTitle,
-      content: cleaned || `> 已导入 Word 文档：\`${originalName}\``,
+      content: cleaned,
       sourceType: 'docx',
     };
   }

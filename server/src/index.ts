@@ -22,7 +22,9 @@ app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // Static uploaded attachments (PDFs, images)
-app.use('/uploads', express.static(UPLOADS_DIR));
+app.use('/uploads', express.static(UPLOADS_DIR, {
+  setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff'),
+}));
 
 // API routes
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', app: '知悟 (Zhiwu)' }));

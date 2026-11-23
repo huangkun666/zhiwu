@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { db, logStudyActivity, nowIso, uid, updateConceptMastery } from '../db.js';
 import { diagnoseMistakeAI, generateVariantQuestionAI } from '../services/ai.js';
 import { computeSM2, previewSM2Intervals } from '../services/sm2.js';
+import { noteStudyText } from '../shared/noteContent.js';
 
 export const mistakesRouter = Router();
 
@@ -113,8 +114,9 @@ mistakesRouter.post('/:id/diagnose', async (req, res) => {
 
   let noteExcerpt = '';
   if (m.note_id) {
-    const note = db.prepare(`SELECT content FROM notes WHERE id = ?`).get(m.note_id) as { content: string } | undefined;
-    noteExcerpt = note?.content || '';
+    const note = db.prepare(`SELECT content, source_content, chat_excerpts FROM notes WHERE id = ?`).get(m.note_id) as
+      Parameters<typeof noteStudyText>[0] | undefined;
+    if (note) noteExcerpt = noteStudyText(note);
   }
 
   try {

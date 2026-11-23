@@ -1,3 +1,5 @@
+import type { ChatExcerpt } from '../../server/src/shared/noteContent';
+
 export type PageId =
   | 'home'
   | 'notes'
@@ -32,6 +34,8 @@ export interface Note {
   id: string;
   title: string;
   content: string;
+  source_content?: string | null;
+  chat_excerpts?: ChatExcerpt[];
   summary: NoteSummary | null;
   category_id: string | null;
   category_name?: string | null;

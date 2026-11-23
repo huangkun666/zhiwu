@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { db, logStudyActivity, nowIso, uid, updateConceptMastery } from '../db.js';
 import { generateFlashcardsAI } from '../services/ai.js';
 import { computeSM2, previewSM2Intervals } from '../services/sm2.js';
+import { noteStudyText } from '../shared/noteContent.js';
 
 export const flashcardsRouter = Router();
 
@@ -112,7 +113,7 @@ flashcardsRouter.post('/generate', async (req, res) => {
   if (!note) return res.status(404).json({ error: '笔记不存在' });
 
   try {
-    const cards = await generateFlashcardsAI(note.title, note.content, Math.max(2, Math.min(12, Number(count) || 6)));
+    const cards = await generateFlashcardsAI(note.title, noteStudyText(note), Math.max(2, Math.min(12, Number(count) || 6)));
     const now = nowIso();
     const created: any[] = [];
     for (const c of cards) {

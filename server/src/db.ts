@@ -91,6 +91,8 @@ export function initDatabase() {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       content TEXT NOT NULL,
+      source_content TEXT,
+      chat_excerpts TEXT NOT NULL DEFAULT '[]',
       summary_json TEXT,
       category_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
       tags TEXT DEFAULT '[]',
@@ -250,6 +252,10 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_flashcards_review ON flashcards(next_review_at);
     CREATE INDEX IF NOT EXISTS idx_study_logs_date ON study_logs(date_key);
   `);
+
+  const noteColumns = new Set(db.prepare('PRAGMA table_info(notes)').all().map((column) => column.name));
+  if (!noteColumns.has('source_content')) db.exec('ALTER TABLE notes ADD COLUMN source_content TEXT');
+  if (!noteColumns.has('chat_excerpts')) db.exec("ALTER TABLE notes ADD COLUMN chat_excerpts TEXT NOT NULL DEFAULT '[]'");
 
   // Initialize default AI settings if absent
   const existing = db.prepare(`SELECT value FROM settings WHERE key = 'ai_settings'`).get() as { value: string } | undefined;

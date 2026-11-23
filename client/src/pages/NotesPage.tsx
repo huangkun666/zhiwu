@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   BookMarked,
@@ -19,9 +19,12 @@ import {
   Square,
   Tag,
   Trash2,
+  Undo2,
 } from 'lucide-react';
+import { splitLegacyChatExcerpts } from '../../../server/src/shared/noteContent';
 import { api } from '../api/client';
 import { MarkdownView } from '../components/MarkdownView';
+import { NoteSource } from '../components/NoteSource';
 import type { Category, Note, PageId, Synthesis } from '../types';
 
 interface NotesPageProps {
@@ -66,6 +69,7 @@ export function NotesPage({
 
   const [loadingList, setLoadingList] = useState(false);
   const [aiBusy, setAiBusy] = useState<string | null>(null);
+  const [undoing, setUndoing] = useState(false);
   const [toast, setToast] = useState<string>('');
 
   const showToast = (msg: string) => {
@@ -125,10 +129,14 @@ export function NotesPage({
   const selectNote = (note: Note) => {
     setActiveNote(note);
     setEditing(false);
+  };
+
+  const startEditing = (note: Note) => {
     setEditTitle(note.title);
     setEditContent(note.content);
     setEditCategoryId(note.category_id || '');
     setEditTagsText(note.tags.join(' '));
+    setEditing(true);
   };
 
   const handleSaveEdit = async () => {
@@ -140,7 +148,7 @@ export function NotesPage({
     try {
       const updated = await api.updateNote(activeNote.id, {
         title: editTitle,
-        content: editContent,
+        content: editContent === activeNote.content ? undefined : editContent,
         categoryId: editCategoryId || null,
         tags: tagArr,
       });
@@ -151,6 +159,27 @@ export function NotesPage({
       showToast('笔记已保存');
     } catch (e: any) {
       alert(e.message);
+    }
+  };
+
+  const handleUndoChat = async (excerpt: { id: string } | { offset: number; block: string }) => {
+    if (!activeNote || undoing) return;
+    const noteId = activeNote.id;
+    if ('offset' in excerpt && !confirm('撤销这段旧版聊天追加？')) return;
+
+    setUndoing(true);
+    try {
+      const updated = 'id' in excerpt
+        ? await api.removeNoteChat(noteId, excerpt.id)
+        : await api.removeLegacyNoteChat(noteId, excerpt.offset, excerpt.block, activeNote.updated_at);
+      setActiveNote((current) => current?.id === noteId ? updated : current);
+      fetchNotes();
+      onRefreshGlobal();
+      showToast('已撤销聊天追加');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '无法撤销聊天追加');
+    } finally {
+      setUndoing(false);
     }
   };
 
@@ -246,6 +275,10 @@ export function NotesPage({
     setCheckedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
 
   const showDetailMobile = Boolean((subTab === 'notes' && activeNote) || (subTab === 'syntheses' && activeSynthesis));
+  const legacy = useMemo(() => splitLegacyChatExcerpts(activeNote?.content ?? ''), [activeNote?.content]);
+  const legacyImport = Boolean(activeNote?.source_filename && activeNote.source_type !== 'image' && activeNote.source_content == null);
+  const body = legacyImport ? '' : legacy.body;
+  const source = activeNote?.source_content ?? (legacyImport ? legacy.body : null);
 
   return (
     <div className="space-y-5">
@@ -256,7 +289,7 @@ export function NotesPage({
       )}
 
       {/* Top Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className={`${subTab === 'notes' && activeNote ? 'hidden lg:flex' : 'flex'} flex-wrap items-center justify-between gap-3`}>
         <div
           className="inline-flex p-1 rounded-xl border"
           style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
@@ -477,7 +510,7 @@ export function NotesPage({
                             </div>
                             <p className="text-xs text-[var(--text-muted)] line-clamp-2 mt-1">
                               {n.summary?.abstract ||
-                                n.content
+                                (n.content || n.chat_excerpts?.[0]?.content || n.source_content || n.source_filename || '')
                                   .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
                                   .replace(/[#*`>!]/g, '')
                                   .trim()
@@ -614,21 +647,22 @@ export function NotesPage({
                         className="w-full text-base font-semibold px-3 py-1 rounded-lg zw-input"
                       />
                     ) : (
-                      <h2 className="text-lg font-semibold leading-snug">{activeNote.title}</h2>
+                      <h2 className="min-w-0 break-words text-lg font-semibold leading-snug">{activeNote.title}</h2>
                     )}
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     <button
                       onClick={handleTogglePin}
-                      title="置顶"
+                      title={activeNote.is_pinned ? '取消置顶' : '置顶'}
                       className="p-2 rounded-lg hover:bg-[var(--bg-hover)] cursor-pointer"
                       style={{ color: activeNote.is_pinned ? 'var(--text-primary)' : 'var(--text-muted)' }}
                     >
                       <Pin className="w-4 h-4" />
                     </button>
                     <button
-                      onClick={() => setEditing(!editing)}
+                      onClick={() => editing ? setEditing(false) : startEditing(activeNote)}
                       title={editing ? '预览' : '编辑'}
+                      disabled={undoing}
                       className="p-2 rounded-lg text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                     >
                       {editing ? <Eye className="w-4 h-4" /> : <Edit3 className="w-4 h-4" />}
@@ -786,7 +820,7 @@ export function NotesPage({
               )}
 
               {/* Content Body */}
-              <div className="p-5 sm:p-6">
+              <div className="p-5 sm:p-6 space-y-5">
                 {editing ? (
                   <div className="space-y-3">
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -810,6 +844,8 @@ export function NotesPage({
                       />
                     </div>
                     <textarea
+                      aria-label="笔记正文"
+                      placeholder="写下你的笔记…"
                       value={editContent}
                       onChange={(e) => setEditContent(e.target.value)}
                       rows={18}
@@ -832,12 +868,40 @@ export function NotesPage({
                     </div>
                   </div>
                 ) : (
-                  <MarkdownView
-                    content={activeNote.content
-                      .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
-                      .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
-                      .trim()}
-                  />
+                  <>
+                    {body.trim() && (
+                      <MarkdownView
+                        content={body
+                          .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
+                          .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
+                          .trim()}
+                      />
+                    )}
+                    {(legacy.excerpts.length > 0 || Boolean(activeNote.chat_excerpts?.length)) && (
+                      <section className="space-y-3" aria-label="聊天追加">
+                        <h3 className="text-sm font-semibold">聊天追加</h3>
+                        {legacy.excerpts.map((excerpt) => (
+                          <NoteChatExcerpt
+                            key={`legacy-${excerpt.offset}`}
+                            date={excerpt.date}
+                            content={excerpt.content}
+                            disabled={undoing}
+                            onUndo={() => handleUndoChat(excerpt)}
+                          />
+                        ))}
+                        {activeNote.chat_excerpts?.map((excerpt) => (
+                          <NoteChatExcerpt
+                            key={excerpt.id}
+                            date={new Date(excerpt.created_at).toLocaleDateString()}
+                            content={excerpt.content}
+                            disabled={undoing}
+                            onUndo={() => handleUndoChat(excerpt)}
+                          />
+                        ))}
+                      </section>
+                    )}
+                    {source !== null && <NoteSource key={activeNote.id} note={activeNote} content={source} />}
+                  </>
                 )}
               </div>
             </div>
@@ -850,5 +914,29 @@ export function NotesPage({
         </div>
       </div>
     </div>
+  );
+}
+
+function NoteChatExcerpt({ date, content, disabled, onUndo }: {
+  date: string;
+  content: string;
+  disabled: boolean;
+  onUndo: () => void;
+}) {
+  return (
+    <article className="space-y-3 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-3 sm:p-4">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs text-[var(--text-muted)]">{date}</span>
+        <button
+          type="button"
+          onClick={onUndo}
+          disabled={disabled}
+          className="inline-flex min-h-9 items-center gap-1 px-2.5 py-1.5 rounded-lg zw-btn-secondary text-xs cursor-pointer disabled:opacity-50"
+        >
+          <Undo2 className="w-3.5 h-3.5" /> 撤销追加
+        </button>
+      </div>
+      <MarkdownView content={content} />
+    </article>
   );
 }

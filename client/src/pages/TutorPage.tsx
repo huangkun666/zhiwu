@@ -10,6 +10,7 @@ import {
   Send,
   Sparkles,
   Trash2,
+  Undo2,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { MarkdownView } from '../components/MarkdownView';
@@ -25,6 +26,8 @@ interface TutorPageProps {
   onRefreshGlobal?: () => void;
 }
 
+type NoteAppend = { noteId: string; excerptId: string };
+
 export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   const [sessions, setSessions] = useState<TutorSession[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
@@ -36,13 +39,18 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   const [sending, setSending] = useState(false);
   const [streamingText, setStreamingText] = useState('');
   const [showContextPicker, setShowContextPicker] = useState(false);
-  const [toast, setToast] = useState('');
+  const [toast, setToast] = useState<{ message: string; append?: NoteAppend } | null>(null);
+  const [noteActionBusy, setNoteActionBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const toastTimer = useRef<number | undefined>(undefined);
 
-  const showToast = (msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(''), 2800);
+  const showToast = (message: string, append?: NoteAppend) => {
+    window.clearTimeout(toastTimer.current);
+    setToast({ message, append });
+    toastTimer.current = window.setTimeout(() => setToast(null), append ? 8000 : 2800);
   };
+
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   const loadSessions = async () => {
     const [sessList, noteList] = await Promise.all([api.getTutorSessions(), api.getNotes()]);
@@ -157,18 +165,18 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   };
 
   // Closed-loop沉淀: Append AI insight back into linked note (or create a new note)
-  const handleAppendToNote = async (aiContent: string) => {
+  const handleAppendToNote = async (message: TutorMessage) => {
+    if (noteActionBusy) return;
+    setNoteActionBusy(true);
     try {
       const targetNoteId = selectedNoteIds[0];
       if (targetNoteId) {
-        const note = await api.getNote(targetNoteId);
-        const appended = `${note.content}\n\n---\n\n### 费曼助教延伸笔记（${new Date().toLocaleDateString()}）\n\n${aiContent}`;
-        await api.updateNote(note.id, { content: appended });
-        showToast(`已追加沉淀到《${note.title}》`);
+        const note = await api.appendNoteChat(targetNoteId, message.id, message.content);
+        showToast(`已追加到《${note.title}》`, { noteId: note.id, excerptId: message.id });
       } else {
         await api.createNote({
           title: `助教沉淀：${activeSession?.title || '学习思考'}`,
-          content: aiContent,
+          content: message.content,
           tags: ['费曼沉淀'],
         });
         showToast('已保存为新笔记');
@@ -176,6 +184,22 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
       onRefreshGlobal?.();
     } catch (e: any) {
       alert(e.message);
+    } finally {
+      setNoteActionBusy(false);
+    }
+  };
+
+  const handleUndoAppend = async (append: NoteAppend) => {
+    if (noteActionBusy) return;
+    setNoteActionBusy(true);
+    try {
+      await api.removeNoteChat(append.noteId, append.excerptId);
+      onRefreshGlobal?.();
+      showToast('已撤销聊天追加');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '无法撤销聊天追加');
+    } finally {
+      setNoteActionBusy(false);
     }
   };
 
@@ -187,8 +211,18 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-[calc(100dvh-8.2rem)] md:h-[calc(100vh-4.5rem)]">
       {toast && (
-        <div className="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-xl zw-btn-primary text-xs font-medium shadow-lg">
-          {toast}
+        <div className="fixed top-4 right-4 z-50 flex items-center gap-3 max-w-[calc(100vw-2rem)] px-4 py-2.5 rounded-xl zw-btn-primary text-xs font-medium shadow-lg">
+          <span role="status" className="break-words min-w-0">{toast.message}</span>
+          {toast.append && (
+            <button
+              type="button"
+              disabled={noteActionBusy}
+              onClick={() => handleUndoAppend(toast.append!)}
+              className="shrink-0 flex items-center gap-1 rounded-lg border border-current px-2 py-1 cursor-pointer disabled:opacity-50"
+            >
+              <Undo2 className="w-3.5 h-3.5" /> 撤销
+            </button>
+          )}
         </div>
       )}
 
@@ -370,10 +404,11 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
                       </button>
                       <span>·</span>
                       <button
-                        onClick={() => handleAppendToNote(m.content)}
-                        className="inline-flex items-center gap-1 hover:text-[var(--text-primary)] cursor-pointer transition"
+                        onClick={() => handleAppendToNote(m)}
+                        disabled={noteActionBusy}
+                        className="inline-flex items-center gap-1 hover:text-[var(--text-primary)] cursor-pointer transition disabled:opacity-50"
                       >
-                        <FilePlus2 className="w-3 h-3" /> 追加到笔记
+                        <FilePlus2 className="w-3 h-3" /> {selectedNoteIds.length ? '追加到笔记' : '存为新笔记'}
                       </button>
                     </div>
                   )}

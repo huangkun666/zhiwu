@@ -1,8 +1,18 @@
 import { Router } from 'express';
 import { db, logStudyActivity, nowIso, uid } from '../db.js';
 import { tutorChatAI, tutorChatStreamAI } from '../services/ai.js';
+import { noteStudyText } from '../shared/noteContent.js';
 
 export const tutorRouter = Router();
+
+function getContextNotes(noteIds: string[]) {
+  const condition = noteIds.length
+    ? `WHERE id IN (${noteIds.map(() => '?').join(',')})`
+    : 'ORDER BY updated_at DESC LIMIT 4';
+  const rows = db.prepare(`SELECT title, content, source_content, chat_excerpts FROM notes ${condition}`).all(...noteIds) as
+    Array<{ title: string } & Parameters<typeof noteStudyText>[0]>;
+  return rows.map((row) => ({ title: row.title, content: noteStudyText(row) }));
+}
 
 // List sessions
 tutorRouter.get('/sessions', (_req, res) => {
@@ -79,14 +89,7 @@ tutorRouter.post('/sessions/:id/chat', async (req, res) => {
     : JSON.parse(session.note_ids || '[]');
   const mode: 'qa' | 'feynman' = req.body?.mode === 'feynman' || session.mode === 'feynman' ? 'feynman' : 'qa';
 
-  // Fetch context notes
-  let notes: { title: string; content: string }[] = [];
-  if (noteIds.length > 0) {
-    const ph = noteIds.map(() => '?').join(',');
-    notes = db.prepare(`SELECT title, content FROM notes WHERE id IN (${ph})`).all(...noteIds) as any[];
-  } else {
-    notes = db.prepare(`SELECT title, content FROM notes ORDER BY updated_at DESC LIMIT 4`).all() as any[];
-  }
+  const notes = getContextNotes(noteIds);
 
   const history = db
     .prepare(`SELECT role, content FROM tutor_messages WHERE session_id = ? ORDER BY created_at ASC`)
@@ -136,13 +139,7 @@ tutorRouter.post('/sessions/:id/chat-stream', async (req, res) => {
     : JSON.parse(session.note_ids || '[]');
   const mode: 'qa' | 'feynman' = req.body?.mode === 'feynman' || session.mode === 'feynman' ? 'feynman' : 'qa';
 
-  let notes: { title: string; content: string }[] = [];
-  if (noteIds.length > 0) {
-    const ph = noteIds.map(() => '?').join(',');
-    notes = db.prepare(`SELECT title, content FROM notes WHERE id IN (${ph})`).all(...noteIds) as any[];
-  } else {
-    notes = db.prepare(`SELECT title, content FROM notes ORDER BY updated_at DESC LIMIT 4`).all() as any[];
-  }
+  const notes = getContextNotes(noteIds);
 
   const history = db
     .prepare(`SELECT role, content FROM tutor_messages WHERE session_id = ? ORDER BY created_at ASC`)

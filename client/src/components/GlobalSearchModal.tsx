@@ -91,7 +91,7 @@ export function GlobalSearchModal({ open, onClose, onSelectNote }: GlobalSearchM
                   </div>
                   <p className="text-xs text-[var(--text-muted)] line-clamp-2 mt-1">
                     {note.summary?.abstract ||
-                      note.content
+                      (note.content || note.chat_excerpts?.[0]?.content || note.source_content || note.source_filename || '')
                         .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
                         .replace(/[#*`>]/g, '')
                         .trim()
