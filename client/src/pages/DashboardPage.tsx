@@ -290,7 +290,7 @@ export function DashboardPage({ onNavigate, onOpenImport, onRefreshGlobal }: Das
         <div className="p-5 rounded-2xl zw-card">
           <h3 className="font-semibold text-sm mb-3.5">学科掌握度</h3>
           {subjectMastery.length === 0 ? (
-            <p className="text-xs text-[var(--text-muted)] py-6 text-center">暂无分类数据</p>
+            <p className="text-xs text-[var(--text-muted)] py-6 text-center">暂无已分类的笔记</p>
           ) : (
             <div className="space-y-3.5">
               {subjectMastery.map((sub) => (
@@ -298,15 +298,17 @@ export function DashboardPage({ onNavigate, onOpenImport, onRefreshGlobal }: Das
                   <div className="flex items-center justify-between text-xs mb-1.5">
                     <span className="font-medium">{sub.name}</span>
                     <span className="text-[var(--text-muted)] tabular-nums">
-                      {sub.mastery}% · {sub.note_count} 篇
+                      {sub.mastery === null ? '待提炼' : `${sub.mastery}%`} · {sub.note_count} 篇
                     </span>
                   </div>
-                  <div className="h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--bg-subtle)' }}>
-                    <div
-                      className="h-full rounded-full transition-all"
-                      style={{ width: `${sub.mastery}%`, background: 'var(--btn-primary-bg)' }}
-                    />
-                  </div>
+                  {sub.mastery !== null && (
+                    <div className="h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--bg-subtle)' }}>
+                      <div
+                        className="h-full rounded-full transition-all"
+                        style={{ width: `${sub.mastery}%`, background: 'var(--btn-primary-bg)' }}
+                      />
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -316,12 +318,14 @@ export function DashboardPage({ onNavigate, onOpenImport, onRefreshGlobal }: Das
         <div className="p-5 rounded-2xl zw-card">
           <div className="flex items-center justify-between mb-3.5">
             <h3 className="font-semibold text-sm">薄弱知识点</h3>
-            <button
-              onClick={() => onNavigate('practice', { subTab: 'quiz', weakOnly: true })}
-              className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
-            >
-              专项突破 →
-            </button>
+            {weakConcepts.length > 0 && (
+              <button
+                onClick={() => onNavigate('practice', { subTab: 'quiz', weakOnly: true })}
+                className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+              >
+                专项突破 →
+              </button>
+            )}
           </div>
           {weakConcepts.length === 0 ? (
             <p className="text-xs text-[var(--text-muted)] py-6 text-center">总结笔记并测验后自动识别</p>

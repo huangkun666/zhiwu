@@ -239,7 +239,7 @@ export interface DashboardData {
   };
   heatmap: { date: string; count: number }[];
   quizTrend: { date: string; accuracy: number }[];
-  subjectMastery: { id: string; name: string; color: string; note_count: number; mastery: number }[];
+  subjectMastery: { id: string; name: string; color: string; note_count: number; mastery: number | null }[];
   weakConcepts: { id: string; name: string; mastery_score: number; quiz_attempts: number; quiz_correct: number }[];
   recentNotes: {
     id: string;

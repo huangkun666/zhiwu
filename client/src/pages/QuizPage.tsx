@@ -50,6 +50,10 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
   const [submitting, setSubmitting] = useState(false);
   const [bookmarked, setBookmarked] = useState<Record<string, boolean>>({});
   const [error, setError] = useState('');
+  const availableNoteIds = selectedNoteIds.filter((id) => notes.some((note) => note.id === id));
+  const hasSource = sourceMode === 'notes'
+    ? availableNoteIds.length > 0
+    : notes.some((note) => sourceMode !== 'category' || !selectedCatId || note.category_id === selectedCatId);
 
   const loadInit = async () => {
     const [noteList, quizList] = await Promise.all([api.getNotes(), api.getQuizzes()]);
@@ -84,11 +88,12 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
   };
 
   const handleGenerate = async () => {
+    if (!hasSource) return;
     setError('');
     setGenerating(true);
     try {
       const quiz = await api.generateQuiz({
-        noteIds: sourceMode === 'notes' ? selectedNoteIds : [],
+        noteIds: sourceMode === 'notes' ? availableNoteIds : [],
         categoryId: sourceMode === 'category' ? selectedCatId || null : null,
         weakOnly: sourceMode === 'weak',
         focusConcepts: sourceMode === 'weak' ? focusConcepts : [],
@@ -455,7 +460,7 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
             >
               <option value="">全部最近笔记</option>
               {categories.map((c) => (
-                <option key={c.id} value={c.id}>
+                <option key={c.id} value={c.id} disabled={!notes.some((note) => note.category_id === c.id)}>
                   {c.name} ({c.note_count || 0} 篇)
                 </option>
               ))}
@@ -552,7 +557,7 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
 
         <button
           onClick={handleGenerate}
-          disabled={generating}
+          disabled={generating || !hasSource}
           className="w-full flex items-center justify-center gap-2 py-3 rounded-2xl zw-btn-primary font-semibold text-sm disabled:opacity-50 cursor-pointer"
         >
           {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}

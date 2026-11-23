@@ -6,8 +6,13 @@ import {
   countWords,
   db,
   DB_PATH,
+  existingCategoryId,
+  existingNoteIds,
   getAISettings,
+  inTransaction,
   nowIso,
+  reconcileLibraryReferences,
+  restoreReviewedConceptLinks,
   saveAISettings,
   syncNoteFts,
   uid,
@@ -187,7 +192,10 @@ settingsRouter.post('/import-json', (req, res) => {
   if (!Array.isArray(payload.notes)) {
     return res.status(400).json({ error: '无效的知悟 JSON 备份格式' });
   }
+  res.json(inTransaction(() => mergeBackup(payload)));
+});
 
+function mergeBackup(payload: any) {
   let notesMerged = 0;
   let cardsMerged = 0;
   let mistakesMerged = 0;
@@ -196,8 +204,9 @@ settingsRouter.post('/import-json', (req, res) => {
   for (const c of payload.categories || []) {
     if (!c?.id || !c?.name) continue;
     db.prepare(
-      `INSERT OR IGNORE INTO categories (id, name, color, icon, description, created_at) VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(c.id, c.name, c.color || '#3B5BDB', c.icon || 'folder', c.description || '', c.created_at || now);
+      `INSERT OR IGNORE INTO categories (id, name, color, icon, description, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(c.id, c.name, c.color || '#3B5BDB', c.icon || 'folder', c.description || '', c.created_at || now,
+      typeof c.parent_id === 'string' ? c.parent_id : null);
   }
 
   for (const n of payload.notes || []) {
@@ -213,10 +222,16 @@ settingsRouter.post('/import-json', (req, res) => {
       const chatExcerpts = readChatExcerpts(n.chat_excerpts);
       const studyText = noteStudyText({ content, source_content: sourceContent, chat_excerpts: chatExcerpts });
       db.prepare(
-        `INSERT OR REPLACE INTO notes (
+        `INSERT INTO notes (
           id, title, content, source_content, chat_excerpts, summary_json, category_id, tags, source_type,
           source_filename, attachment_path, word_count, is_pinned, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          title = excluded.title, content = excluded.content, source_content = excluded.source_content,
+          chat_excerpts = excluded.chat_excerpts, summary_json = excluded.summary_json, category_id = excluded.category_id,
+          tags = excluded.tags, source_type = excluded.source_type, source_filename = excluded.source_filename,
+          attachment_path = excluded.attachment_path, word_count = excluded.word_count, is_pinned = excluded.is_pinned,
+          updated_at = excluded.updated_at`
       ).run(
         n.id,
         n.title,
@@ -224,7 +239,7 @@ settingsRouter.post('/import-json', (req, res) => {
         sourceContent,
         JSON.stringify(chatExcerpts),
         n.summary ? JSON.stringify(n.summary) : null,
-        n.category_id || null,
+        existingCategoryId(n.category_id),
         JSON.stringify(tags),
         n.source_type || 'markdown',
         n.source_filename || null,
@@ -248,13 +263,10 @@ settingsRouter.post('/import-json', (req, res) => {
 
   for (const con of payload.concepts || []) {
     if (!con?.name) continue;
-    const cid = upsertConcept(con.name, con.description || '', con.category_id || null);
-    for (const nid of con.note_ids || []) {
-      try {
-        db.prepare(`INSERT OR IGNORE INTO note_concepts (note_id, concept_id) VALUES (?, ?)`).run(nid, cid);
-      } catch {
-        // note may not exist
-      }
+    const cid = upsertConcept(con.name, con.description || '', existingCategoryId(con.category_id));
+    if (!cid) continue;
+    for (const nid of existingNoteIds(con.note_ids)) {
+      db.prepare(`INSERT OR IGNORE INTO note_concepts (note_id, concept_id) VALUES (?, ?)`).run(nid, cid);
     }
   }
 
@@ -267,7 +279,7 @@ settingsRouter.post('/import-json', (req, res) => {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       f.id,
-      f.note_id || null,
+      existingNoteIds([f.note_id])[0] || null,
       f.category_id || null,
       f.concept_name || '',
       f.front,
@@ -327,5 +339,7 @@ settingsRouter.post('/import-json', (req, res) => {
     ).run(l.id || uid(), l.activity_type, l.entity_id || null, l.duration_seconds || 0, l.score ?? null, l.created_at || now, l.date_key);
   }
 
-  res.json({ ok: true, notesCount: notesMerged, cardsMerged, mistakesMerged });
-});
+  reconcileLibraryReferences();
+  restoreReviewedConceptLinks();
+  return { ok: true, notesCount: notesMerged, cardsMerged, mistakesMerged };
+}

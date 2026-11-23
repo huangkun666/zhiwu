@@ -1,6 +1,7 @@
 import { Router } from 'express';
-import { db, logStudyActivity, nowIso, uid, updateConceptMastery } from '../db.js';
+import { db, existingCategoryId, existingNoteIds, inTransaction, logStudyActivity, nowIso, reconcileLibraryReferences, uid, updateConceptMastery } from '../db.js';
 import { generateQuizAI, gradeShortAnswerAI } from '../services/ai.js';
+import { questionSourceId, readIds } from '../shared/libraryReferences.js';
 import { noteStudyText } from '../shared/noteContent.js';
 
 export const quizzesRouter = Router();
@@ -19,21 +20,27 @@ quizzesRouter.get('/', (_req, res) => {
   res.json(
     rows.map((r) => ({
       ...r,
-      source_note_ids: JSON.parse(r.source_note_ids || '[]'),
+      source_note_ids: readIds(r.source_note_ids),
     }))
   );
 });
 
 // Get single quiz with questions
-quizzesRouter.get('/:id', (req, res) => {
-  const quiz = db.prepare(`SELECT * FROM quizzes WHERE id = ?`).get(req.params.id) as any;
-  if (!quiz) return res.status(404).json({ error: '测验不存在' });
+function getQuiz(id: string) {
+  const quiz = db.prepare(`SELECT * FROM quizzes WHERE id = ?`).get(id) as any;
+  if (!quiz) return null;
   const questions = db.prepare(`SELECT * FROM quiz_questions WHERE quiz_id = ?`).all(quiz.id) as any[];
-  res.json({
+  return {
     ...quiz,
-    source_note_ids: JSON.parse(quiz.source_note_ids || '[]'),
+    source_note_ids: readIds(quiz.source_note_ids),
     questions: questions.map(formatQuestion),
-  });
+  };
+}
+
+quizzesRouter.get('/:id', (req, res) => {
+  const quiz = getQuiz(req.params.id);
+  if (!quiz) return res.status(404).json({ error: '测验不存在' });
+  res.json(quiz);
 });
 
 // Generate a dynamic quiz from notes / category / weak concepts
@@ -50,41 +57,34 @@ quizzesRouter.post('/generate', async (req, res) => {
   } = req.body || {};
 
   let sourceNotes: any[] = [];
-  let targetConcepts: string[] = Array.isArray(focusConcepts) ? focusConcepts : [];
+  let targetConcepts = readIds(focusConcepts);
+  const requestedNotes = readIds(noteIds);
+  let missingSource = '笔记库中暂无可用笔记，请先导入或创建至少一篇笔记。';
 
   if (weakOnly) {
-    const weakRows = db
-      .prepare(`SELECT id, name FROM concepts ORDER BY mastery_score ASC, quiz_attempts DESC LIMIT 6`)
-      .all() as { id: string; name: string }[];
-    if (targetConcepts.length === 0) {
-      targetConcepts = weakRows.map((w) => w.name);
-    }
-    if (weakRows.length > 0) {
-      const ph = weakRows.map(() => '?').join(',');
-      sourceNotes = db
-        .prepare(
-          `SELECT DISTINCT n.* FROM notes n
-           INNER JOIN note_concepts nc ON nc.note_id = n.id
-           WHERE nc.concept_id IN (${ph})
-           LIMIT 6`
-        )
-        .all(...weakRows.map((w) => w.id)) as any[];
-    }
-  }
-
-  if (sourceNotes.length === 0 && Array.isArray(noteIds) && noteIds.length > 0) {
-    const ph = noteIds.map(() => '?').join(',');
-    sourceNotes = db.prepare(`SELECT * FROM notes WHERE id IN (${ph})`).all(...noteIds) as any[];
-  } else if (sourceNotes.length === 0 && categoryId) {
+    const names = JSON.stringify(targetConcepts);
+    const weakRows = db.prepare(`SELECT id, name FROM active_concepts
+      WHERE ? = '[]' OR name IN (SELECT value FROM json_each(?))
+      ORDER BY mastery_score ASC, quiz_attempts DESC LIMIT 6`).all(names, names) as { id: string; name: string }[];
+    targetConcepts = weakRows.map((row) => row.name);
+    sourceNotes = db.prepare(`SELECT DISTINCT n.* FROM notes n INNER JOIN note_concepts nc ON nc.note_id = n.id
+      WHERE nc.concept_id IN (SELECT value FROM json_each(?)) ORDER BY n.updated_at DESC LIMIT 6`)
+      .all(JSON.stringify(weakRows.map(({ id }) => id)));
+    missingSource = '暂无可用于专项突破的关联笔记';
+  } else if (requestedNotes.length > 0) {
+    sourceNotes = db.prepare(`SELECT * FROM notes WHERE id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(requestedNotes));
+    missingSource = '所选笔记已不存在，请重新选择';
+  } else if (categoryId) {
     sourceNotes = db
       .prepare(`SELECT * FROM notes WHERE category_id = ? ORDER BY updated_at DESC LIMIT 6`)
       .all(categoryId) as any[];
-  } else if (sourceNotes.length === 0) {
+    missingSource = '所选分类没有可用笔记，请重新选择';
+  } else {
     sourceNotes = db.prepare(`SELECT * FROM notes ORDER BY updated_at DESC LIMIT 5`).all() as any[];
   }
 
   if (sourceNotes.length === 0) {
-    return res.status(400).json({ error: '笔记库中暂无可用笔记，请先导入或创建至少一篇笔记。' });
+    return res.status(400).json({ error: missingSource });
   }
 
   const safeCount = Math.max(1, Math.min(15, Number(count) || 5));
@@ -116,45 +116,26 @@ quizzesRouter.post('/generate', async (req, res) => {
         ? `《${sourceNotes[0].title}》动态测验`
         : `综合动态测验（${sourceNotes.length} 篇笔记）`);
 
-    db.prepare(
-      `INSERT INTO quizzes (id, title, source_note_ids, category_id, difficulty, total_questions, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'in_progress', ?)`
-    ).run(quizId, quizTitle, JSON.stringify(sourceNotes.map((n) => n.id)), categoryId || null, difficulty, generated.length, now);
-
-    const savedQuestions: any[] = [];
-    for (const q of generated) {
-      const qid = uid();
+    const sourceIds = sourceNotes.map((note) => note.id);
+    const quiz = inTransaction(() => {
+      if (existingNoteIds(sourceIds).length !== sourceIds.length) return null;
       db.prepare(
-        `INSERT INTO quiz_questions (
-          id, quiz_id, note_id, concept_name, type, stem, options_json, correct_answer, explanation, memory_tip
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        qid,
-        quizId,
-        q.noteId || sourceNotes[0].id,
-        q.conceptName,
-        q.type,
-        q.stem,
-        JSON.stringify(q.options),
-        q.correctAnswer,
-        q.explanation,
-        q.memoryTip
-      );
-      savedQuestions.push(
-        formatQuestion(db.prepare(`SELECT * FROM quiz_questions WHERE id = ?`).get(qid))
-      );
-    }
+        `INSERT INTO quizzes (id, title, source_note_ids, category_id, difficulty, total_questions, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'in_progress', ?)`
+      ).run(quizId, quizTitle, JSON.stringify(sourceIds), existingCategoryId(categoryId), difficulty, generated.length, now);
 
-    res.status(201).json({
-      id: quizId,
-      title: quizTitle,
-      source_note_ids: sourceNotes.map((n) => n.id),
-      difficulty,
-      total_questions: generated.length,
-      status: 'in_progress',
-      created_at: now,
-      questions: savedQuestions,
+      const insertQuestion = db.prepare(`INSERT INTO quiz_questions (
+        id, quiz_id, note_id, concept_name, type, stem, options_json, correct_answer, explanation, memory_tip
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const q of generated) {
+        const noteId = questionSourceId(q.noteId, sourceIds);
+        insertQuestion.run(uid(), quizId, noteId, q.conceptName, q.type, q.stem,
+          JSON.stringify(q.options), q.correctAnswer, q.explanation, q.memoryTip);
+      }
+      return getQuiz(quizId);
     });
+    if (!quiz) return res.status(409).json({ error: '出题期间有来源笔记被删除，请重新选择' });
+    res.status(201).json(quiz);
   } catch (err: any) {
     res.status(400).json({ error: err?.message || '动态出题失败' });
   }
@@ -171,17 +152,14 @@ function normalizeChoiceAnswer(ans: string): string {
 
 // Submit answers & grade (auto-adds wrong questions to Mistake Notebook!)
 quizzesRouter.post('/:id/submit', async (req, res) => {
-  const quiz = db.prepare(`SELECT * FROM quizzes WHERE id = ?`).get(req.params.id) as any;
+  const quiz = getQuiz(req.params.id);
   if (!quiz) return res.status(404).json({ error: '测验不存在' });
+  if (quiz.status === 'completed') return res.json({ ...quiz, mistakesAdded: 0 });
 
   const answers: Record<string, string> = req.body?.answers || {};
-  const questions = db.prepare(`SELECT * FROM quiz_questions WHERE quiz_id = ?`).all(quiz.id) as any[];
+  const grades = new Map<string, { userAnswer: string; isCorrect: boolean; score: number; feedback: string }>();
 
-  let totalScore = 0;
-  let mistakesAdded = 0;
-  const now = nowIso();
-
-  for (const q of questions) {
+  for (const q of quiz.questions) {
     const userAnswer = String(answers[q.id] ?? '').trim();
     let isCorrect = false;
     let score = 0;
@@ -216,19 +194,30 @@ quizzesRouter.post('/:id/submit', async (req, res) => {
       }
     }
 
-    totalScore += score;
+    grades.set(q.id, { userAnswer, isCorrect, score, feedback });
+  }
 
-    db.prepare(
-      `UPDATE quiz_questions SET user_answer = ?, is_correct = ?, ai_feedback = ?, score = ? WHERE id = ?`
-    ).run(userAnswer, isCorrect ? 1 : 0, feedback, score, q.id);
+  const submitted = inTransaction(() => {
+    const current = getQuiz(req.params.id);
+    if (!current) return null;
+    if (current.status === 'completed') return { ...current, mistakesAdded: 0 };
 
-    // Update concept mastery in Knowledge Graph
-    if (q.concept_name) {
-      updateConceptMastery(q.concept_name, isCorrect, quiz.category_id || null);
-    }
+    let totalScore = 0;
+    let mistakesAdded = 0;
+    const now = nowIso();
+    for (const q of current.questions) {
+      const grade = grades.get(q.id);
+      if (!grade) throw new Error('测验题目已变化，请重新打开后交卷');
+      const { userAnswer, isCorrect, score, feedback } = grade;
+      totalScore += score;
 
-    // Automatically add wrong answers to Mistake Notebook
-    if (!isCorrect) {
+      db.prepare(
+        `UPDATE quiz_questions SET user_answer = ?, is_correct = ?, ai_feedback = ?, score = ? WHERE id = ?`
+      ).run(userAnswer, isCorrect ? 1 : 0, feedback, score, q.id);
+
+      if (q.concept_name) updateConceptMastery(q.concept_name, isCorrect, q.note_id);
+
+      if (isCorrect) continue;
       const existingMistake = db
         .prepare(`SELECT id, wrong_count FROM mistakes WHERE question_id = ?`)
         .get(q.id) as { id: string; wrong_count: number } | undefined;
@@ -263,28 +252,21 @@ quizzesRouter.post('/:id/submit', async (req, res) => {
         mistakesAdded++;
       }
     }
-  }
 
-  const finalScore = questions.length > 0 ? Number((totalScore / questions.length).toFixed(3)) : 0;
-  db.prepare(`UPDATE quizzes SET score = ?, status = 'completed', completed_at = ? WHERE id = ?`).run(
-    finalScore,
-    now,
-    quiz.id
-  );
-  logStudyActivity('quiz_complete', quiz.id, finalScore, questions.length * 45);
-
-  const updatedQuestions = db.prepare(`SELECT * FROM quiz_questions WHERE quiz_id = ?`).all(quiz.id) as any[];
-  res.json({
-    ...quiz,
-    score: finalScore,
-    status: 'completed',
-    completed_at: now,
-    mistakesAdded,
-    questions: updatedQuestions.map(formatQuestion),
+    const finalScore = current.questions.length > 0 ? Number((totalScore / current.questions.length).toFixed(3)) : 0;
+    db.prepare(`UPDATE quizzes SET score = ?, status = 'completed', completed_at = ? WHERE id = ?`)
+      .run(finalScore, now, quiz.id);
+    logStudyActivity('quiz_complete', quiz.id, finalScore, current.questions.length * 45);
+    return { ...getQuiz(quiz.id), mistakesAdded };
   });
+  if (!submitted) return res.status(404).json({ error: '测验已被删除' });
+  res.json(submitted);
 });
 
 quizzesRouter.delete('/:id', (req, res) => {
-  db.prepare(`DELETE FROM quizzes WHERE id = ?`).run(req.params.id);
+  inTransaction(() => {
+    db.prepare(`DELETE FROM quizzes WHERE id = ?`).run(req.params.id);
+    reconcileLibraryReferences();
+  });
   res.json({ ok: true });
 });

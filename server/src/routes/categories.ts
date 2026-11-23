@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { db, nowIso, uid } from '../db.js';
+import { db, existingCategoryId, inTransaction, nowIso, reconcileLibraryReferences, uid } from '../db.js';
 
 export const categoriesRouter = Router();
 
@@ -21,12 +21,14 @@ categoriesRouter.post('/', (req, res) => {
   if (!name || !String(name).trim()) {
     return res.status(400).json({ error: '分类名称不能为空' });
   }
+  const parent = existingCategoryId(parentId);
+  if (parentId && !parent) return res.status(400).json({ error: '上级分类不存在' });
   const id = uid();
   const now = nowIso();
   db.prepare(
     `INSERT INTO categories (id, name, parent_id, color, icon, description, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, String(name).trim(), parentId, color, icon, description, now);
+  ).run(id, String(name).trim(), parent, color, icon, description, now);
   const created = db.prepare(`SELECT *, 0 as note_count FROM categories WHERE id = ?`).get(id);
   res.status(201).json(created);
 });
@@ -51,7 +53,9 @@ categoriesRouter.put('/:id', (req, res) => {
 
 categoriesRouter.delete('/:id', (req, res) => {
   const { id } = req.params;
-  db.prepare(`UPDATE notes SET category_id = NULL WHERE category_id = ?`).run(id);
-  db.prepare(`DELETE FROM categories WHERE id = ?`).run(id);
+  inTransaction(() => {
+    db.prepare(`DELETE FROM categories WHERE id = ?`).run(id);
+    reconcileLibraryReferences();
+  });
   res.json({ ok: true });
 });

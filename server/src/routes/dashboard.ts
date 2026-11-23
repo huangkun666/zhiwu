@@ -62,7 +62,7 @@ dashboardRouter.get('/', (_req, res) => {
     }
   }
 
-  // Quiz accuracy trend (last 10 quizzes or study_logs quiz entries)
+  // Quiz trends are historical study events and can be restored from a backup.
   const quizTrend = db
     .prepare(
       `SELECT date_key as date, ROUND(AVG(score) * 100, 1) as accuracy
@@ -78,14 +78,18 @@ dashboardRouter.get('/', (_req, res) => {
   // Subject mastery breakdown
   const subjectMastery = db
     .prepare(
-      `SELECT cat.id, cat.name, cat.color,
-        COUNT(DISTINCT n.id) as note_count,
-        COALESCE(ROUND(AVG(con.mastery_score) * 100, 0), 50) as mastery
-       FROM categories cat
-       LEFT JOIN notes n ON n.category_id = cat.id
-       LEFT JOIN concepts con ON con.category_id = cat.id
-       GROUP BY cat.id
-       ORDER BY note_count DESC`
+      `WITH note_counts AS (
+        SELECT category_id, COUNT(*) AS note_count FROM notes GROUP BY category_id
+       ), category_concepts AS (
+        SELECT DISTINCT n.category_id, nc.concept_id FROM note_concepts nc INNER JOIN notes n ON n.id = nc.note_id
+       ), scores AS (
+        SELECT cc.category_id, ROUND(AVG(c.mastery_score) * 100) AS mastery
+        FROM category_concepts cc INNER JOIN concepts c ON c.id = cc.concept_id GROUP BY cc.category_id
+       )
+       SELECT cat.id, cat.name, cat.color, counts.note_count, scores.mastery
+       FROM categories cat INNER JOIN note_counts counts ON counts.category_id = cat.id
+       LEFT JOIN scores ON scores.category_id = cat.id
+       ORDER BY counts.note_count DESC, cat.created_at ASC`
     )
     .all();
 
@@ -93,7 +97,7 @@ dashboardRouter.get('/', (_req, res) => {
   const weakConcepts = db
     .prepare(
       `SELECT id, name, mastery_score, quiz_attempts, quiz_correct
-       FROM concepts
+       FROM active_concepts
        ORDER BY mastery_score ASC, quiz_attempts DESC
        LIMIT 5`
     )

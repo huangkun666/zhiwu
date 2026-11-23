@@ -186,7 +186,7 @@ mistakesRouter.post('/:id/review', (req, res) => {
   ).run(next.easeFactor, next.intervalDays, next.repetitions, next.nextReviewAt, now, nextStatus, now, m.id);
 
   if (m.concept_name) {
-    updateConceptMastery(m.concept_name, rating >= 3);
+    updateConceptMastery(m.concept_name, rating >= 3, m.note_id);
   }
   logStudyActivity('mistake_review', m.id, rating >= 3 ? 1 : 0, 30);
 

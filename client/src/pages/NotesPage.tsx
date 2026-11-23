@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   BookMarked,
@@ -71,6 +71,8 @@ export function NotesPage({
   const [aiBusy, setAiBusy] = useState<string | null>(null);
   const [undoing, setUndoing] = useState(false);
   const [toast, setToast] = useState<string>('');
+  const noteRequest = useRef(0);
+  const synthesisRequest = useRef(0);
 
   const showToast = (msg: string) => {
     setToast(msg);
@@ -78,6 +80,7 @@ export function NotesPage({
   };
 
   const fetchNotes = async () => {
+    const request = ++noteRequest.current;
     setLoadingList(true);
     try {
       const [list, tagList] = await Promise.all([
@@ -88,18 +91,22 @@ export function NotesPage({
         }),
         api.getTags(),
       ]);
-      setNotes(list);
-      setTags(tagList);
+      if (request === noteRequest.current) {
+        setNotes(list);
+        setTags(tagList);
+      }
     } catch {
       // ignore
     } finally {
-      setLoadingList(false);
+      if (request === noteRequest.current) setLoadingList(false);
     }
   };
 
   const fetchSyntheses = async () => {
+    const request = ++synthesisRequest.current;
     try {
-      setSyntheses(await api.getSyntheses());
+      const reports = await api.getSyntheses();
+      if (request === synthesisRequest.current) setSyntheses(reports);
     } catch {
       // ignore
     }
@@ -191,12 +198,24 @@ export function NotesPage({
   };
 
   const handleDeleteNote = async () => {
-    if (!activeNote || !confirm(`确定删除笔记《${activeNote.title}》吗？`)) return;
-    await api.deleteNote(activeNote.id);
-    setActiveNote(null);
-    fetchNotes();
-    onRefreshGlobal();
-    showToast('已删除');
+    if (!activeNote || !confirm(`删除笔记《${activeNote.title}》并解除它的来源链接？`)) return;
+    const deletedId = activeNote.id;
+    try {
+      await api.deleteNote(deletedId);
+      setActiveNote((current) => current?.id === deletedId ? null : current);
+      setCheckedIds((current) => current.filter((id) => id !== deletedId));
+      setNotes((current) => current.filter((note) => note.id !== deletedId));
+      setSyntheses((current) => current.map((report) => ({
+        ...report,
+        note_ids: report.note_ids.filter((id) => id !== deletedId),
+      })));
+      fetchNotes();
+      fetchSyntheses();
+      onRefreshGlobal();
+      showToast('笔记已删除');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '删除笔记失败');
+    }
   };
 
   const handleSummarize = async () => {
@@ -567,7 +586,7 @@ export function NotesPage({
                   >
                     <h4 className="font-medium text-sm">{s.title}</h4>
                     <p className="text-[11px] text-[var(--text-muted)] mt-1">
-                      {s.note_ids.length} 篇笔记 · {new Date(s.created_at).toLocaleDateString()}
+                      {s.note_ids.length ? `${s.note_ids.length} 篇来源笔记` : '暂无可打开的来源'} · {new Date(s.created_at).toLocaleDateString()}
                     </p>
                   </div>
                 ))

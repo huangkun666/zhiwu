@@ -63,7 +63,7 @@ export function HomePage({
           onRefreshGlobal={onRefreshGlobal}
         />
       ) : (
-        <GraphPage onNavigate={onNavigate} />
+        <GraphPage key={`graph-${refreshTick}`} onNavigate={onNavigate} />
       )}
     </div>
   );

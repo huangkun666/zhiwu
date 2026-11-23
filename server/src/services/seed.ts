@@ -170,6 +170,8 @@ $$P(D|+) = \frac{0.99 \times 0.001}{0.99 \times 0.001 + 0.01 \times 0.999} \appr
   ];
 
   for (const n of sampleNotes) {
+    const [first, ...rest] = n.summary.concepts;
+    const relations = rest.map((concept) => ({ source: first.name, target: concept.name, relation: '关联' }));
     db.prepare(
       `INSERT INTO notes (id, title, content, summary_json, category_id, tags, source_type, word_count, is_pinned, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'markdown', ?, ?, ?, ?)`
@@ -177,7 +179,7 @@ $$P(D|+) = \frac{0.99 \times 0.001}{0.99 \times 0.001 + 0.01 \times 0.999} \appr
       n.id,
       n.title,
       n.content,
-      JSON.stringify(n.summary),
+      JSON.stringify({ ...n.summary, relations }),
       n.categoryId,
       JSON.stringify(n.tags),
       countWords(n.content),
@@ -192,11 +194,10 @@ $$P(D|+) = \frac{0.99 \times 0.001}{0.99 \times 0.001 + 0.01 \times 0.999} \appr
       conceptIds[c.name] = upsertConcept(c.name, c.definition, n.categoryId, n.id);
     }
     // Create simple internal links
-    const names = n.summary.concepts.map((c) => c.name);
-    for (let i = 0; i < names.length - 1; i++) {
+    for (const relation of relations) {
       db.prepare(
         `INSERT OR IGNORE INTO concept_links (id, source_id, target_id, relation, weight) VALUES (?, ?, ?, ?, 1.0)`
-      ).run(uid(), conceptIds[names[0]], conceptIds[names[i + 1]], '关联');
+      ).run(uid(), conceptIds[relation.source], conceptIds[relation.target], relation.relation);
     }
   }
 

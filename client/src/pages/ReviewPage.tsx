@@ -52,7 +52,7 @@ export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
       setQueue(qRes.items);
       setAllCards(cards);
       setNotes(noteList);
-      if (noteList.length > 0 && !selectedNoteId) setSelectedNoteId(noteList[0].id);
+      setSelectedNoteId((current) => noteList.some(({ id }) => id === current) ? current : noteList[0]?.id || '');
       setCurrentIndex(0);
       setFlipped(false);
       setShowHint(false);
@@ -141,12 +141,16 @@ export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
 
   const handleManualCreate = async () => {
     if (!newFront.trim() || !newBack.trim()) return;
-    await api.createFlashcard({ front: newFront, back: newBack, hint: newHint, noteId: selectedNoteId || null });
-    setNewFront('');
-    setNewBack('');
-    setNewHint('');
-    await loadData();
-    onRefreshGlobal();
+    try {
+      await api.createFlashcard({ front: newFront, back: newBack, hint: newHint, noteId: selectedNoteId || null });
+      setNewFront('');
+      setNewBack('');
+      setNewHint('');
+      await loadData();
+      onRefreshGlobal();
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '创建闪卡失败');
+    }
   };
 
   return (

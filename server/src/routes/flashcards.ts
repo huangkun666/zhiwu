@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { db, logStudyActivity, nowIso, uid, updateConceptMastery } from '../db.js';
+import { db, existingCategoryId, existingNoteIds, inTransaction, logStudyActivity, nowIso, uid, updateConceptMastery } from '../db.js';
 import { generateFlashcardsAI } from '../services/ai.js';
 import { computeSM2, previewSM2Intervals } from '../services/sm2.js';
 import { noteStudyText } from '../shared/noteContent.js';
@@ -96,12 +96,16 @@ flashcardsRouter.post('/', (req, res) => {
   if (!front?.trim() || !back?.trim()) {
     return res.status(400).json({ error: '闪卡正面与背面均不能为空' });
   }
+  const [sourceId] = existingNoteIds([noteId]);
+  if (noteId && !sourceId) return res.status(400).json({ error: '来源笔记已不存在' });
+  const category = existingCategoryId(categoryId);
+  if (categoryId && !category) return res.status(400).json({ error: '分类已不存在' });
   const id = uid();
   const now = nowIso();
   db.prepare(
     `INSERT INTO flashcards (id, note_id, category_id, concept_name, front, back, hint, next_review_at, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, noteId || null, categoryId || null, conceptName, front.trim(), back.trim(), hint, now, now, now);
+  ).run(id, sourceId || null, category, conceptName, front.trim(), back.trim(), hint, now, now, now);
 
   res.status(201).json(formatCard(db.prepare(`SELECT * FROM flashcards WHERE id = ?`).get(id)));
 });
@@ -114,16 +118,18 @@ flashcardsRouter.post('/generate', async (req, res) => {
 
   try {
     const cards = await generateFlashcardsAI(note.title, noteStudyText(note), Math.max(2, Math.min(12, Number(count) || 6)));
+    const current = db.prepare(`SELECT id, category_id FROM notes WHERE id = ?`).get(note.id) as
+      { id: string; category_id: string | null } | undefined;
+    if (!current) return res.status(409).json({ error: '来源笔记已被删除' });
     const now = nowIso();
-    const created: any[] = [];
-    for (const c of cards) {
+    const created = inTransaction(() => cards.map((c) => {
       const id = uid();
       db.prepare(
         `INSERT INTO flashcards (id, note_id, category_id, concept_name, front, back, hint, next_review_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, note.id, note.category_id || null, c.conceptName, c.front, c.back, c.hint, now, now, now);
-      created.push(formatCard(db.prepare(`SELECT * FROM flashcards WHERE id = ?`).get(id)));
-    }
+      ).run(id, current.id, current.category_id, c.conceptName, c.front, c.back, c.hint, now, now, now);
+      return formatCard(db.prepare(`SELECT * FROM flashcards WHERE id = ?`).get(id));
+    }));
     res.status(201).json({ count: created.length, cards: created });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || '生成闪卡失败' });
@@ -157,7 +163,7 @@ flashcardsRouter.post('/:id/review', (req, res) => {
   ).run(next.easeFactor, next.intervalDays, next.repetitions, next.nextReviewAt, now, now, card.id);
 
   if (card.concept_name) {
-    updateConceptMastery(card.concept_name, rating >= 3, card.category_id || null);
+    updateConceptMastery(card.concept_name, rating >= 3, card.note_id);
   }
   logStudyActivity('flashcard_review', card.id, rating >= 3 ? 1 : 0, 20);
 

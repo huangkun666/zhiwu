@@ -1,4 +1,6 @@
 import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt } from '../../../server/src/shared/noteContent';
+import { existingIds, questionSourceId, readIds } from '../../../server/src/shared/libraryReferences';
+import { buildGraphLinks } from '../../../server/src/shared/graphLinks';
 import { loadPdf } from '../utils/pdf';
 import type {
   ActiveModelCapability,
@@ -60,6 +62,68 @@ interface LocalDBState {
   tutorSessions: TutorSession[];
   tutorMessages: Record<string, TutorMessage[]>;
   studyLogs: StudyLogRecord[];
+}
+
+function noteIdsIn(state: LocalDBState, value: unknown): string[] {
+  return existingIds(value, new Set(state.notes.map(({ id }) => id)));
+}
+
+function requireCategory(state: LocalDBState, id?: string | null): string | null {
+  if (id && !state.categories.some((category) => category.id === id)) throw new Error('分类已不存在，请重新选择');
+  return id || null;
+}
+
+function reconcileLibraryReferences(state: LocalDBState) {
+  const notes = new Set(state.notes.map(({ id }) => id));
+  const categories = new Set(state.categories.map(({ id }) => id));
+  const questions = new Set<string>();
+
+  for (const category of state.categories) {
+    if (category.parent_id && !categories.has(category.parent_id)) category.parent_id = null;
+  }
+  for (const item of [...state.notes, ...state.concepts, ...state.syntheses, ...state.quizzes, ...state.flashcards]) {
+    if (item.category_id && !categories.has(item.category_id)) item.category_id = null;
+  }
+  for (const item of [...state.concepts, ...state.syntheses, ...state.tutorSessions]) {
+    item.note_ids = existingIds(item.note_ids, notes);
+  }
+  for (const quiz of state.quizzes) {
+    quiz.source_note_ids = existingIds(quiz.source_note_ids, notes);
+    for (const question of quiz.questions || []) {
+      questions.add(question.id);
+      if (question.note_id && !notes.has(question.note_id)) question.note_id = null;
+    }
+  }
+  for (const mistake of state.mistakes) {
+    if (mistake.question_id && !questions.has(mistake.question_id)) mistake.question_id = null;
+    if (mistake.note_id && !notes.has(mistake.note_id)) mistake.note_id = null;
+    if (!mistake.note_id) mistake.note_title = null;
+  }
+  for (const card of state.flashcards) {
+    if (card.note_id && !notes.has(card.note_id)) card.note_id = null;
+    if (!card.note_id) card.note_title = null;
+  }
+}
+
+function restoreReviewedConceptLinks(state: LocalDBState) {
+  const concepts = new Map(state.concepts.map((concept) => [concept.name, concept]));
+  const link = (review: { note_id?: string | null; concept_name?: string }) => {
+    const concept = concepts.get(review.concept_name?.trim() || '');
+    if (concept && review.note_id && !concept.note_ids.includes(review.note_id)) concept.note_ids.push(review.note_id);
+  };
+  for (const quiz of state.quizzes) {
+    for (const question of quiz.questions || []) {
+      if (question.is_correct != null) link(question);
+    }
+  }
+  for (const item of [...state.flashcards, ...state.mistakes]) {
+    if (item.last_reviewed_at) link(item);
+  }
+}
+
+function lowestMastery(state: LocalDBState) {
+  return state.concepts.filter((concept) => concept.note_ids.length > 0)
+    .sort((a, b) => a.mastery_score - b.mastery_score || b.quiz_attempts - a.quiz_attempts);
 }
 
 const DEFAULT_PROVIDERS: AIProviderConfig[] = [
@@ -207,6 +271,8 @@ async function readState(): Promise<LocalDBState> {
   }
   cachedState = { ...createEmptyState(), ...saved };
   cachedState.settings = normalizeLocalSettings(cachedState.settings);
+  reconcileLibraryReferences(cachedState);
+  restoreReviewedConceptLinks(cachedState);
   return cachedState;
 }
 
@@ -347,8 +413,9 @@ function upsertConcept(state: LocalDBState, name: string, description = '', cate
   return c.id;
 }
 
-function updateConceptMastery(state: LocalDBState, name: string, isCorrect: boolean, categoryId: string | null = null) {
-  const id = upsertConcept(state, name, '', categoryId);
+function updateConceptMastery(state: LocalDBState, name: string, isCorrect: boolean, noteId?: string | null) {
+  const note = state.notes.find((item) => item.id === noteId);
+  const id = upsertConcept(state, name, '', note?.category_id, note?.id);
   const c = state.concepts.find((x) => x.id === id);
   if (!c) return;
   c.quiz_attempts += 1;
@@ -673,7 +740,7 @@ export const localApi = {
     const dueFlashcards = s.flashcards.filter((f) => f.next_review_at <= now).length;
     const activeMistakes = s.mistakes.filter((m) => m.status !== 'mastered').length;
     const dueMistakes = s.mistakes.filter((m) => m.status !== 'mastered' && m.next_review_at <= now).length;
-    const completedQuizzes = s.quizzes.filter((q) => q.status === 'completed' && q.score !== null);
+    const completedQuizzes = s.quizzes.filter((q) => q.status === 'completed' && q.score != null);
     const avgAccuracy =
       completedQuizzes.length > 0
         ? Math.round((completedQuizzes.reduce((acc, q) => acc + (q.score || 0), 0) / completedQuizzes.length) * 100)
@@ -695,9 +762,9 @@ export const localApi = {
 
     // Quiz trend by date
     const trendMap: Record<string, number[]> = {};
-    for (const l of s.studyLogs) {
-      if (l.activity_type === 'quiz_complete' && l.score !== null) {
-        (trendMap[l.date_key] ||= []).push(l.score * 100);
+    for (const log of s.studyLogs) {
+      if (log.activity_type === 'quiz_complete' && log.score !== null) {
+        (trendMap[log.date_key] ||= []).push(log.score * 100);
       }
     }
     const quizTrend = Object.entries(trendMap)
@@ -705,17 +772,17 @@ export const localApi = {
       .slice(-10)
       .map(([date, arr]) => ({ date, accuracy: Math.round(arr.reduce((x, y) => x + y, 0) / arr.length) }));
 
-    const subjectMastery = s.categories.map((cat) => {
-      const noteCount = s.notes.filter((n) => n.category_id === cat.id).length;
-      const cons = s.concepts.filter((c) => c.category_id === cat.id);
+    const subjectMastery = s.categories.flatMap((cat) => {
+      const noteIds = new Set(s.notes.filter((n) => n.category_id === cat.id).map(({ id }) => id));
+      if (noteIds.size === 0) return [];
+      const cons = s.concepts.filter((c) => c.note_ids.some((id) => noteIds.has(id)));
       const mastery = cons.length
         ? Math.round((cons.reduce((a, b) => a + b.mastery_score, 0) / cons.length) * 100)
-        : 50;
-      return { id: cat.id, name: cat.name, color: cat.color, note_count: noteCount, mastery };
-    });
+        : null;
+      return [{ id: cat.id, name: cat.name, color: cat.color, note_count: noteIds.size, mastery }];
+    }).sort((a, b) => b.note_count - a.note_count);
 
-    const weakConcepts = [...s.concepts]
-      .sort((a, b) => a.mastery_score - b.mastery_score)
+    const weakConcepts = lowestMastery(s)
       .slice(0, 5)
       .map((c) => ({
         id: c.id,
@@ -783,6 +850,7 @@ export const localApi = {
           { name: '三次握手', definition: 'TCP 建立可靠连接并同步双方序列号的三步过程' },
           { name: 'TIME_WAIT', definition: '主动关闭方发出最后 ACK 后等待 2MSL 的保护状态' },
         ],
+        relations: [{ source: '三次握手', target: 'TIME_WAIT', relation: '同属TCP' }],
         outline: ['1. 三次握手', '2. TIME_WAIT 与 2MSL'],
         difficulty: '进阶',
       },
@@ -806,6 +874,7 @@ export const localApi = {
           { name: '主动回忆', definition: '合上材料主动提取知识以强化长期记忆' },
           { name: '费曼学习法', definition: '以教代学发现理解漏洞的深度学习方法' },
         ],
+        relations: [{ source: '主动回忆', target: '费曼学习法', relation: '协同强化' }],
         outline: ['1. 主动回忆', '2. 费曼与 SM-2 协同'],
         difficulty: '基础',
       },
@@ -908,9 +977,7 @@ export const localApi = {
   async deleteCategory(id: string) {
     const s = await loadState();
     s.categories = s.categories.filter((c) => c.id !== id);
-    s.notes.forEach((n) => {
-      if (n.category_id === id) n.category_id = null;
-    });
+    reconcileLibraryReferences(s);
     await saveState(s);
     return { ok: true };
   },
@@ -959,7 +1026,7 @@ export const localApi = {
       title: payload.title.trim() || '未命名笔记',
       content: payload.content || '',
       summary: null,
-      category_id: payload.categoryId || null,
+      category_id: requireCategory(s, payload.categoryId),
       tags: payload.tags || [],
       source_type: (payload.sourceType as Note['source_type']) || 'markdown',
       word_count: countWords(payload.content || ''),
@@ -976,9 +1043,9 @@ export const localApi = {
   async updateNote(id: string, payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean }): Promise<Note> {
     const s = await loadState();
     const n = requireNote(s, id);
+    if (payload.categoryId !== undefined) n.category_id = requireCategory(s, payload.categoryId);
     if (payload.title !== undefined) n.title = payload.title.trim() || n.title;
     if (payload.content !== undefined) n.content = payload.content;
-    if (payload.categoryId !== undefined) n.category_id = payload.categoryId || null;
     if (payload.tags !== undefined) n.tags = payload.tags;
     if (payload.isPinned !== undefined) n.is_pinned = payload.isPinned;
     return saveNoteText(s, n);
@@ -1020,7 +1087,9 @@ export const localApi = {
 
   async deleteNote(id: string) {
     const s = await loadState();
+    requireNote(s, id);
     s.notes = s.notes.filter((x) => x.id !== id);
+    reconcileLibraryReferences(s);
     await saveState(s);
     return { ok: true };
   },
@@ -1041,7 +1110,7 @@ export const localApi = {
           content: isImage ? parsed.content : '',
           source_content: isImage ? null : parsed.content,
           summary: null,
-          category_id: categoryId || null,
+          category_id: null,
           tags: tags || [],
           source_type: parsed.sourceType,
           source_filename: f.name,
@@ -1060,7 +1129,9 @@ export const localApi = {
       throw new Error(warnings.join('；'));
     }
     const s = await loadState();
+    const category = requireCategory(s, categoryId);
     for (const note of imported) {
+      note.category_id = category;
       s.notes.unshift(note);
       logStudy(s, 'note_import', note.id);
     }
@@ -1069,13 +1140,15 @@ export const localApi = {
   },
 
   async rerunOcr(id: string): Promise<Note> {
-    const s = await loadState();
-    const n = s.notes.find((x) => x.id === id);
-    if (!n || n.source_type !== 'image' || !n.attachment_path?.startsWith('data:')) throw new Error('该笔记没有关联图片附件');
-    const provider = requireActiveProvider(s.settings);
-    const [meta, base64] = n.attachment_path.split(',');
+    const initial = await loadState();
+    const source = requireNote(initial, id);
+    if (source.source_type !== 'image' || !source.attachment_path?.startsWith('data:')) throw new Error('该笔记没有关联图片附件');
+    const provider = requireActiveProvider(initial.settings);
+    const [meta, base64] = source.attachment_path.split(',');
     const mime = meta.match(/data:(.*?);/)?.[1] || 'image/jpeg';
     const ocrText = cleanOcrMarkdown(await callVisionDirect(provider, base64, mime));
+    const s = await loadState();
+    const n = requireNote(s, id);
     if (/^(JPEG_|IMG_|Screenshot|图片笔记|微信图片|Photo)/i.test(n.title)) {
       n.title = extractSmartTitle(ocrText, n.title);
     }
@@ -1085,11 +1158,10 @@ export const localApi = {
   },
 
   async summarizeNote(id: string, applyMeta = true): Promise<Note> {
-    const s = await loadState();
-    const n = s.notes.find((x) => x.id === id);
-    if (!n) throw new Error('笔记不存在');
-    const provider = requireActiveProvider(s.settings);
-    const cleanText = stripInlineImages(noteStudyText(n));
+    const initial = await loadState();
+    const source = requireNote(initial, id);
+    const provider = requireActiveProvider(initial.settings);
+    const cleanText = stripInlineImages(noteStudyText(source));
     const raw = await callLLMDirect(
       provider,
       [
@@ -1100,7 +1172,7 @@ export const localApi = {
         },
         {
           role: 'user',
-          content: `已有分类：${s.categories.map((c) => c.name).join('、') || '暂无'}\n标题：${n.title}\n正文：\n${cleanText.slice(0, 12000)}`,
+          content: `已有分类：${initial.categories.map((c) => c.name).join('、') || '暂无'}\n标题：${source.title}\n正文：\n${cleanText.slice(0, 12000)}`,
         },
       ],
       { jsonMode: true, temperature: 0.3 }
@@ -1116,6 +1188,8 @@ export const localApi = {
       suggestedTags: Array.isArray(parsed.suggestedTags) ? parsed.suggestedTags.slice(0, 6) : [],
       difficulty: (['基础', '进阶', '高阶'].includes(parsed.difficulty as string) ? parsed.difficulty : '进阶') as NoteSummary['difficulty'],
     };
+    const s = await loadState();
+    const n = requireNote(s, id);
     n.summary = summary;
     if (applyMeta) {
       if (summary.suggestedTags?.length) n.tags = Array.from(new Set([...n.tags, ...summary.suggestedTags])).slice(0, 8);
@@ -1144,14 +1218,15 @@ export const localApi = {
   },
 
   async synthesizeNotes(payload: { noteIds?: string[]; categoryId?: string | null; title?: string }): Promise<Synthesis> {
-    const s = await loadState();
-    const provider = requireActiveProvider(s.settings);
-    let target = payload.noteIds?.length
-      ? s.notes.filter((n) => payload.noteIds!.includes(n.id))
+    const initial = await loadState();
+    const requested = readIds(payload.noteIds);
+    const target = requested.length
+      ? initial.notes.filter((n) => requested.includes(n.id))
       : payload.categoryId
-      ? s.notes.filter((n) => n.category_id === payload.categoryId).slice(0, 10)
+      ? initial.notes.filter((n) => n.category_id === payload.categoryId).slice(0, 10)
       : [];
     if (!target.length) throw new Error('请至少选择 1 篇笔记进行归纳');
+    const provider = requireActiveProvider(initial.settings);
     const combined = target
       .map((n, i) => `### 笔记${i + 1}：${n.title}\n${stripInlineImages(noteStudyText(n)).slice(0, 3200)}`)
       .join('\n\n---\n\n');
@@ -1162,11 +1237,14 @@ export const localApi = {
       },
       { role: 'user', content: combined },
     ]);
+    const s = await loadState();
+    const sourceIds = target.map(({ id }) => id);
+    if (noteIdsIn(s, sourceIds).length !== sourceIds.length) throw new Error('归纳期间有来源笔记被删除，请重新选择');
     const syn: Synthesis = {
       id: uid(),
       title: payload.title?.trim() || `专题归纳（${target.length} 篇笔记）`,
-      note_ids: target.map((n) => n.id),
-      category_id: payload.categoryId || null,
+      note_ids: sourceIds,
+      category_id: s.categories.find(({ id }) => id === payload.categoryId)?.id ?? null,
       content: md,
       created_at: nowIso(),
     };
@@ -1207,20 +1285,28 @@ export const localApi = {
     types?: ('single' | 'multiple' | 'boolean' | 'short')[];
     title?: string;
   }): Promise<Quiz> {
-    const s = await loadState();
-    const provider = requireActiveProvider(s.settings);
+    const initial = await loadState();
+    const requested = readIds(payload.noteIds);
     let sourceNotes: Note[] = [];
-    let focus = payload.focusConcepts || [];
+    let focus = readIds(payload.focusConcepts);
+    let missingSource = '笔记库暂无笔记，请先导入至少一篇笔记。';
     if (payload.weakOnly) {
-      const weak = [...s.concepts].sort((a, b) => a.mastery_score - b.mastery_score).slice(0, 5);
-      if (!focus.length) focus = weak.map((w) => w.name);
+      const weak = lowestMastery(initial).filter((concept) => !focus.length || focus.includes(concept.name)).slice(0, 5);
+      focus = weak.map((concept) => concept.name);
       const ids = new Set(weak.flatMap((w) => w.note_ids));
-      sourceNotes = s.notes.filter((n) => ids.has(n.id)).slice(0, 5);
+      sourceNotes = initial.notes.filter((n) => ids.has(n.id)).slice(0, 5);
+      missingSource = '暂无可用于专项突破的关联笔记';
+    } else if (requested.length) {
+      sourceNotes = initial.notes.filter((n) => requested.includes(n.id));
+      missingSource = '所选笔记已不存在，请重新选择';
+    } else if (payload.categoryId) {
+      sourceNotes = initial.notes.filter((n) => n.category_id === payload.categoryId).slice(0, 5);
+      missingSource = '所选分类没有可用笔记，请重新选择';
+    } else {
+      sourceNotes = initial.notes.slice(0, 4);
     }
-    if (!sourceNotes.length && payload.noteIds?.length) sourceNotes = s.notes.filter((n) => payload.noteIds!.includes(n.id));
-    if (!sourceNotes.length && payload.categoryId) sourceNotes = s.notes.filter((n) => n.category_id === payload.categoryId).slice(0, 5);
-    if (!sourceNotes.length) sourceNotes = s.notes.slice(0, 4);
-    if (!sourceNotes.length) throw new Error('笔记库暂无笔记，请先导入至少一篇笔记。');
+    if (!sourceNotes.length) throw new Error(missingSource);
+    const provider = requireActiveProvider(initial.settings);
 
     const count = Math.max(1, Math.min(12, payload.count || 5));
     const types = payload.types?.length ? payload.types : ['single', 'boolean', 'short'];
@@ -1244,13 +1330,17 @@ export const localApi = {
     );
     const parsed = extractJson<{ questions?: any[] } | any[]>(raw);
     const arr = Array.isArray(parsed) ? parsed : parsed.questions || [];
+    if (!arr.length) throw new Error('AI 未能生成有效题目，请重试');
+    const s = await loadState();
+    const sourceIds = sourceNotes.map(({ id }) => id);
+    if (noteIdsIn(s, sourceIds).length !== sourceIds.length) throw new Error('出题期间有来源笔记被删除，请重新选择');
     const quizId = uid();
     const questions: QuizQuestion[] = arr.slice(0, count).map((q: any) => {
       const t = ['single', 'multiple', 'boolean', 'short'].includes(q.type) ? q.type : 'single';
       return {
         id: uid(),
         quiz_id: quizId,
-        note_id: q.noteId || sourceNotes[0].id,
+        note_id: questionSourceId(q.noteId, sourceIds),
         concept_name: q.conceptName || '综合知识',
         type: t,
         stem: q.stem || '',
@@ -1263,8 +1353,8 @@ export const localApi = {
     const quiz: Quiz = {
       id: quizId,
       title: payload.title || (sourceNotes.length === 1 ? `《${sourceNotes[0].title}》动态测验` : `综合动态测验（${questions.length}题）`),
-      source_note_ids: sourceNotes.map((n) => n.id),
-      category_id: payload.categoryId || null,
+      source_note_ids: sourceIds,
+      category_id: s.categories.find(({ id }) => id === payload.categoryId)?.id ?? null,
       difficulty: diff,
       total_questions: questions.length,
       score: null,
@@ -1278,14 +1368,13 @@ export const localApi = {
   },
 
   async submitQuiz(id: string, answers: Record<string, string>): Promise<Quiz> {
-    const s = await loadState();
-    const quiz = s.quizzes.find((x) => x.id === id);
-    if (!quiz || !quiz.questions) throw new Error('测验不存在');
-    let total = 0;
-    let mistakesAdded = 0;
-    const now = nowIso();
+    const initial = await loadState();
+    const original = initial.quizzes.find((x) => x.id === id);
+    if (!original?.questions) throw new Error('测验不存在');
+    if (original.status === 'completed') return { ...original, mistakesAdded: 0 };
+    const grades = new Map<string, { answer: string; isCorrect: boolean; score: number; feedback: string }>();
 
-    for (const q of quiz.questions) {
+    for (const q of original.questions) {
       const ua = String(answers[q.id] ?? '').trim();
       let isCorrect = false;
       let score = 0;
@@ -1300,7 +1389,7 @@ export const localApi = {
         score = isCorrect ? 1 : 0;
       } else {
         try {
-          const provider = requireActiveProvider(s.settings);
+          const provider = requireActiveProvider(initial.settings);
           const raw = await callLLMDirect(
             provider,
             [
@@ -1320,12 +1409,26 @@ export const localApi = {
         }
       }
 
+      grades.set(q.id, { answer: ua, isCorrect, score, feedback });
+    }
+
+    const s = await loadState();
+    const quiz = s.quizzes.find((x) => x.id === id);
+    if (!quiz?.questions) throw new Error('测验已被删除');
+    if (quiz.status === 'completed') return { ...quiz, mistakesAdded: 0 };
+    let total = 0;
+    let mistakesAdded = 0;
+    const now = nowIso();
+    for (const q of quiz.questions) {
+      const grade = grades.get(q.id);
+      if (!grade) throw new Error('测验题目已变化，请重新打开后交卷');
+      const { answer: ua, isCorrect, score, feedback } = grade;
       q.user_answer = ua;
       q.is_correct = isCorrect;
       q.ai_feedback = feedback;
       q.score = score;
       total += score;
-      if (q.concept_name) updateConceptMastery(s, q.concept_name, isCorrect, quiz.category_id || null);
+      if (q.concept_name) updateConceptMastery(s, q.concept_name, isCorrect, q.note_id);
 
       if (!isCorrect) {
         const existing = s.mistakes.find((m) => m.question_id === q.id);
@@ -1375,6 +1478,7 @@ export const localApi = {
   async deleteQuiz(id: string) {
     const s = await loadState();
     s.quizzes = s.quizzes.filter((q) => q.id !== id);
+    reconcileLibraryReferences(s);
     await saveState(s);
     return { ok: true };
   },
@@ -1386,7 +1490,11 @@ export const localApi = {
     if (params?.status && params.status !== 'all') list = list.filter((m) => m.status === params.status);
     if (params?.concept) list = list.filter((m) => m.concept_name.includes(params.concept!));
     if (params?.dueOnly) list = list.filter((m) => m.status !== 'mastered' && m.next_review_at <= now);
-    return list.map((m) => ({ ...m, interval_previews: previewIntervals(m.ease_factor, m.interval_days, m.repetitions) }));
+    return list.map((m) => ({
+      ...m,
+      note_title: s.notes.find((note) => note.id === m.note_id)?.title ?? null,
+      interval_previews: previewIntervals(m.ease_factor, m.interval_days, m.repetitions),
+    }));
   },
 
   async bookmarkMistake(questionId: string): Promise<Mistake> {
@@ -1489,7 +1597,7 @@ export const localApi = {
     m.next_review_at = next.nextReviewAt;
     m.last_reviewed_at = nowIso();
     m.status = rating === 1 ? 'unmastered' : rating === 4 || next.repetitions >= 3 ? 'mastered' : 'reviewing';
-    if (m.concept_name) updateConceptMastery(s, m.concept_name, rating >= 3);
+    if (m.concept_name) updateConceptMastery(s, m.concept_name, rating >= 3, m.note_id);
     logStudy(s, 'mistake_review', m.id, rating >= 3 ? 1 : 0);
     await saveState(s);
     return { mistake: { ...m, interval_previews: previewIntervals(m.ease_factor, m.interval_days, m.repetitions) }, nextLabel: next.label };
@@ -1524,7 +1632,7 @@ export const localApi = {
         itemType: 'mistake',
         id: m.id,
         note_id: m.note_id,
-        note_title: m.note_title,
+        note_title: s.notes.find((note) => note.id === m.note_id)?.title ?? null,
         concept_name: m.concept_name,
         type: m.type,
         stem: m.stem,
@@ -1558,10 +1666,11 @@ export const localApi = {
 
   async createFlashcard(payload: { front: string; back: string; hint?: string; noteId?: string | null; conceptName?: string }): Promise<Flashcard> {
     const s = await loadState();
+    const source = payload.noteId ? requireNote(s, payload.noteId) : null;
     const now = nowIso();
     const c: Flashcard = {
       id: uid(),
-      note_id: payload.noteId || null,
+      note_id: source?.id ?? null,
       concept_name: payload.conceptName || '',
       front: payload.front.trim(),
       back: payload.back.trim(),
@@ -1578,20 +1687,21 @@ export const localApi = {
   },
 
   async generateFlashcards(noteId: string, count = 6) {
-    const s = await loadState();
-    const n = s.notes.find((x) => x.id === noteId);
-    if (!n) throw new Error('笔记不存在');
-    const provider = requireActiveProvider(s.settings);
+    const initial = await loadState();
+    const source = requireNote(initial, noteId);
+    const provider = requireActiveProvider(initial.settings);
     const raw = await callLLMDirect(
       provider,
       [
         { role: 'system', content: '从笔记生成原子化主动回忆闪卡，返回JSON：{"cards":[{"front":"问题","back":"答案","hint":"提示","conceptName":"概念"}]}' },
-        { role: 'user', content: `生成 ${count} 张闪卡。\n标题：${n.title}\n${stripInlineImages(noteStudyText(n)).slice(0, 9000)}` },
+        { role: 'user', content: `生成 ${count} 张闪卡。\n标题：${source.title}\n${stripInlineImages(noteStudyText(source)).slice(0, 9000)}` },
       ],
       { jsonMode: true, temperature: 0.4 }
     );
     const parsed = extractJson<{ cards?: any[] } | any[]>(raw);
     const list = Array.isArray(parsed) ? parsed : parsed.cards || [];
+    const s = await loadState();
+    const n = requireNote(s, noteId);
     const now = nowIso();
     const created: Flashcard[] = list.slice(0, count).map((c: any) => ({
       id: uid(),
@@ -1622,7 +1732,7 @@ export const localApi = {
     c.repetitions = next.repetitions;
     c.next_review_at = next.nextReviewAt;
     c.last_reviewed_at = nowIso();
-    if (c.concept_name) updateConceptMastery(s, c.concept_name, rating >= 3, c.category_id || null);
+    if (c.concept_name) updateConceptMastery(s, c.concept_name, rating >= 3, c.note_id);
     logStudy(s, 'flashcard_review', c.id, rating >= 3 ? 1 : 0);
     await saveState(s);
     return { card: { ...c, interval_previews: previewIntervals(c.ease_factor, c.interval_days, c.repetitions) }, nextLabel: next.label };
@@ -1637,17 +1747,19 @@ export const localApi = {
 
   async getGraph(): Promise<{ nodes: GraphNode[]; links: GraphLink[]; weakConcepts: GraphNode[] }> {
     const s = await loadState();
-    const nodes: GraphNode[] = s.concepts.map((c) => {
-      const cat = s.categories.find((x) => x.id === c.category_id);
-      const linkedNotes = c.note_ids
-        .map((nid) => s.notes.find((n) => n.id === nid))
-        .filter(Boolean)
-        .map((n) => ({ id: n!.id, title: n!.title }));
-      return {
+    const notes = new Map(s.notes.map((note) => [note.id, note]));
+    const nodes: GraphNode[] = s.concepts.flatMap((c) => {
+      const linkedNotes = c.note_ids.map((id) => notes.get(id)).filter((note): note is Note => Boolean(note));
+      if (linkedNotes.length === 0) return [];
+      const categorized = linkedNotes.filter((note) => note.category_id)
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id));
+      const categoryId = (categorized.find((note) => note.category_id === c.category_id) || categorized[0])?.category_id ?? null;
+      const cat = s.categories.find((x) => x.id === categoryId);
+      return [{
         id: c.id,
         name: c.name,
         description: c.description,
-        category_id: c.category_id,
+        category_id: categoryId,
         category_name: cat?.name || null,
         category_color: cat?.color || null,
         mastery_score: c.mastery_score,
@@ -1655,11 +1767,22 @@ export const localApi = {
         quiz_correct: c.quiz_correct,
         note_count: linkedNotes.length,
         active_mistakes: s.mistakes.filter((m) => m.concept_name === c.name && m.status !== 'mastered').length,
-        notes: linkedNotes,
-      };
+        notes: linkedNotes.map(({ id, title }) => ({ id, title })),
+      }];
     });
-    const weakConcepts = [...nodes].sort((a, b) => a.mastery_score - b.mastery_score).slice(0, 12);
-    return { nodes, links: s.conceptLinks, weakConcepts };
+    const conceptsByNote = new Map<string, { id: string; name: string }[]>();
+    for (const node of nodes) {
+      for (const { id } of node.notes) {
+        const concepts = conceptsByNote.get(id) || [];
+        concepts.push({ id: node.id, name: node.name });
+        conceptsByNote.set(id, concepts);
+      }
+    }
+    const links = buildGraphLinks([...s.notes]
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id))
+      .map((note) => ({ concepts: conceptsByNote.get(note.id) || [], summary: note.summary })));
+    const weakConcepts = [...nodes].sort((a, b) => a.mastery_score - b.mastery_score || b.active_mistakes - a.active_mistakes).slice(0, 12);
+    return { nodes, links, weakConcepts };
   },
 
   async getTutorSessions(): Promise<TutorSession[]> {
@@ -1673,7 +1796,7 @@ export const localApi = {
       id: uid(),
       title: payload.title?.trim() || (payload.mode === 'feynman' ? '费曼考官演练' : '笔记深度答疑'),
       mode: payload.mode,
-      note_ids: payload.noteIds || [],
+      note_ids: noteIdsIn(s, payload.noteIds),
       created_at: now,
       updated_at: now,
     };
@@ -1702,23 +1825,31 @@ export const localApi = {
   },
 
   async sendTutorMessage(sessionId: string, payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' }) {
-    const s = await loadState();
-    const session = s.tutorSessions.find((x) => x.id === sessionId);
-    if (!session) throw new Error('会话不存在');
-    const provider = requireActiveProvider(s.settings);
-    const noteIds = payload.noteIds?.length ? payload.noteIds : session.note_ids;
-    const mode = payload.mode || session.mode;
-    const notes = noteIds.length ? s.notes.filter((n) => noteIds.includes(n.id)) : s.notes.slice(0, 3);
+    const initial = await loadState();
+    const source = initial.tutorSessions.find((x) => x.id === sessionId);
+    if (!source) throw new Error('会话不存在');
+    const provider = requireActiveProvider(initial.settings);
+    const requested = readIds(payload.noteIds ?? source.note_ids);
+    const noteIds = noteIdsIn(initial, requested);
+    const mode = payload.mode || source.mode;
+    const notes = requested.length
+      ? initial.notes.filter((n) => noteIds.includes(n.id))
+      : [...initial.notes].sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 4);
     const ctx = notes.map((n, i) => `【笔记${i + 1}：${n.title}】\n${stripInlineImages(noteStudyText(n)).slice(0, 3500)}`).join('\n\n');
     const sys =
       mode === 'feynman'
         ? `你是费曼学习法考官。先肯定准确部分并给出理解度评分，再指出逻辑漏洞并提出1-2个直击要害的苏格拉底式追问。\n\n参考材料：\n${ctx}`
         : `你是知悟学习助教。结合参考笔记清晰深入地解答问题。\n\n参考材料：\n${ctx}`;
-    const hist = (s.tutorMessages[sessionId] || []).slice(-10).map((m) => ({ role: m.role, content: m.content }));
+    const hist = (initial.tutorMessages[sessionId] || []).slice(-10).map((m) => ({ role: m.role, content: m.content }));
     const reply = await callLLMDirect(provider, [{ role: 'system', content: sys }, ...hist, { role: 'user', content: payload.message }]);
+    const s = await loadState();
+    const session = s.tutorSessions.find((item) => item.id === sessionId);
+    if (!session) throw new Error('会话已被删除');
     const userMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'user', content: payload.message, created_at: nowIso() };
     const assistantMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: reply, created_at: nowIso() };
     (s.tutorMessages[sessionId] ||= []).push(userMessage, assistantMessage);
+    session.note_ids = noteIdsIn(s, noteIds);
+    session.mode = mode;
     session.updated_at = nowIso();
     logStudy(s, 'tutor_chat', sessionId);
     await saveState(s);
@@ -1858,6 +1989,9 @@ export const localApi = {
     current.flashcards = mergeById(current.flashcards, parsed.flashcards || []);
     current.mistakes = mergeById(current.mistakes, parsed.mistakes || []);
     current.studyLogs = mergeById(current.studyLogs, parsed.studyLogs || []);
+
+    reconcileLibraryReferences(current);
+    restoreReviewedConceptLinks(current);
 
     await saveState(current);
     return { ok: true, notesCount: notesMerged || parsed.notes.length };

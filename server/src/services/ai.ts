@@ -542,10 +542,8 @@ ${context}`,
 
   const parsed = extractJson<{ questions?: GeneratedQuestion[] } | GeneratedQuestion[]>(raw);
   const list = Array.isArray(parsed) ? parsed : parsed.questions || [];
-  const defaultNoteId = notes[0]?.id || '';
-
   return list.slice(0, config.count).map((q) => ({
-    noteId: q.noteId || defaultNoteId,
+    noteId: q.noteId || '',
     conceptName: q.conceptName || '综合知识',
     type: (['single', 'multiple', 'boolean', 'short'].includes(q.type) ? q.type : 'single') as GeneratedQuestion['type'],
     stem: q.stem || '',

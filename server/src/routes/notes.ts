@@ -6,8 +6,12 @@ import {
   countWords,
   db,
   deleteNoteFts,
+  existingCategoryId,
+  existingNoteIds,
+  inTransaction,
   logStudyActivity,
   nowIso,
+  reconcileLibraryReferences,
   syncNoteFts,
   uid,
   UPLOADS_DIR,
@@ -22,6 +26,7 @@ import {
   synthesizeNotesAI,
 } from '../services/ai.js';
 import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, type ChatExcerpt } from '../shared/noteContent.js';
+import { readIds } from '../shared/libraryReferences.js';
 
 export const notesRouter = Router();
 
@@ -71,18 +76,6 @@ function getNoteRow(id: string) {
     `SELECT n.*, c.name as category_name, c.color as category_color
      FROM notes n LEFT JOIN categories c ON n.category_id = c.id WHERE n.id = ?`
   ).get(id);
-}
-
-function inNoteTransaction<T>(write: () => T): T {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const result = write();
-    db.exec('COMMIT');
-    return result;
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
 }
 
 const noteMatchesLike = `(n.title LIKE ? OR n.content LIKE ? OR n.source_content LIKE ? OR n.tags LIKE ? OR EXISTS (
@@ -192,7 +185,7 @@ notesRouter.get('/syntheses/list', (_req, res) => {
   res.json(
     rows.map((r) => ({
       ...r,
-      note_ids: JSON.parse(r.note_ids || '[]'),
+      note_ids: readIds(r.note_ids),
     }))
   );
 });
@@ -212,6 +205,8 @@ notesRouter.get('/:id', (req, res) => {
 // Create note (paste / manual)
 notesRouter.post('/', (req, res) => {
   const { title, content = '', categoryId = null, tags = [], sourceType = 'markdown' } = req.body || {};
+  const category = existingCategoryId(categoryId);
+  if (categoryId && !category) return res.status(400).json({ error: '分类已不存在，请重新选择' });
   const finalTitle = String(title || '').trim() || '未命名笔记';
   const finalContent = String(content || '');
   const cleanTags = Array.isArray(tags) ? tags.map((t) => String(t).trim()).filter(Boolean) : [];
@@ -221,7 +216,7 @@ notesRouter.post('/', (req, res) => {
   db.prepare(
     `INSERT INTO notes (id, title, content, category_id, tags, source_type, word_count, is_pinned, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
-  ).run(id, finalTitle, finalContent, categoryId || null, JSON.stringify(cleanTags), sourceType, countWords(finalContent), now, now);
+  ).run(id, finalTitle, finalContent, category, JSON.stringify(cleanTags), sourceType, countWords(finalContent), now, now);
 
   syncNoteFts(id, finalTitle, finalContent, cleanTags);
   logStudyActivity('note_import', id);
@@ -272,7 +267,9 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
       const now = nowIso();
       const keepAttachment = parsed.sourceType === 'pdf' || parsed.sourceType === 'image' || parsed.sourceType === 'docx';
       const isImage = parsed.sourceType === 'image';
-      const row = inNoteTransaction(() => {
+      const row = inTransaction(() => {
+        const category = existingCategoryId(categoryId);
+        if (categoryId && !category) throw new Error('分类已不存在，请重新选择');
         db.prepare(
           `INSERT INTO notes (
             id, title, content, source_content, category_id, tags, source_type, source_filename,
@@ -283,7 +280,7 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
           parsed.title,
           isImage ? parsed.content : '',
           isImage ? null : parsed.content,
-          categoryId || null,
+          category,
           JSON.stringify(extraTags),
           parsed.sourceType,
           originalName,
@@ -315,7 +312,7 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
 type NoteChatText = { content: string; chat_excerpts: ChatExcerpt[] };
 
 function editNoteChat(id: string, edit: (text: NoteChatText, updatedAt: string) => NoteChatText | { error: string }) {
-  return inNoteTransaction(() => {
+  return inTransaction(() => {
     const row = getNoteRow(id) as {
       title: string; content: string; source_content: string | null; chat_excerpts: string; tags: string; updated_at: string;
     } | undefined;
@@ -395,7 +392,7 @@ notesRouter.post('/:id/ocr', async (req, res) => {
     const isGenericTitle = /^(JPEG_|IMG_|Screenshot|图片笔记|微信图片|Photo)/i.test(note.title);
     const newTitle = isGenericTitle ? extractSmartTitle(ocrText, note.title) : note.title;
     const now = nowIso();
-    const updated = inNoteTransaction(() => {
+    const updated = inTransaction(() => {
       const current = getNoteRow(note.id);
       if (!current) return null;
       const studyText = noteStudyText({ ...current, content: ocrText });
@@ -419,7 +416,8 @@ notesRouter.put('/:id', (req, res) => {
 
   const title = req.body.title !== undefined ? String(req.body.title).trim() || existing.title : existing.title;
   const content = req.body.content !== undefined ? String(req.body.content) : existing.content;
-  const categoryId = req.body.categoryId !== undefined ? req.body.categoryId || null : existing.category_id;
+  const categoryId = req.body.categoryId !== undefined ? existingCategoryId(req.body.categoryId) : existing.category_id;
+  if (req.body.categoryId && !categoryId) return res.status(400).json({ error: '分类已不存在，请重新选择' });
   const tags: string[] =
     req.body.tags !== undefined
       ? Array.isArray(req.body.tags)
@@ -430,7 +428,7 @@ notesRouter.put('/:id', (req, res) => {
   const now = nextNoteUpdatedAt(existing.updated_at);
   const studyText = noteStudyText({ ...existing, content });
 
-  const updated = inNoteTransaction(() => {
+  const updated = inTransaction(() => {
     db.prepare(
       `UPDATE notes SET title = ?, content = ?, category_id = ?, tags = ?, word_count = ?, is_pinned = ?, updated_at = ? WHERE id = ?`
     ).run(title, content, categoryId, JSON.stringify(tags), countWords(studyText), isPinned, now, existing.id);
@@ -442,15 +440,22 @@ notesRouter.put('/:id', (req, res) => {
 
 // Delete note
 notesRouter.delete('/:id', (req, res) => {
-  const existing = db.prepare(`SELECT * FROM notes WHERE id = ?`).get(req.params.id) as any;
-  if (!existing) return res.status(404).json({ error: '笔记不存在' });
+  const deleted = inTransaction(() => {
+    const note = db.prepare(`SELECT id, attachment_path FROM notes WHERE id = ?`).get(req.params.id) as
+      { id: string; attachment_path: string | null } | undefined;
+    if (!note) return null;
+    db.prepare(`DELETE FROM notes WHERE id = ?`).run(note.id);
+    deleteNoteFts(note.id);
+    reconcileLibraryReferences();
+    return note;
+  });
+  if (!deleted) return res.status(404).json({ error: '笔记不存在' });
 
-  if (existing.attachment_path) {
-    const fp = path.join(UPLOADS_DIR, path.basename(existing.attachment_path));
-    if (fs.existsSync(fp)) fs.unlink(fp, () => {});
+  const attachment = deleted.attachment_path;
+  if (attachment && /^\/uploads\/[a-z0-9][\w.-]*$/i.test(attachment)
+    && !db.prepare(`SELECT 1 FROM notes WHERE attachment_path = ?`).get(attachment)) {
+    fs.unlink(path.join(UPLOADS_DIR, path.basename(attachment)), () => {});
   }
-  deleteNoteFts(existing.id);
-  db.prepare(`DELETE FROM notes WHERE id = ?`).run(existing.id);
   res.json({ ok: true });
 });
 
@@ -482,7 +487,7 @@ notesRouter.post('/:id/summarize', async (req, res) => {
       }
       // Auto-assign category if note currently uncategorized
       if (!categoryId && summary.suggestedCategory) {
-        const matched = cats.find((c) => c.name === summary.suggestedCategory);
+        const matched = db.prepare(`SELECT id FROM categories WHERE name = ?`).get(summary.suggestedCategory) as { id: string } | undefined;
         if (matched) {
           categoryId = matched.id;
         } else {
@@ -539,9 +544,9 @@ notesRouter.post('/synthesize', async (req, res) => {
   const { noteIds = [], title, categoryId = null } = req.body || {};
   let targetNotes: any[] = [];
 
-  if (Array.isArray(noteIds) && noteIds.length > 0) {
-    const placeholders = noteIds.map(() => '?').join(',');
-    targetNotes = db.prepare(`SELECT * FROM notes WHERE id IN (${placeholders})`).all(...noteIds) as any[];
+  const requested = readIds(noteIds);
+  if (requested.length > 0) {
+    targetNotes = db.prepare(`SELECT * FROM notes WHERE id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(requested));
   } else if (categoryId) {
     targetNotes = db.prepare(`SELECT * FROM notes WHERE category_id = ? ORDER BY updated_at DESC LIMIT 10`).all(categoryId) as any[];
   }
@@ -558,6 +563,11 @@ notesRouter.post('/synthesize', async (req, res) => {
         tags: JSON.parse(n.tags || '[]'),
       }))
     );
+    const sourceIds = targetNotes.map((note) => note.id);
+    if (existingNoteIds(sourceIds).length !== sourceIds.length) {
+      return res.status(409).json({ error: '归纳期间有来源笔记被删除，请重新选择' });
+    }
+    const category = existingCategoryId(categoryId);
 
     const synId = uid();
     const synTitle =
@@ -567,15 +577,15 @@ notesRouter.post('/synthesize', async (req, res) => {
 
     db.prepare(
       `INSERT INTO syntheses (id, title, note_ids, category_id, content, created_at) VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(synId, synTitle, JSON.stringify(targetNotes.map((n) => n.id)), categoryId || null, markdown, now);
+    ).run(synId, synTitle, JSON.stringify(sourceIds), category, markdown, now);
 
     logStudyActivity('note_summary', synId);
 
     res.status(201).json({
       id: synId,
       title: synTitle,
-      note_ids: targetNotes.map((n) => n.id),
-      category_id: categoryId,
+      note_ids: sourceIds,
+      category_id: category,
       content: markdown,
       created_at: now,
     });

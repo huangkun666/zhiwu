@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { existingIds, readIds } from './shared/libraryReferences.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -248,20 +249,102 @@ export function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_notes_category ON notes(category_id);
     CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_note_concepts_concept ON note_concepts(concept_id, note_id);
     CREATE INDEX IF NOT EXISTS idx_mistakes_review ON mistakes(next_review_at);
     CREATE INDEX IF NOT EXISTS idx_flashcards_review ON flashcards(next_review_at);
     CREATE INDEX IF NOT EXISTS idx_study_logs_date ON study_logs(date_key);
+
+    CREATE VIEW IF NOT EXISTS active_concepts AS
+      SELECT c.* FROM concepts c WHERE EXISTS (
+        SELECT 1 FROM note_concepts nc INNER JOIN notes n ON n.id = nc.note_id WHERE nc.concept_id = c.id
+      );
   `);
 
   const noteColumns = new Set(db.prepare('PRAGMA table_info(notes)').all().map((column) => column.name));
   if (!noteColumns.has('source_content')) db.exec('ALTER TABLE notes ADD COLUMN source_content TEXT');
   if (!noteColumns.has('chat_excerpts')) db.exec("ALTER TABLE notes ADD COLUMN chat_excerpts TEXT NOT NULL DEFAULT '[]'");
 
+  inTransaction(() => {
+    reconcileLibraryReferences();
+    restoreReviewedConceptLinks();
+  });
+
   // Initialize default AI settings if absent
   const existing = db.prepare(`SELECT value FROM settings WHERE key = 'ai_settings'`).get() as { value: string } | undefined;
   if (!existing) {
     db.prepare(`INSERT INTO settings (key, value) VALUES ('ai_settings', ?)`).run(JSON.stringify(DEFAULT_AI_SETTINGS));
   }
+}
+
+export function inTransaction<T>(write: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = write();
+    db.exec('COMMIT');
+    return result;
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+export function existingNoteIds(value: unknown): string[] {
+  const ids = readIds(value);
+  if (ids.length === 0) return ids;
+  const rows = db.prepare(`SELECT id FROM notes WHERE id IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify(ids)) as { id: string }[];
+  const found = new Set(rows.map(({ id }) => id));
+  return ids.filter((id) => found.has(id));
+}
+
+export function existingCategoryId(value: unknown): string | null {
+  return typeof value === 'string' && value && db.prepare(`SELECT 1 FROM categories WHERE id = ?`).get(value) ? value : null;
+}
+
+export function reconcileLibraryReferences() {
+  const noteIds = new Set((db.prepare(`SELECT id FROM notes`).all() as { id: string }[]).map(({ id }) => id));
+  const noteLists = [
+    ['tutor_sessions', 'note_ids'],
+    ['syntheses', 'note_ids'],
+    ['quizzes', 'source_note_ids'],
+  ];
+  for (const [table, column] of noteLists) {
+    const rows = db.prepare(`SELECT id, ${column} AS refs FROM ${table}`).all() as { id: string; refs: string | null }[];
+    const update = db.prepare(`UPDATE ${table} SET ${column} = ? WHERE id = ?`);
+    for (const row of rows) {
+      const corrected = JSON.stringify(existingIds(row.refs, noteIds));
+      if (corrected !== row.refs) update.run(corrected, row.id);
+    }
+  }
+
+  const references = [
+    ['quiz_questions', 'note_id', 'notes'],
+    ['mistakes', 'note_id', 'notes'],
+    ['flashcards', 'note_id', 'notes'],
+    ['mistakes', 'question_id', 'quiz_questions'],
+    ['notes', 'category_id', 'categories'],
+    ['concepts', 'category_id', 'categories'],
+    ['quizzes', 'category_id', 'categories'],
+    ['syntheses', 'category_id', 'categories'],
+    ['flashcards', 'category_id', 'categories'],
+    ['categories', 'parent_id', 'categories'],
+  ];
+  for (const [table, column, target] of references) {
+    db.exec(`UPDATE ${table} SET ${column} = NULL WHERE ${column} IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM ${target} AS target WHERE target.id = ${table}.${column})`);
+  }
+}
+
+export function restoreReviewedConceptLinks() {
+  // Earlier builds recorded mastery from reviews without linking those concepts to their source notes.
+  db.exec(`INSERT OR IGNORE INTO note_concepts (note_id, concept_id)
+    SELECT n.id, c.id FROM (
+      SELECT note_id, concept_name FROM quiz_questions WHERE is_correct IS NOT NULL
+      UNION SELECT note_id, concept_name FROM flashcards WHERE last_reviewed_at IS NOT NULL
+      UNION SELECT note_id, concept_name FROM mistakes WHERE last_reviewed_at IS NOT NULL
+    ) AS reviewed
+    INNER JOIN notes n ON n.id = reviewed.note_id
+    INNER JOIN concepts c ON c.name = TRIM(reviewed.concept_name)`);
 }
 
 export function uid(): string {
@@ -426,10 +509,13 @@ export function upsertConcept(
   return conceptId;
 }
 
-export function updateConceptMastery(conceptName: string, isCorrect: boolean, categoryId: string | null = null) {
+export function updateConceptMastery(conceptName: string, isCorrect: boolean, noteId?: string | null) {
   const trimmed = conceptName.trim();
   if (!trimmed) return;
-  const conceptId = upsertConcept(trimmed, '', categoryId);
+  const source = typeof noteId === 'string'
+    ? db.prepare(`SELECT id, category_id FROM notes WHERE id = ?`).get(noteId) as { id: string; category_id: string | null } | undefined
+    : undefined;
+  const conceptId = upsertConcept(trimmed, '', source?.category_id, source?.id);
   const row = db.prepare(`SELECT quiz_attempts, quiz_correct FROM concepts WHERE id = ?`).get(conceptId) as {
     quiz_attempts: number;
     quiz_correct: number;

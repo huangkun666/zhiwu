@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookMarked,
   BookOpen,
@@ -13,6 +13,7 @@ import {
   Undo2,
 } from 'lucide-react';
 import { api } from '../api/client';
+import { existingIds } from '../../../server/src/shared/libraryReferences';
 import { MarkdownView } from '../components/MarkdownView';
 import type { Note, TutorMessage, TutorSession } from '../types';
 
@@ -43,6 +44,11 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   const [noteActionBusy, setNoteActionBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<number | undefined>(undefined);
+  const noteRequest = useRef(0);
+  const availableSelection = useMemo(
+    () => existingIds(selectedNoteIds, new Set(notes.map(({ id }) => id))),
+    [selectedNoteIds, notes]
+  );
 
   const showToast = (message: string, append?: NoteAppend) => {
     window.clearTimeout(toastTimer.current);
@@ -53,10 +59,19 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   const loadSessions = async () => {
-    const [sessList, noteList] = await Promise.all([api.getTutorSessions(), api.getNotes()]);
+    const [sessList] = await Promise.all([api.getTutorSessions(), refreshContextNotes()]);
     setSessions(sessList);
-    setNotes(noteList);
-    return { sessList, noteList };
+    return sessList;
+  };
+
+  const refreshContextNotes = async () => {
+    const request = ++noteRequest.current;
+    try {
+      const list = await api.getNotes();
+      if (request === noteRequest.current) setNotes(list);
+    } catch {
+      // Keep the last successfully loaded list if the note library is unreachable.
+    }
   };
 
   const openSession = async (id: string) => {
@@ -76,7 +91,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
     const targetMode = opts?.mode || mode;
     const sess = await api.createTutorSession({
       mode: targetMode,
-      noteIds: opts?.noteIds || selectedNoteIds,
+      noteIds: opts?.noteIds || availableSelection,
       title: opts?.title,
       initialPrompt: opts?.initialPrompt,
     });
@@ -86,10 +101,13 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   };
 
   useEffect(() => {
-    loadSessions().then(({ sessList }) => {
+    let cancelled = false;
+    loadSessions().then((sessList) => {
+      if (cancelled) return;
       if (initialContext) startNewSession(initialContext);
       else if (sessList.length > 0) openSession(sessList[0].id);
     });
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -102,7 +120,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
 
     let session = activeSession;
     if (!session) {
-      session = await api.createTutorSession({ mode, noteIds: selectedNoteIds, title: text.slice(0, 22) });
+      session = await api.createTutorSession({ mode, noteIds: availableSelection, title: text.slice(0, 22) });
       setSessions((p) => [session!, ...p]);
       setActiveSession(session);
     }
@@ -123,7 +141,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
     try {
       const res = await api.sendTutorMessageStream(
         session.id,
-        { message: text, noteIds: selectedNoteIds, mode },
+        { message: text, noteIds: availableSelection, mode },
         (delta) => setStreamingText((prev) => prev + delta)
       );
       setStreamingText('');
@@ -154,12 +172,13 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
       await api.createFlashcard({
         front,
         back: aiMsg.content.slice(0, 1200),
-        noteId: selectedNoteIds[0] || null,
+        noteId: availableSelection[0] || null,
         conceptName: activeSession?.title || '助教沉淀',
       });
       onRefreshGlobal?.();
       showToast('已一键存为记忆闪卡，加入复习计划！');
     } catch (e: any) {
+      refreshContextNotes();
       alert(e.message);
     }
   };
@@ -169,7 +188,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
     if (noteActionBusy) return;
     setNoteActionBusy(true);
     try {
-      const targetNoteId = selectedNoteIds[0];
+      const targetNoteId = availableSelection[0];
       if (targetNoteId) {
         const note = await api.appendNoteChat(targetNoteId, message.id, message.content);
         showToast(`已追加到《${note.title}》`, { noteId: note.id, excerptId: message.id });
@@ -183,6 +202,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
       }
       onRefreshGlobal?.();
     } catch (e: any) {
+      refreshContextNotes();
       alert(e.message);
     } finally {
       setNoteActionBusy(false);
@@ -320,11 +340,14 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
 
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setShowContextPicker(!showContextPicker)}
+              onClick={() => {
+                setShowContextPicker(!showContextPicker);
+                if (!showContextPicker) refreshContextNotes();
+              }}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl zw-btn-secondary text-xs cursor-pointer"
             >
               <BookOpen className="w-3.5 h-3.5" />
-              参考笔记 ({selectedNoteIds.length || '自动'})
+              参考笔记 ({availableSelection.length || (notes.length ? '自动' : 0)})
             </button>
             <button onClick={() => startNewSession()} className="lg:hidden p-2 rounded-xl zw-btn-secondary" title="新对话">
               <Plus className="w-4 h-4" />
@@ -337,10 +360,12 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
             className="px-4 py-3 border-b max-h-36 overflow-y-auto"
             style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
           >
-            <div className="text-[11px] text-[var(--text-muted)] mb-2">勾选参考笔记（不选则默认参考最近笔记）：</div>
+            <div className="text-[11px] text-[var(--text-muted)] mb-2">
+              {notes.length ? '可勾选参考笔记，默认参考最近更新的笔记。' : '笔记库暂无可参考的笔记。'}
+            </div>
             <div className="flex flex-wrap gap-1.5">
               {notes.map((n) => {
-                const active = selectedNoteIds.includes(n.id);
+                const active = availableSelection.includes(n.id);
                 return (
                   <button
                     key={n.id}
@@ -408,7 +433,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
                         disabled={noteActionBusy}
                         className="inline-flex items-center gap-1 hover:text-[var(--text-primary)] cursor-pointer transition disabled:opacity-50"
                       >
-                        <FilePlus2 className="w-3 h-3" /> {selectedNoteIds.length ? '追加到笔记' : '存为新笔记'}
+                        <FilePlus2 className="w-3 h-3" /> {availableSelection.length ? '追加到笔记' : '存为新笔记'}
                       </button>
                     </div>
                   )}
