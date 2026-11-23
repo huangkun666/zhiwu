@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Cloud,
   Cpu,
-  Download,
   Eye,
   EyeOff,
   GitBranch,
@@ -18,10 +17,10 @@ import {
   RotateCcw,
   Save,
   Sun,
-  Upload,
   Zap,
 } from 'lucide-react';
 import { api, IS_STANDALONE_MODE } from '../api/client';
+import { LibraryBackupPanel } from '../components/LibraryBackupPanel';
 import { QrScannerModal } from '../components/QrScannerModal';
 import { QrSendModal } from '../components/QrSendModal';
 import type { AIProviderConfig, AISettings } from '../types';
@@ -62,6 +61,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
   const [modelsError, setModelsError] = useState('');
   const [qrSendOpen, setQrSendOpen] = useState(false);
   const [qrScanOpen, setQrScanOpen] = useState(false);
+  const [qrBackupOnly, setQrBackupOnly] = useState(false);
 
   // Remote branch & commit update state
   const nativeOta = getNativeOtaState();
@@ -156,28 +156,6 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
       setModelsError(e.message || '获取模型列表失败');
     } finally {
       setFetchingModels(false);
-    }
-  };
-
-  const handleExportJson = async () => {
-    const json = await api.exportJsonBackup();
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `zhiwu-sync-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const handleImportJson = async (file: File) => {
-    try {
-      const text = await file.text();
-      const res = await api.importJsonBackup(text);
-      alert(`同步合并成功！共合并 ${res.notesCount} 篇笔记（保留原有数据，不覆盖）。`);
-      onSettingsChanged?.();
-    } catch (err: any) {
-      alert(err.message || '导入失败');
     }
   };
 
@@ -540,12 +518,19 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
         </div>
       </div>
 
-      {/* Unified Cross-Device Sync & QR File Transfer */}
+      <LibraryBackupPanel
+        onRestored={onSettingsChanged}
+        onOpenBackupTransfer={() => {
+          setQrBackupOnly(true);
+          setQrScanOpen(true);
+        }}
+      />
+
       <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-4">
         <div>
-          <h2 className="font-semibold text-sm">跨端快传与通用备份（电脑 ↔ 安卓 APK）</h2>
+          <h2 className="font-semibold text-sm">局域网快传</h2>
           <p className="text-xs text-[var(--text-muted)] mt-0.5">
-            支持同 Wi-Fi 扫码直接互传文件或全量同步笔记，亦支持 JSON 文件智能增量合并。
+            电脑和手机连接同一 Wi-Fi 后，可扫码传输文件。
           </p>
         </div>
         <div className="flex flex-wrap gap-2.5">
@@ -555,44 +540,19 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
             >
               <QrCode className="w-3.5 h-3.5" />
-              生成扫码快传码（传给手机）
+              打开扫码快传
             </button>
           ) : (
             <button
-              onClick={() => setQrScanOpen(true)}
+              onClick={() => {
+                setQrBackupOnly(false);
+                setQrScanOpen(true);
+              }}
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
             >
               <QrCode className="w-3.5 h-3.5" />
               扫码从电脑导入 / 同步
             </button>
-          )}
-          <button
-            onClick={handleExportJson}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer"
-          >
-            <Download className="w-3.5 h-3.5" />
-            导出 JSON 备份
-          </button>
-          <label className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer">
-            <Upload className="w-3.5 h-3.5" />
-            导入并智能合并
-            <input
-              type="file"
-              accept=".json,application/json"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) handleImportJson(f);
-              }}
-            />
-          </label>
-          {!IS_STANDALONE_MODE && (
-            <a
-              href="/api/settings/backup"
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium"
-            >
-              下载原始 SQLite (.db)
-            </a>
           )}
         </div>
       </div>
@@ -911,6 +871,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
       <QrSendModal open={qrSendOpen} onClose={() => setQrSendOpen(false)} />
       <QrScannerModal
         open={qrScanOpen}
+        backupOnly={qrBackupOnly}
         onClose={() => setQrScanOpen(false)}
         onCompleted={() => onSettingsChanged?.()}
       />

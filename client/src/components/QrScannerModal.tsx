@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import jsQR from 'jsqr';
 import { Camera, CheckCircle2, Image, Link2, Loader2, QrCode, X } from 'lucide-react';
+import { parseBackupReceiveUrl } from '../../../server/src/shared/backupReceive';
 import { api } from '../api/client';
 import type { Note } from '../types';
+import { sendBackupToComputer, verifyBackupReceiver } from '../utils/sendBackupToComputer';
 
 interface QrScannerModalProps {
   open: boolean;
   onClose: () => void;
-  onCompleted: (result: { kind: 'files' | 'sync'; notes?: Note[]; count: number }) => void;
+  onCompleted?: (result: { kind: 'files' | 'sync'; notes?: Note[]; count: number }) => void;
+  backupOnly?: boolean;
 }
 
 function base64ToFile(base64: string, name: string, mimeType: string): File {
@@ -17,20 +20,24 @@ function base64ToFile(base64: string, name: string, mimeType: string): File {
   return new File([bytes], name, { type: mimeType || 'application/octet-stream' });
 }
 
-export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalProps) {
+export function QrScannerModal({ open, onClose, onCompleted, backupOnly = false }: QrScannerModalProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const timerRef = useRef<number | null>(null);
   const handledRef = useRef(false);
+  const cameraRequestRef = useRef(0);
+  const activeTransferRef = useRef<'download' | 'backup' | null>(null);
 
   const [cameraError, setCameraError] = useState('');
+  const [cameraPaused, setCameraPaused] = useState(false);
   const [manualUrl, setManualUrl] = useState('');
   const [busyText, setBusyText] = useState('');
   const [error, setError] = useState('');
   const [doneMsg, setDoneMsg] = useState('');
 
   const stopCamera = () => {
+    cameraRequestRef.current += 1;
     if (timerRef.current) {
       window.clearInterval(timerRef.current);
       timerRef.current = null;
@@ -42,15 +49,40 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
   };
 
   const handleTransferUrl = async (rawUrl: string) => {
+    if (activeTransferRef.current) return;
     const url = rawUrl.trim();
+    const destination = parseBackupReceiveUrl(url);
+    stopCamera();
+    setCameraPaused(true);
+    if (backupOnly && !destination) {
+      setError('请扫描电脑端「接收备份」的二维码');
+      return;
+    }
     if (!url || !/^https?:\/\//i.test(url)) {
       setError('未识别到有效的快传链接（需以 http:// 或 https:// 开头）');
       return;
     }
-    stopCamera();
     setError('');
-    setBusyText('正在通过局域网拉取文件...');
+    if (destination) {
+      setManualUrl(destination.href);
+      if (!window.confirm(`将完整备份发送到电脑 ${destination.host}？`)) return;
+    }
+    activeTransferRef.current = destination ? 'backup' : 'download';
+    setBusyText(destination ? '正在连接电脑…' : '正在通过局域网拉取文件…');
     try {
+      if (destination) {
+        await verifyBackupReceiver(destination);
+        setBusyText('正在打包笔记、原文件和学习进度…');
+        const { blob, missingAttachments } = await api.exportBackup();
+        setBusyText('正在发送备份 · 0%');
+        await sendBackupToComputer(destination, blob, (receivedBytes) => {
+          setBusyText(`正在发送备份 · ${Math.floor(receivedBytes * 100 / blob.size)}%`);
+        });
+        const missing = missingAttachments ? ` 有 ${missingAttachments} 个原文件在本机无法读取。` : '';
+        setDoneMsg(`已发送，请在电脑上点击「下载完整备份」。${missing}`);
+        return;
+      }
+
       const res = await fetch(url);
       const data = await res.json().catch(() => null);
       if (!res.ok || !data) {
@@ -61,7 +93,7 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
         setBusyText('正在智能合并电脑笔记库...');
         const merged = await api.importJsonBackup(JSON.stringify(data.payload));
         setDoneMsg(`同步完成！已合并 ${merged.notesCount} 篇笔记`);
-        onCompleted({ kind: 'sync', count: merged.notesCount });
+        onCompleted?.({ kind: 'sync', count: merged.notesCount });
         setTimeout(onClose, 1200);
         return;
       }
@@ -71,7 +103,7 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
         const fileObjs = data.files.map((f: any) => base64ToFile(f.base64, f.name, f.mimeType));
         const imp = await api.importFiles(fileObjs);
         setDoneMsg(`成功扫码导入 ${imp.imported.length} 篇笔记！`);
-        onCompleted({ kind: 'files', notes: imp.imported, count: imp.imported.length });
+        onCompleted?.({ kind: 'files', notes: imp.imported, count: imp.imported.length });
         setTimeout(onClose, 1200);
         return;
       }
@@ -79,14 +111,18 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
       throw new Error('二维码内容不是有效的知悟快传包');
     } catch (e: any) {
       handledRef.current = false;
-      setError(e?.message || '拉取失败，请检查网络或重新生成二维码');
+      setError(e?.message || '快传失败，请检查网络或重新生成二维码');
     } finally {
+      activeTransferRef.current = null;
       setBusyText('');
     }
   };
 
   const startCamera = async () => {
+    const cameraRequest = ++cameraRequestRef.current;
     setCameraError('');
+    setCameraPaused(false);
+    setError('');
     handledRef.current = false;
     if (!navigator.mediaDevices?.getUserMedia) {
       setCameraError('当前环境不支持实时调用摄像头，请使用下方「从相册选二维码」或粘贴快传链接。');
@@ -97,11 +133,16 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
         video: { facingMode: { ideal: 'environment' } },
         audio: false,
       });
+      if (cameraRequest !== cameraRequestRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
+      if (cameraRequest !== cameraRequestRef.current) return;
       timerRef.current = window.setInterval(() => {
         if (handledRef.current || !videoRef.current || !canvasRef.current) return;
         const video = videoRef.current;
@@ -120,6 +161,8 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
         }
       }, 200);
     } catch {
+      if (cameraRequest !== cameraRequestRef.current) return;
+      stopCamera();
       setCameraError('未获得摄像头权限，可点击下方「从相册选二维码」或直接粘贴电脑快传链接。');
     }
   };
@@ -167,33 +210,41 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-      <div className="w-full max-w-md zw-modal rounded-2xl overflow-hidden">
+      <div role="dialog" aria-modal="true" aria-labelledby="qr-scanner-title" className="w-full max-w-md max-h-[calc(100dvh-2rem)] zw-modal rounded-2xl overflow-y-auto">
         <div
           className="flex items-center justify-between px-5 py-4 border-b"
           style={{ borderColor: 'var(--border-hairline)' }}
         >
           <div className="flex items-center gap-2">
             <QrCode className="w-4 h-4" />
-            <h3 className="font-semibold text-sm">扫码导入文件 / 同步电脑笔记</h3>
+            <h3 id="qr-scanner-title" className="font-semibold text-sm">{backupOnly ? '扫码保存到电脑' : '扫码导入文件 / 同步电脑笔记'}</h3>
           </div>
           <button
+            type="button"
+            aria-label="关闭扫码窗口"
+            disabled={activeTransferRef.current === 'backup'}
             onClick={() => {
               stopCamera();
               onClose();
             }}
-            className="p-1.5 rounded-lg text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer"
+            className="p-1.5 rounded-lg text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer disabled:opacity-45"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="p-5 space-y-4">
+          {backupOnly && !doneMsg && (
+            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+              在同一 Wi-Fi 下，打开电脑的「手机与电脑快传 → 接收备份」，再扫描接收二维码。
+            </p>
+          )}
           {/* Camera Viewfinder */}
           {!doneMsg && (
             <div className="relative rounded-2xl overflow-hidden bg-black aspect-[4/3] flex items-center justify-center">
               <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
               <canvas ref={canvasRef} className="hidden" />
-              {!cameraError && !busyText && (
+              {!cameraError && !busyText && !cameraPaused && (
                 <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
                   <div className="w-48 h-48 rounded-2xl border-2 border-white/75 shadow-[0_0_0_9999px_rgba(0,0,0,0.42)]" />
                 </div>
@@ -205,9 +256,16 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
                 </div>
               )}
               {busyText && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center p-5 text-center text-xs text-white bg-black/75 space-y-2">
+                <div role="status" className="absolute inset-0 flex flex-col items-center justify-center p-5 text-center text-xs text-white bg-black/75 space-y-2">
                   <Loader2 className="w-6 h-6 animate-spin" />
                   <p>{busyText}</p>
+                </div>
+              )}
+              {!cameraError && !busyText && cameraPaused && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/75">
+                  <button type="button" className="px-3 py-2 rounded-xl border border-white/30 text-xs text-white" onClick={startCamera}>
+                    重新扫码
+                  </button>
                 </div>
               )}
             </div>
@@ -215,6 +273,7 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
 
           {doneMsg && (
             <div
+              role="status"
               className="p-5 rounded-2xl border text-center space-y-2"
               style={{ background: 'var(--ok-bg)', borderColor: 'var(--ok-border)', color: 'var(--ok-fg)' }}
             >
@@ -225,6 +284,7 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
 
           {error && (
             <div
+              role="alert"
               className="p-3 rounded-xl border text-xs"
               style={{ background: 'var(--danger-bg)', borderColor: 'var(--danger-border)', color: 'var(--danger-fg)' }}
             >
@@ -232,42 +292,48 @@ export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalPro
             </div>
           )}
 
-          {/* Fallbacks: Pick QR image from gallery OR paste transfer link */}
-          <div className="space-y-2.5">
-            <label className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer">
-              <Image className="w-3.5 h-3.5" />
-              从相册选二维码图片识别
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) handleDecodeImageFile(f);
-                }}
-              />
-            </label>
-
-            <div className="flex gap-2">
-              <div className="relative flex-1">
-                <Link2 className="w-3.5 h-3.5 text-[var(--text-muted)] absolute left-3 top-1/2 -translate-y-1/2" />
+          {!doneMsg && (
+            <div className="space-y-2.5">
+              <label className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer">
+                <Image className="w-3.5 h-3.5" />
+                从相册选二维码
                 <input
-                  value={manualUrl}
-                  onChange={(e) => setManualUrl(e.target.value)}
-                  placeholder="或粘贴电脑生成的快传链接..."
-                  className="w-full pl-8 pr-3 py-2 rounded-xl zw-input text-xs font-mono"
+                  type="file"
+                  accept="image/*"
+                  disabled={Boolean(busyText)}
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleDecodeImageFile(file);
+                    e.target.value = '';
+                  }}
                 />
+              </label>
+
+              <div className="flex gap-2">
+                <div className="relative min-w-0 flex-1">
+                  <Link2 className="w-3.5 h-3.5 text-[var(--text-muted)] absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="url"
+                    value={manualUrl}
+                    disabled={Boolean(busyText)}
+                    onChange={(e) => setManualUrl(e.target.value)}
+                    aria-label={backupOnly ? '备份接收链接' : '快传链接'}
+                    placeholder={backupOnly ? '粘贴备份接收链接' : '粘贴快传链接'}
+                    className="w-full pl-8 pr-3 py-2 rounded-xl zw-input text-xs font-mono"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={!manualUrl.trim() || Boolean(busyText)}
+                  onClick={() => handleTransferUrl(manualUrl)}
+                  className="px-3.5 py-2 rounded-xl zw-btn-primary text-xs font-semibold disabled:opacity-45 cursor-pointer"
+                >
+                  {backupOnly ? '连接' : '拉取'}
+                </button>
               </div>
-              <button
-                type="button"
-                disabled={!manualUrl.trim() || Boolean(busyText)}
-                onClick={() => handleTransferUrl(manualUrl)}
-                className="px-3.5 py-2 rounded-xl zw-btn-primary text-xs font-semibold disabled:opacity-45 cursor-pointer"
-              >
-                拉取
-              </button>
             </div>
-          </div>
+          )}
         </div>
       </div>
     </div>

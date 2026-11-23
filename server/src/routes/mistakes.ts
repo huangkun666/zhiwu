@@ -6,10 +6,15 @@ import { noteStudyText } from '../shared/noteContent.js';
 
 export const mistakesRouter = Router();
 
+const mistakeSelect = `SELECT m.*, n.id AS active_note_id, n.title AS note_title
+  FROM mistakes m LEFT JOIN active_notes n ON m.note_id = n.id`;
+
 function formatMistake(row: any) {
+  const { active_note_id, ...mistake } = row;
   const options = JSON.parse(row.options_json || '[]');
   return {
-    ...row,
+    ...mistake,
+    note_id: active_note_id,
     options,
     interval_previews: previewSM2Intervals({
       easeFactor: row.ease_factor,
@@ -17,6 +22,10 @@ function formatMistake(row: any) {
       repetitions: row.repetitions,
     }),
   };
+}
+
+function getMistake(id: string) {
+  return formatMistake(db.prepare(`${mistakeSelect} WHERE m.id = ?`).get(id));
 }
 
 // List mistakes with optional status / concept filter
@@ -44,10 +53,7 @@ mistakesRouter.get('/', (req, res) => {
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = db
     .prepare(
-      `SELECT m.*, n.title as note_title
-       FROM mistakes m
-       LEFT JOIN notes n ON m.note_id = n.id
-       ${where}
+      `${mistakeSelect} ${where}
        ORDER BY m.status ASC, m.next_review_at ASC`
     )
     .all(...params);
@@ -61,7 +67,7 @@ mistakesRouter.post('/bookmark', (req, res) => {
   const q = db.prepare(`SELECT * FROM quiz_questions WHERE id = ?`).get(questionId) as any;
   if (!q) return res.status(404).json({ error: '题目不存在' });
 
-  const existing = db.prepare(`SELECT * FROM mistakes WHERE question_id = ?`).get(questionId);
+  const existing = db.prepare(`${mistakeSelect} WHERE m.question_id = ?`).get(questionId);
   if (existing) return res.json(formatMistake(existing));
 
   const id = uid();
@@ -86,8 +92,7 @@ mistakesRouter.post('/bookmark', (req, res) => {
     now,
     now
   );
-  const created = db.prepare(`SELECT * FROM mistakes WHERE id = ?`).get(id);
-  res.status(201).json(formatMistake(created));
+  res.status(201).json(getMistake(id));
 });
 
 // Update reflection or status
@@ -104,7 +109,7 @@ mistakesRouter.put('/:id', (req, res) => {
     nowIso(),
     existing.id
   );
-  res.json(formatMistake(db.prepare(`SELECT * FROM mistakes WHERE id = ?`).get(existing.id)));
+  res.json(getMistake(existing.id));
 });
 
 // Deep AI Diagnosis for a mistake
@@ -114,7 +119,7 @@ mistakesRouter.post('/:id/diagnose', async (req, res) => {
 
   let noteExcerpt = '';
   if (m.note_id) {
-    const note = db.prepare(`SELECT content, source_content, chat_excerpts FROM notes WHERE id = ?`).get(m.note_id) as
+    const note = db.prepare(`SELECT content, source_content, chat_excerpts FROM active_notes WHERE id = ?`).get(m.note_id) as
       Parameters<typeof noteStudyText>[0] | undefined;
     if (note) noteExcerpt = noteStudyText(note);
   }
@@ -129,7 +134,7 @@ mistakesRouter.post('/:id/diagnose', async (req, res) => {
       noteExcerpt,
     });
     db.prepare(`UPDATE mistakes SET ai_diagnosis = ?, updated_at = ? WHERE id = ?`).run(diagnosis, nowIso(), m.id);
-    res.json(formatMistake(db.prepare(`SELECT * FROM mistakes WHERE id = ?`).get(m.id)));
+    res.json(getMistake(m.id));
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'AI 错题深度剖析失败' });
   }
@@ -191,7 +196,7 @@ mistakesRouter.post('/:id/review', (req, res) => {
   logStudyActivity('mistake_review', m.id, rating >= 3 ? 1 : 0, 30);
 
   res.json({
-    mistake: formatMistake(db.prepare(`SELECT * FROM mistakes WHERE id = ?`).get(m.id)),
+    mistake: getMistake(m.id),
     nextLabel: next.label,
   });
 });

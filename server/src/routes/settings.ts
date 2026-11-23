@@ -1,25 +1,10 @@
 import { Router } from 'express';
 import os from 'node:os';
 import QRCode from 'qrcode';
-import {
-  AISettings,
-  countWords,
-  db,
-  DB_PATH,
-  existingCategoryId,
-  existingNoteIds,
-  getAISettings,
-  inTransaction,
-  nowIso,
-  reconcileLibraryReferences,
-  restoreReviewedConceptLinks,
-  saveAISettings,
-  syncNoteFts,
-  uid,
-  upsertConcept,
-} from '../db.js';
+import { type AISettings, DB_PATH, getAISettings, nowIso, saveAISettings } from '../db.js';
 import { fetchProviderModels, getActiveModelCapability, testProviderConnection } from '../services/ai.js';
-import { noteStudyText, readChatExcerpts } from '../shared/noteContent.js';
+import { restoreLegacyBackup } from '../services/backupArchive.js';
+import { readBackupSnapshot } from '../services/backupSnapshot.js';
 
 export const settingsRouter = Router();
 
@@ -142,204 +127,16 @@ settingsRouter.get('/backup', (_req, res) => {
   res.download(DB_PATH, `zhiwu-backup-${new Date().toISOString().slice(0, 10)}.db`);
 });
 
-// Unified Cross-Device JSON Export (100% compatible with Android APK standalone backup!)
+// Compatibility with older clients and saved JSON backups.
 settingsRouter.get('/export-json', (_req, res) => {
-  const categories = db.prepare(`SELECT * FROM categories`).all();
-  const notes = (db.prepare(`SELECT * FROM notes`).all() as any[]).map((n) => ({
-    ...n,
-    tags: JSON.parse(n.tags || '[]'),
-    summary: n.summary_json ? JSON.parse(n.summary_json) : null,
-    chat_excerpts: readChatExcerpts(n.chat_excerpts),
-    is_pinned: Boolean(n.is_pinned),
-  }));
-  const syntheses = (db.prepare(`SELECT * FROM syntheses`).all() as any[]).map((s) => ({
-    ...s,
-    note_ids: JSON.parse(s.note_ids || '[]'),
-  }));
-  const concepts = (db.prepare(`SELECT * FROM concepts`).all() as any[]).map((c) => {
-    const noteIds = (
-      db.prepare(`SELECT note_id FROM note_concepts WHERE concept_id = ?`).all(c.id) as { note_id: string }[]
-    ).map((r) => r.note_id);
-    return { ...c, note_ids: noteIds };
-  });
-  const conceptLinks = db
-    .prepare(`SELECT id, source_id as source, target_id as target, relation, weight FROM concept_links`)
-    .all();
-  const flashcards = db.prepare(`SELECT * FROM flashcards`).all();
-  const mistakes = (db.prepare(`SELECT * FROM mistakes`).all() as any[]).map((m) => ({
-    ...m,
-    options: JSON.parse(m.options_json || '[]'),
-  }));
-  const studyLogs = db.prepare(`SELECT * FROM study_logs`).all();
-
-  res.json({
-    version: 1,
-    exportedAt: nowIso(),
-    categories,
-    notes,
-    syntheses,
-    concepts,
-    conceptLinks,
-    flashcards,
-    mistakes,
-    studyLogs,
-  });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ version: 1, exportedAt: nowIso(), ...readBackupSnapshot() });
 });
 
-// Unified Cross-Device JSON Smart Merge Import (Desktop <-> Android APK sync!)
-settingsRouter.post('/import-json', (req, res) => {
-  const payload = req.body || {};
-  if (!Array.isArray(payload.notes)) {
-    return res.status(400).json({ error: '无效的知悟 JSON 备份格式' });
+settingsRouter.post('/import-json', async (req, res) => {
+  try {
+    res.json(await restoreLegacyBackup(req.body));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : '无法读取知悟 JSON 备份' });
   }
-  res.json(inTransaction(() => mergeBackup(payload)));
 });
-
-function mergeBackup(payload: any) {
-  let notesMerged = 0;
-  let cardsMerged = 0;
-  let mistakesMerged = 0;
-  const now = nowIso();
-
-  for (const c of payload.categories || []) {
-    if (!c?.id || !c?.name) continue;
-    db.prepare(
-      `INSERT OR IGNORE INTO categories (id, name, color, icon, description, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(c.id, c.name, c.color || '#3B5BDB', c.icon || 'folder', c.description || '', c.created_at || now,
-      typeof c.parent_id === 'string' ? c.parent_id : null);
-  }
-
-  for (const n of payload.notes || []) {
-    if (!n?.id || !n?.title) continue;
-    const existing = db.prepare(`SELECT updated_at FROM notes WHERE id = ?`).get(n.id) as
-      | { updated_at: string }
-      | undefined;
-    const incomingUpdated = n.updated_at || now;
-    if (!existing || incomingUpdated > existing.updated_at) {
-      const tags = Array.isArray(n.tags) ? n.tags : [];
-      const content = n.content || '';
-      const sourceContent = typeof n.source_content === 'string' ? n.source_content : null;
-      const chatExcerpts = readChatExcerpts(n.chat_excerpts);
-      const studyText = noteStudyText({ content, source_content: sourceContent, chat_excerpts: chatExcerpts });
-      db.prepare(
-        `INSERT INTO notes (
-          id, title, content, source_content, chat_excerpts, summary_json, category_id, tags, source_type,
-          source_filename, attachment_path, word_count, is_pinned, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          title = excluded.title, content = excluded.content, source_content = excluded.source_content,
-          chat_excerpts = excluded.chat_excerpts, summary_json = excluded.summary_json, category_id = excluded.category_id,
-          tags = excluded.tags, source_type = excluded.source_type, source_filename = excluded.source_filename,
-          attachment_path = excluded.attachment_path, word_count = excluded.word_count, is_pinned = excluded.is_pinned,
-          updated_at = excluded.updated_at`
-      ).run(
-        n.id,
-        n.title,
-        content,
-        sourceContent,
-        JSON.stringify(chatExcerpts),
-        n.summary ? JSON.stringify(n.summary) : null,
-        existingCategoryId(n.category_id),
-        JSON.stringify(tags),
-        n.source_type || 'markdown',
-        n.source_filename || null,
-        n.attachment_path || null,
-        countWords(studyText),
-        n.is_pinned ? 1 : 0,
-        n.created_at || now,
-        incomingUpdated
-      );
-      syncNoteFts(n.id, n.title, studyText, tags);
-      notesMerged++;
-    }
-  }
-
-  for (const s of payload.syntheses || []) {
-    if (!s?.id || !s?.content) continue;
-    db.prepare(
-      `INSERT OR IGNORE INTO syntheses (id, title, note_ids, category_id, content, created_at) VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(s.id, s.title || '专题归纳', JSON.stringify(s.note_ids || []), s.category_id || null, s.content, s.created_at || now);
-  }
-
-  for (const con of payload.concepts || []) {
-    if (!con?.name) continue;
-    const cid = upsertConcept(con.name, con.description || '', existingCategoryId(con.category_id));
-    if (!cid) continue;
-    for (const nid of existingNoteIds(con.note_ids)) {
-      db.prepare(`INSERT OR IGNORE INTO note_concepts (note_id, concept_id) VALUES (?, ?)`).run(nid, cid);
-    }
-  }
-
-  for (const f of payload.flashcards || []) {
-    if (!f?.id || !f?.front || !f?.back) continue;
-    db.prepare(
-      `INSERT OR IGNORE INTO flashcards (
-        id, note_id, category_id, concept_name, front, back, hint,
-        ease_factor, interval_days, repetitions, next_review_at, last_reviewed_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      f.id,
-      existingNoteIds([f.note_id])[0] || null,
-      f.category_id || null,
-      f.concept_name || '',
-      f.front,
-      f.back,
-      f.hint || '',
-      f.ease_factor || 2.5,
-      f.interval_days || 0,
-      f.repetitions || 0,
-      f.next_review_at || now,
-      f.last_reviewed_at || null,
-      f.created_at || now,
-      f.updated_at || now
-    );
-    cardsMerged++;
-  }
-
-  for (const m of payload.mistakes || []) {
-    if (!m?.id || !m?.stem) continue;
-    db.prepare(
-      `INSERT OR IGNORE INTO mistakes (
-        id, question_id, note_id, concept_name, type, stem, options_json,
-        correct_answer, wrong_answer, explanation, ai_diagnosis, user_reflection,
-        status, wrong_count, ease_factor, interval_days, repetitions,
-        next_review_at, last_reviewed_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      m.id,
-      m.question_id || null,
-      m.note_id || null,
-      m.concept_name || '',
-      m.type || 'single',
-      m.stem,
-      JSON.stringify(m.options || []),
-      m.correct_answer || '',
-      m.wrong_answer || '',
-      m.explanation || '',
-      m.ai_diagnosis || '',
-      m.user_reflection || '',
-      m.status || 'unmastered',
-      m.wrong_count || 1,
-      m.ease_factor || 2.5,
-      m.interval_days || 1,
-      m.repetitions || 0,
-      m.next_review_at || now,
-      m.last_reviewed_at || null,
-      m.created_at || now,
-      m.updated_at || now
-    );
-    mistakesMerged++;
-  }
-
-  for (const l of payload.studyLogs || []) {
-    if (!l?.activity_type || !l?.date_key) continue;
-    db.prepare(
-      `INSERT OR IGNORE INTO study_logs (id, activity_type, entity_id, duration_seconds, score, created_at, date_key)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(l.id || uid(), l.activity_type, l.entity_id || null, l.duration_seconds || 0, l.score ?? null, l.created_at || now, l.date_key);
-  }
-
-  reconcileLibraryReferences();
-  restoreReviewedConceptLinks();
-  return { ok: true, notesCount: notesMerged, cardsMerged, mistakesMerged };
-}

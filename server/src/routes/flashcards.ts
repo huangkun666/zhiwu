@@ -6,15 +6,24 @@ import { noteStudyText } from '../shared/noteContent.js';
 
 export const flashcardsRouter = Router();
 
+const cardSelect = `SELECT f.*, n.id AS active_note_id, n.title AS note_title
+  FROM flashcards f LEFT JOIN active_notes n ON f.note_id = n.id`;
+
 function formatCard(row: any) {
+  const { active_note_id, ...card } = row;
   return {
-    ...row,
+    ...card,
+    note_id: active_note_id,
     interval_previews: previewSM2Intervals({
       easeFactor: row.ease_factor,
       intervalDays: row.interval_days,
       repetitions: row.repetitions,
     }),
   };
+}
+
+function getCard(id: string) {
+  return formatCard(db.prepare(`${cardSelect} WHERE f.id = ?`).get(id));
 }
 
 // List flashcards
@@ -25,7 +34,7 @@ flashcardsRouter.get('/', (req, res) => {
   const params: any[] = [];
 
   if (noteId) {
-    conds.push(`f.note_id = ?`);
+    conds.push(`n.id = ?`);
     params.push(noteId);
   }
   if (dueOnly) {
@@ -36,10 +45,7 @@ flashcardsRouter.get('/', (req, res) => {
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const rows = db
     .prepare(
-      `SELECT f.*, n.title as note_title
-       FROM flashcards f
-       LEFT JOIN notes n ON f.note_id = n.id
-       ${where}
+      `${cardSelect} ${where}
        ORDER BY f.next_review_at ASC`
     )
     .all(...params);
@@ -51,10 +57,7 @@ flashcardsRouter.get('/queue', (_req, res) => {
   const now = nowIso();
   const dueCards = db
     .prepare(
-      `SELECT f.*, n.title as note_title
-       FROM flashcards f
-       LEFT JOIN notes n ON f.note_id = n.id
-       WHERE f.next_review_at <= ?
+      `${cardSelect} WHERE f.next_review_at <= ?
        ORDER BY f.next_review_at ASC
        LIMIT 40`
     )
@@ -63,17 +66,18 @@ flashcardsRouter.get('/queue', (_req, res) => {
 
   const dueMistakes = db
     .prepare(
-      `SELECT m.*, n.title as note_title
+      `SELECT m.*, n.id AS active_note_id, n.title AS note_title
        FROM mistakes m
-       LEFT JOIN notes n ON m.note_id = n.id
+       LEFT JOIN active_notes n ON m.note_id = n.id
        WHERE m.status != 'mastered' AND m.next_review_at <= ?
        ORDER BY m.next_review_at ASC
        LIMIT 30`
     )
     .all(now)
-    .map((r: any) => ({
+    .map(({ active_note_id, ...r }: any) => ({
       itemType: 'mistake' as const,
       ...r,
+      note_id: active_note_id,
       options: JSON.parse(r.options_json || '[]'),
       interval_previews: previewSM2Intervals({
         easeFactor: r.ease_factor,
@@ -107,29 +111,33 @@ flashcardsRouter.post('/', (req, res) => {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(id, sourceId || null, category, conceptName, front.trim(), back.trim(), hint, now, now, now);
 
-  res.status(201).json(formatCard(db.prepare(`SELECT * FROM flashcards WHERE id = ?`).get(id)));
+  res.status(201).json(getCard(id));
 });
 
 // Generate flashcards from a note via AI
 flashcardsRouter.post('/generate', async (req, res) => {
   const { noteId, count = 6 } = req.body || {};
-  const note = db.prepare(`SELECT * FROM notes WHERE id = ?`).get(noteId) as any;
+  const note = db.prepare(`SELECT * FROM active_notes WHERE id = ?`).get(noteId) as any;
   if (!note) return res.status(404).json({ error: '笔记不存在' });
 
   try {
     const cards = await generateFlashcardsAI(note.title, noteStudyText(note), Math.max(2, Math.min(12, Number(count) || 6)));
-    const current = db.prepare(`SELECT id, category_id FROM notes WHERE id = ?`).get(note.id) as
-      { id: string; category_id: string | null } | undefined;
-    if (!current) return res.status(409).json({ error: '来源笔记已被删除' });
-    const now = nowIso();
-    const created = inTransaction(() => cards.map((c) => {
-      const id = uid();
-      db.prepare(
+    const created = inTransaction(() => {
+      const current = db.prepare(`SELECT id, category_id FROM active_notes WHERE id = ?`).get(note.id) as
+        { id: string; category_id: string | null } | undefined;
+      if (!current) return null;
+      const now = nowIso();
+      const insert = db.prepare(
         `INSERT INTO flashcards (id, note_id, category_id, concept_name, front, back, hint, next_review_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, current.id, current.category_id, c.conceptName, c.front, c.back, c.hint, now, now, now);
-      return formatCard(db.prepare(`SELECT * FROM flashcards WHERE id = ?`).get(id));
-    }));
+      );
+      return cards.map((c) => {
+        const id = uid();
+        insert.run(id, current.id, current.category_id, c.conceptName, c.front, c.back, c.hint, now, now, now);
+        return getCard(id);
+      });
+    });
+    if (!created) return res.status(409).json({ error: '来源笔记已被删除' });
     res.status(201).json({ count: created.length, cards: created });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || '生成闪卡失败' });
@@ -168,7 +176,7 @@ flashcardsRouter.post('/:id/review', (req, res) => {
   logStudyActivity('flashcard_review', card.id, rating >= 3 ? 1 : 0, 20);
 
   res.json({
-    card: formatCard(db.prepare(`SELECT * FROM flashcards WHERE id = ?`).get(card.id)),
+    card: getCard(card.id),
     nextLabel: next.label,
   });
 });
@@ -183,7 +191,7 @@ flashcardsRouter.put('/:id', (req, res) => {
     nowIso(),
     card.id
   );
-  res.json(formatCard(db.prepare(`SELECT * FROM flashcards WHERE id = ?`).get(card.id)));
+  res.json(getCard(card.id));
 });
 
 flashcardsRouter.delete('/:id', (req, res) => {

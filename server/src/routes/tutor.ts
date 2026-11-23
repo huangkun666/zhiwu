@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { db, existingNoteIds, inTransaction, logStudyActivity, nowIso, uid } from '../db.js';
 import { tutorChatAI, tutorChatStreamAI } from '../services/ai.js';
-import { readIds } from '../shared/libraryReferences.js';
+import { readIds, tutorNoteSelection } from '../shared/libraryReferences.js';
 import { noteStudyText } from '../shared/noteContent.js';
 
 export const tutorRouter = Router();
@@ -10,29 +10,33 @@ function getContextNotes(noteIds: string[]) {
   const condition = noteIds.length
     ? `WHERE id IN (${noteIds.map(() => '?').join(',')})`
     : 'ORDER BY updated_at DESC LIMIT 4';
-  const rows = db.prepare(`SELECT title, content, source_content, chat_excerpts FROM notes ${condition}`).all(...noteIds) as
+  const rows = db.prepare(`SELECT title, content, source_content, chat_excerpts FROM active_notes ${condition}`).all(...noteIds) as
     Array<{ title: string } & Parameters<typeof noteStudyText>[0]>;
   return rows.map((row) => ({ title: row.title, content: noteStudyText(row) }));
 }
 
-function replyContext(requested: unknown) {
+function replyContext(requested: unknown, storedIds: unknown) {
   const requestedIds = readIds(requested);
   const noteIds = existingNoteIds(requestedIds);
+  const selectNoteIds = tutorNoteSelection(storedIds, existingNoteIds(storedIds), noteIds);
   const notes = noteIds.length || !requestedIds.length ? getContextNotes(noteIds) : [];
-  return { noteIds, notes };
+  return { notes, selectNoteIds };
 }
 
-function saveTutorReply(sessionId: string, message: string, reply: string, noteIds: string[], mode: string) {
+function saveTutorReply(sessionId: string, message: string, reply: string, mode: string, selectNoteIds: (latest: unknown) => string[]) {
   return inTransaction(() => {
-    if (!db.prepare(`SELECT 1 FROM tutor_sessions WHERE id = ?`).get(sessionId)) throw new Error('会话已被删除');
+    const session = db.prepare(`SELECT note_ids FROM tutor_sessions WHERE id = ?`).get(sessionId) as
+      { note_ids: string } | undefined;
+    if (!session) throw new Error('会话已被删除');
     const userMessage = { id: uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
     const assistantMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: reply, created_at: new Date(Date.now() + 10).toISOString() };
     const insert = db.prepare(`INSERT INTO tutor_messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)`);
     for (const saved of [userMessage, assistantMessage]) {
       insert.run(saved.id, sessionId, saved.role, saved.content, saved.created_at);
     }
+    const storedIds = selectNoteIds(session.note_ids);
     db.prepare(`UPDATE tutor_sessions SET note_ids = ?, mode = ?, updated_at = ? WHERE id = ?`)
-      .run(JSON.stringify(existingNoteIds(noteIds)), mode, assistantMessage.created_at, sessionId);
+      .run(JSON.stringify(existingNoteIds(storedIds, true)), mode, assistantMessage.created_at, sessionId);
     logStudyActivity('tutor_chat', sessionId, null, 60);
     return { userMessage, assistantMessage };
   });
@@ -44,7 +48,7 @@ tutorRouter.get('/sessions', (_req, res) => {
   res.json(
     rows.map((r) => ({
       ...r,
-      note_ids: readIds(r.note_ids),
+      note_ids: existingNoteIds(r.note_ids),
     }))
   );
 });
@@ -110,7 +114,7 @@ tutorRouter.post('/sessions/:id/chat', async (req, res) => {
   if (!message) return res.status(400).json({ error: '消息内容不能为空' });
 
   const mode: 'qa' | 'feynman' = req.body?.mode === 'feynman' || session.mode === 'feynman' ? 'feynman' : 'qa';
-  const { noteIds, notes } = replyContext(req.body?.noteIds ?? session.note_ids);
+  const { notes, selectNoteIds } = replyContext(req.body?.noteIds ?? session.note_ids, session.note_ids);
 
   const history = db
     .prepare(`SELECT role, content FROM tutor_messages WHERE session_id = ? ORDER BY created_at ASC`)
@@ -118,7 +122,7 @@ tutorRouter.post('/sessions/:id/chat', async (req, res) => {
 
   try {
     const reply = await tutorChatAI(mode, notes, history, message);
-    res.json(saveTutorReply(session.id, message, reply, noteIds, mode));
+    res.json(saveTutorReply(session.id, message, reply, mode, selectNoteIds));
   } catch (err: any) {
     res.status(400).json({ error: err?.message || '助教回复失败' });
   }
@@ -133,7 +137,7 @@ tutorRouter.post('/sessions/:id/chat-stream', async (req, res) => {
   if (!message) return res.status(400).json({ error: '消息内容不能为空' });
 
   const mode: 'qa' | 'feynman' = req.body?.mode === 'feynman' || session.mode === 'feynman' ? 'feynman' : 'qa';
-  const { noteIds, notes } = replyContext(req.body?.noteIds ?? session.note_ids);
+  const { notes, selectNoteIds } = replyContext(req.body?.noteIds ?? session.note_ids, session.note_ids);
 
   const history = db
     .prepare(`SELECT role, content FROM tutor_messages WHERE session_id = ? ORDER BY created_at ASC`)
@@ -148,7 +152,7 @@ tutorRouter.post('/sessions/:id/chat-stream', async (req, res) => {
       res.write(`data: ${JSON.stringify({ delta })}\n\n`);
     });
 
-    const saved = saveTutorReply(session.id, message, reply, noteIds, mode);
+    const saved = saveTutorReply(session.id, message, reply, mode, selectNoteIds);
     res.write(`data: ${JSON.stringify({ done: true, ...saved })}\n\n`);
     res.end();
   } catch (err: any) {

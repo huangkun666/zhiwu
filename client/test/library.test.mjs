@@ -36,6 +36,7 @@ test('the offline library clears deleted note references and keeps saved learnin
   const vite = await createServer({
     root: fileURLToPath(new URL('../', import.meta.url)),
     server: { middlewareMode: true, ws: false },
+    optimizeDeps: { noDiscovery: true, include: [] },
   });
   try {
     const { localApi: api } = await vite.ssrLoadModule('/src/api/localEngine.ts');
@@ -57,6 +58,17 @@ test('the offline library clears deleted note references and keeps saved learnin
     assert.equal((await api.getSyntheses())[0].content, '保留归纳');
     assert.equal((await api.getFlashcards())[0].note_id, null);
     assert.equal((await api.getQuizzes())[0].status, 'completed');
+    assert.deepEqual((await api.getTrashedNotes()).map(({ id }) => id), ['live-note']);
+    await assert.rejects(api.getNote('live-note'), /笔记不存在/);
+    await api.restoreNote('live-note');
+    assert.deepEqual((await api.getTrashedNotes()).map(({ id }) => id), []);
+    assert.deepEqual((await api.getTutorMessages('chat')).session.note_ids, ['live-note']);
+    assert.deepEqual((await api.getSyntheses())[0].note_ids, ['live-note']);
+    assert.equal((await api.getFlashcards())[0].note_id, 'live-note');
+    assert.equal((await api.getDashboard()).subjectMastery[0].mastery, 50);
+    await api.deleteNote('live-note');
+    await api.permanentlyDeleteNote('live-note');
+    assert.deepEqual((await api.getTrashedNotes()).map(({ id }) => id), []);
     await api.deleteQuiz('quiz');
     assert.equal((await api.getMistakes())[0].question_id, null);
 
@@ -83,6 +95,11 @@ test('the offline library clears deleted note references and keeps saved learnin
       const latest = await api.getTutorMessages('chat');
       assert.deepEqual(latest.session.note_ids, []);
       assert.equal(latest.messages.at(-1).content, '新的回复');
+      const other = await api.createNote({ title: '新增参考', content: '' });
+      await api.sendTutorMessage('chat', { message: '参考新笔记', noteIds: [other.id] });
+      assert.deepEqual((await api.getTutorMessages('chat')).session.note_ids, [other.id]);
+      await api.restoreNote(note.id);
+      assert.deepEqual((await api.getTutorMessages('chat')).session.note_ids, [note.id, other.id]);
     } finally {
       finish.resolve('测试结束');
       globalThis.fetch = realFetch;

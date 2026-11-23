@@ -14,6 +14,16 @@ export function existingIds(value: unknown, available: ReadonlySet<string>): str
   return readIds(value).filter((id) => available.has(id));
 }
 
+export function tutorNoteSelection(stored: unknown, visible: string[], selected: string[]) {
+  const unchanged = selected.length === visible.length && selected.every((id, index) => id === visible[index]);
+  const visibleIds = new Set(visible);
+  const hiddenIds = new Set(readIds(stored).filter((id) => !visibleIds.has(id)));
+  return (latest: unknown) => {
+    const current = readIds(latest);
+    return unchanged ? current : [...current.filter((id) => hiddenIds.has(id)), ...selected];
+  };
+}
+
 export function questionSourceId(value: unknown, sources: readonly string[]): string | null {
   if (typeof value === 'string' && sources.includes(value)) return value;
   return sources.length === 1 ? sources[0] : null;

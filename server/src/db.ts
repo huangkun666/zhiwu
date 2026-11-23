@@ -85,7 +85,8 @@ export function initDatabase() {
       color TEXT DEFAULT '#3B5BDB',
       icon TEXT DEFAULT 'folder',
       description TEXT DEFAULT '',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      updated_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS notes (
@@ -102,6 +103,7 @@ export function initDatabase() {
       attachment_path TEXT,
       word_count INTEGER DEFAULT 0,
       is_pinned INTEGER DEFAULT 0,
+      deleted_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -253,18 +255,26 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_mistakes_review ON mistakes(next_review_at);
     CREATE INDEX IF NOT EXISTS idx_flashcards_review ON flashcards(next_review_at);
     CREATE INDEX IF NOT EXISTS idx_study_logs_date ON study_logs(date_key);
-
-    CREATE VIEW IF NOT EXISTS active_concepts AS
-      SELECT c.* FROM concepts c WHERE EXISTS (
-        SELECT 1 FROM note_concepts nc INNER JOIN notes n ON n.id = nc.note_id WHERE nc.concept_id = c.id
-      );
   `);
 
-  const noteColumns = new Set(db.prepare('PRAGMA table_info(notes)').all().map((column) => column.name));
-  if (!noteColumns.has('source_content')) db.exec('ALTER TABLE notes ADD COLUMN source_content TEXT');
-  if (!noteColumns.has('chat_excerpts')) db.exec("ALTER TABLE notes ADD COLUMN chat_excerpts TEXT NOT NULL DEFAULT '[]'");
-
   inTransaction(() => {
+    const noteColumns = new Set(db.prepare('PRAGMA table_info(notes)').all().map((column) => column.name));
+    if (!noteColumns.has('source_content')) db.exec('ALTER TABLE notes ADD COLUMN source_content TEXT');
+    if (!noteColumns.has('chat_excerpts')) db.exec("ALTER TABLE notes ADD COLUMN chat_excerpts TEXT NOT NULL DEFAULT '[]'");
+    if (!noteColumns.has('deleted_at')) db.exec('ALTER TABLE notes ADD COLUMN deleted_at TEXT');
+    if (!db.prepare('PRAGMA table_info(categories)').all().some(({ name }) => name === 'updated_at')) {
+      db.exec('ALTER TABLE categories ADD COLUMN updated_at TEXT');
+    }
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_notes_trash ON notes(deleted_at) WHERE deleted_at IS NOT NULL;
+      CREATE VIEW IF NOT EXISTS active_notes AS SELECT * FROM notes WHERE deleted_at IS NULL;
+      DROP VIEW IF EXISTS active_concepts;
+      CREATE VIEW active_concepts AS
+        SELECT c.* FROM concepts c WHERE EXISTS (
+          SELECT 1 FROM note_concepts nc INNER JOIN active_notes n ON n.id = nc.note_id WHERE nc.concept_id = c.id
+        );
+    `);
     reconcileLibraryReferences();
     restoreReviewedConceptLinks();
   });
@@ -288,10 +298,11 @@ export function inTransaction<T>(write: () => T): T {
   }
 }
 
-export function existingNoteIds(value: unknown): string[] {
+export function existingNoteIds(value: unknown, includeTrash = false): string[] {
   const ids = readIds(value);
   if (ids.length === 0) return ids;
-  const rows = db.prepare(`SELECT id FROM notes WHERE id IN (SELECT value FROM json_each(?))`)
+  const source = includeTrash ? 'notes' : 'active_notes';
+  const rows = db.prepare(`SELECT id FROM ${source} WHERE id IN (SELECT value FROM json_each(?))`)
     .all(JSON.stringify(ids)) as { id: string }[];
   const found = new Set(rows.map(({ id }) => id));
   return ids.filter((id) => found.has(id));
@@ -512,6 +523,7 @@ export function upsertConcept(
 export function updateConceptMastery(conceptName: string, isCorrect: boolean, noteId?: string | null) {
   const trimmed = conceptName.trim();
   if (!trimmed) return;
+  // Keep review progress linked to a trashed note so it can reappear when restored.
   const source = typeof noteId === 'string'
     ? db.prepare(`SELECT id, category_id FROM notes WHERE id = ?`).get(noteId) as { id: string; category_id: string | null } | undefined
     : undefined;

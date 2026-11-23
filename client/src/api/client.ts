@@ -1,5 +1,6 @@
 import { Capacitor } from '@capacitor/core';
 import { localApi } from './localEngine';
+import type { BackupPreview } from '../../../server/src/shared/libraryBackup';
 import type {
   AISettings,
   AIProviderConfig,
@@ -15,6 +16,7 @@ import type {
   Synthesis,
   TutorMessage,
   TutorSession,
+  TrashedNote,
 } from '../types';
 
 export const IS_STANDALONE_MODE =
@@ -70,6 +72,9 @@ const serverApi = {
       method: 'DELETE', body: JSON.stringify({ block, updatedAt }),
     }),
   deleteNote: (id: string) => request<{ ok: boolean }>(`/api/notes/${id}`, { method: 'DELETE' }),
+  getTrashedNotes: () => request<TrashedNote[]>('/api/notes/trash'),
+  restoreNote: (id: string) => request<{ ok: boolean }>(`/api/notes/trash/${encodeURIComponent(id)}/restore`, { method: 'POST' }),
+  permanentlyDeleteNote: (id: string) => request<{ ok: boolean }>(`/api/notes/trash/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   importFiles: (files: File[], categoryId?: string | null, tags?: string[]) => {
     const fd = new FormData();
     files.forEach((f) => fd.append('files', f));
@@ -250,6 +255,27 @@ const serverApi = {
       method: 'POST',
       body: JSON.stringify(parsed),
     });
+  },
+  exportBackup: async () => {
+    const response = await fetch('/api/backups');
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || '导出备份失败');
+    }
+    return {
+      blob: await response.blob(),
+      missingAttachments: Number(response.headers.get('X-Zhiwu-Missing-Attachments')) || 0,
+    };
+  },
+  previewBackup: (file: File) => {
+    const body = new FormData();
+    body.append('backup', file);
+    return request<BackupPreview>('/api/backups/preview', { method: 'POST', body });
+  },
+  restoreBackup: (file: File) => {
+    const body = new FormData();
+    body.append('backup', file);
+    return request<{ ok: boolean; notesCount: number }>('/api/backups/restore', { method: 'POST', body });
   },
 };
 

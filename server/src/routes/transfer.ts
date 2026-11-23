@@ -4,8 +4,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
-import { db, nowIso, UPLOADS_DIR } from '../db.js';
-import { readChatExcerpts } from '../shared/noteContent.js';
+import { DATA_DIR, nowIso, UPLOADS_DIR } from '../db.js';
+import { readBackupSnapshot } from '../services/backupSnapshot.js';
+import { BACKUP_CHUNK_SIZE, isLocalBackupHost } from '../shared/backupReceive.js';
 import { getLocalNetworkAdapters } from './settings.js';
 
 export const transferRouter = Router();
@@ -35,65 +36,66 @@ interface StagedTransfer {
 
 const stagedMap = new Map<string, StagedTransfer>();
 
+const BACKUP_TRANSFER_DIR = path.join(DATA_DIR, 'backup-transfers');
+fs.mkdirSync(BACKUP_TRANSFER_DIR, { recursive: true });
+const TRANSFER_LIFETIME_MS = 30 * 60 * 1000;
+
+interface BackupReceive {
+  receipt: string;
+  uploadToken: string;
+  path: string;
+  expiresAt: number;
+  uploadId?: string;
+  totalBytes: number;
+  receivedBytes: number;
+}
+
+const backupReceipts = new Map<string, BackupReceive>();
+const backupUploads = new Map<string, BackupReceive>();
+const backupChunk = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: BACKUP_CHUNK_SIZE, files: 1, fields: 0, parts: 1 },
+}).single('chunk');
+
+function activeBackup(map: Map<string, BackupReceive>, token: string): BackupReceive | undefined {
+  const backup = map.get(token);
+  return backup && backup.expiresAt > Date.now() ? backup : undefined;
+}
+
 // Periodically purge staged transfers older than 30 minutes
 setInterval(() => {
-  const cutoff = Date.now() - 30 * 60 * 1000;
+  const cutoff = Date.now() - TRANSFER_LIFETIME_MS;
   for (const [token, item] of stagedMap.entries()) {
     if (item.createdAt < cutoff) {
       item.files?.forEach((f) => fs.unlink(f.path, () => {}));
       stagedMap.delete(token);
     }
   }
+  for (const [receipt, backup] of backupReceipts) {
+    if (backup.expiresAt <= Date.now()) {
+      backupReceipts.delete(receipt);
+      backupUploads.delete(backup.uploadToken);
+    }
+  }
+  fs.readdir(BACKUP_TRANSFER_DIR, { withFileTypes: true }, (error, entries) => {
+    if (error) return;
+    for (const entry of entries) {
+      if (!entry.isFile() || !/^[a-f0-9]{32}\.zip$/.test(entry.name)) continue;
+      if (backupReceipts.has(path.basename(entry.name, '.zip'))) continue;
+      const filename = path.join(BACKUP_TRANSFER_DIR, entry.name);
+      fs.stat(filename, (statError, stats) => {
+        if (!statError && stats.mtimeMs < cutoff) fs.unlink(filename, () => {});
+      });
+    }
+  });
 }, 5 * 60 * 1000).unref();
 
-function buildExportSnapshot() {
-  const categories = db.prepare(`SELECT * FROM categories`).all();
-  const notes = (db.prepare(`SELECT * FROM notes`).all() as any[]).map((n) => ({
-    ...n,
-    tags: JSON.parse(n.tags || '[]'),
-    summary: n.summary_json ? JSON.parse(n.summary_json) : null,
-    chat_excerpts: readChatExcerpts(n.chat_excerpts),
-    is_pinned: Boolean(n.is_pinned),
-  }));
-  const syntheses = (db.prepare(`SELECT * FROM syntheses`).all() as any[]).map((s) => ({
-    ...s,
-    note_ids: JSON.parse(s.note_ids || '[]'),
-  }));
-  const concepts = (db.prepare(`SELECT * FROM concepts`).all() as any[]).map((c) => {
-    const noteIds = (
-      db.prepare(`SELECT note_id FROM note_concepts WHERE concept_id = ?`).all(c.id) as { note_id: string }[]
-    ).map((r) => r.note_id);
-    return { ...c, note_ids: noteIds };
-  });
-  const conceptLinks = db
-    .prepare(`SELECT id, source_id as source, target_id as target, relation, weight FROM concept_links`)
-    .all();
-  const flashcards = db.prepare(`SELECT * FROM flashcards`).all();
-  const mistakes = (db.prepare(`SELECT * FROM mistakes`).all() as any[]).map((m) => ({
-    ...m,
-    options: JSON.parse(m.options_json || '[]'),
-  }));
-  const studyLogs = db.prepare(`SELECT * FROM study_logs`).all();
-
-  return {
-    version: 1,
-    exportedAt: nowIso(),
-    categories,
-    notes,
-    syntheses,
-    concepts,
-    conceptLinks,
-    flashcards,
-    mistakes,
-    studyLogs,
-  };
-}
-
-async function buildQrPayload(token: string, port: string, requestedIp?: string) {
-  const adapters = getLocalNetworkAdapters();
+async function buildQrPayload(token: string, port: string, requestedIp?: string, receiveBackup = false) {
+  const adapters = getLocalNetworkAdapters().filter((adapter) => !receiveBackup || isLocalBackupHost(adapter.address));
   const ips = adapters.map((a) => a.address);
   const primaryIp = requestedIp && ips.includes(requestedIp) ? requestedIp : adapters[0]?.address || '127.0.0.1';
-  const url = `http://${primaryIp}:${port}/api/transfer/${token}`;
+  const suffix = receiveBackup ? `backup/${token}` : token;
+  const url = `http://${primaryIp}:${port}/api/transfer/${suffix}`;
   const qrDataUrl = await QRCode.toDataURL(url, {
     width: 240,
     margin: 2,
@@ -101,6 +103,112 @@ async function buildQrPayload(token: string, port: string, requestedIp?: string)
   });
   return { token, url, qrDataUrl, adapters, primaryIp };
 }
+
+function backupQrPort(value: unknown): string {
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? String(port) : '3001';
+}
+
+transferRouter.post('/backup-receive', async (req, res) => {
+  const receipt = crypto.randomBytes(16).toString('hex');
+  const uploadToken = crypto.randomBytes(16).toString('hex');
+  const backup: BackupReceive = {
+    receipt,
+    uploadToken,
+    path: path.join(BACKUP_TRANSFER_DIR, `${receipt}.zip`),
+    expiresAt: Date.now() + TRANSFER_LIFETIME_MS,
+    totalBytes: 0,
+    receivedBytes: 0,
+  };
+  const qr = await buildQrPayload(uploadToken, backupQrPort(req.body?.port), undefined, true);
+  backupReceipts.set(receipt, backup);
+  backupUploads.set(uploadToken, backup);
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(201).json({ ...qr, token: receipt, kind: 'backup-receive' });
+});
+
+transferRouter.get('/backup-receive/:receipt/qr', async (req, res) => {
+  const backup = activeBackup(backupReceipts, req.params.receipt);
+  if (!backup) return res.status(404).json({ error: '备份接收码已过期，请重新生成' });
+  const ip = typeof req.query.ip === 'string' ? req.query.ip : undefined;
+  const qr = await buildQrPayload(backup.uploadToken, backupQrPort(req.query.port), ip, true);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ...qr, token: backup.receipt, kind: 'backup-receive' });
+});
+
+transferRouter.get('/backup-receive/:receipt', (req, res) => {
+  const backup = activeBackup(backupReceipts, req.params.receipt);
+  if (!backup) return res.status(404).json({ error: '备份接收码已过期，请重新生成' });
+  const ready = backup.totalBytes > 0 && backup.receivedBytes === backup.totalBytes;
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ready,
+    totalBytes: backup.totalBytes,
+    receivedBytes: backup.receivedBytes,
+    expiresAt: backup.expiresAt,
+    downloadPath: ready ? `/api/transfer/backup-receive/${backup.receipt}/download` : null,
+  });
+});
+
+transferRouter.get('/backup-receive/:receipt/download', (req, res) => {
+  const backup = activeBackup(backupReceipts, req.params.receipt);
+  if (!backup || backup.totalBytes === 0 || backup.receivedBytes !== backup.totalBytes || !fs.existsSync(backup.path)) {
+    return res.status(404).json({ error: '备份文件尚未接收完成或已过期' });
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.download(backup.path, `zhiwu-backup-${new Date().toISOString().slice(0, 10)}.zip`);
+});
+
+transferRouter.get('/backup/:token', (req, res) => {
+  const backup = activeBackup(backupUploads, req.params.token);
+  if (!backup) return res.status(404).json({ error: '备份接收码已过期，请在电脑端重新生成' });
+  if (backup.totalBytes > 0 && backup.receivedBytes === backup.totalBytes) {
+    return res.status(409).json({ error: '电脑已收到备份。请重新生成接收码以发送另一份' });
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ kind: 'backup-receive' });
+});
+
+transferRouter.put('/backup/:token', (req, res) => {
+  const token = req.params.token;
+  if (!activeBackup(backupUploads, token)) return res.status(404).json({ error: '备份接收码已过期' });
+  backupChunk(req, res, (error) => {
+    if (error) return res.status(400).json({ error: '收到的备份分段无效' });
+    const backup = activeBackup(backupUploads, token);
+    if (!backup) return res.status(404).json({ error: '备份接收码已过期' });
+    if (backup.totalBytes > 0 && backup.receivedBytes === backup.totalBytes) {
+      return res.status(409).json({ error: '这份备份已接收完成' });
+    }
+    const uploadId = req.get('X-Zhiwu-Backup-Upload') || '';
+    const totalBytes = Number(req.get('X-Zhiwu-Backup-Size'));
+    const offset = Number(req.get('X-Zhiwu-Backup-Offset'));
+    const chunk = req.file?.buffer;
+    if (!chunk?.length || !/^[a-f0-9]{32}$/.test(uploadId) || !Number.isSafeInteger(totalBytes) ||
+        !Number.isSafeInteger(offset) || offset < 0 || totalBytes < 4 || offset > totalBytes - chunk.length) {
+      return res.status(400).json({ error: '收到的备份分段无效' });
+    }
+    if (offset !== 0 && (backup.uploadId !== uploadId || offset !== backup.receivedBytes || totalBytes !== backup.totalBytes)) {
+      return res.status(409).json({ error: '备份传输进度已变化，请重新扫码发送' });
+    }
+    if (offset === 0 && (chunk.length < 4 || chunk.readUInt32BE(0) !== 0x504b0304)) {
+      return res.status(400).json({ error: '收到的文件不是 ZIP 备份' });
+    }
+    try {
+      fs.writeFileSync(backup.path, chunk, { flag: offset === 0 ? 'w' : 'a' });
+    } catch {
+      backup.uploadId = undefined;
+      backup.totalBytes = 0;
+      backup.receivedBytes = 0;
+      return res.status(500).json({ error: '电脑未能写入备份，请检查存储空间后重试' });
+    }
+    backup.uploadId = uploadId;
+    backup.totalBytes = totalBytes;
+    backup.receivedBytes = offset + chunk.length;
+    backup.expiresAt = Date.now() + TRANSFER_LIFETIME_MS;
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ receivedBytes: backup.receivedBytes, ready: backup.receivedBytes === totalBytes });
+  });
+});
 
 // Stage one or more PC files for Android APK QR scan import
 transferRouter.post('/stage-files', upload.array('files', 10), async (req, res) => {
@@ -159,7 +267,7 @@ transferRouter.get('/:token', (req, res) => {
   }
 
   if (item.kind === 'sync') {
-    return res.json({ kind: 'sync', payload: buildExportSnapshot() });
+    return res.json({ kind: 'sync', payload: { version: 1, exportedAt: nowIso(), ...readBackupSnapshot() } });
   }
 
   const files = (item.files || [])

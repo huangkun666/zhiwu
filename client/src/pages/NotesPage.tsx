@@ -25,7 +25,8 @@ import { splitLegacyChatExcerpts } from '../../../server/src/shared/noteContent'
 import { api } from '../api/client';
 import { MarkdownView } from '../components/MarkdownView';
 import { NoteSource } from '../components/NoteSource';
-import type { Category, Note, PageId, Synthesis } from '../types';
+import { TrashList } from '../components/TrashList';
+import type { Category, Note, PageId, Synthesis, TrashedNote } from '../types';
 
 interface NotesPageProps {
   categories: Category[];
@@ -44,9 +45,10 @@ export function NotesPage({
   onOpenImport,
   onNavigate,
 }: NotesPageProps) {
-  const [subTab, setSubTab] = useState<'notes' | 'syntheses'>('notes');
+  const [subTab, setSubTab] = useState<'notes' | 'syntheses' | 'trash'>('notes');
   const [notes, setNotes] = useState<Note[]>([]);
   const [syntheses, setSyntheses] = useState<Synthesis[]>([]);
+  const [trash, setTrash] = useState<TrashedNote[]>([]);
   const [tags, setTags] = useState<{ name: string; count: number }[]>([]);
 
   const [search, setSearch] = useState('');
@@ -68,16 +70,24 @@ export function NotesPage({
   const [newCatName, setNewCatName] = useState('');
 
   const [loadingList, setLoadingList] = useState(false);
+  const [loadingTrash, setLoadingTrash] = useState(false);
+  const [trashError, setTrashError] = useState('');
+  const [changingTrash, setChangingTrash] = useState(false);
   const [aiBusy, setAiBusy] = useState<string | null>(null);
   const [undoing, setUndoing] = useState(false);
-  const [toast, setToast] = useState<string>('');
+  const [toast, setToast] = useState<{ message: string; restoreId?: string } | null>(null);
+  const toastTimer = useRef<number | undefined>(undefined);
   const noteRequest = useRef(0);
   const synthesisRequest = useRef(0);
+  const trashRequest = useRef(0);
 
-  const showToast = (msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(''), 3200);
+  const showToast = (message: string, restoreId?: string) => {
+    window.clearTimeout(toastTimer.current);
+    setToast({ message, restoreId });
+    toastTimer.current = window.setTimeout(() => setToast(null), restoreId ? 8000 : 3200);
   };
+
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   const fetchNotes = async () => {
     const request = ++noteRequest.current;
@@ -112,6 +122,20 @@ export function NotesPage({
     }
   };
 
+  const fetchTrash = async () => {
+    const request = ++trashRequest.current;
+    setLoadingTrash(true);
+    setTrashError('');
+    try {
+      const items = await api.getTrashedNotes();
+      if (request === trashRequest.current) setTrash(items);
+    } catch (error) {
+      if (request === trashRequest.current) setTrashError(error instanceof Error ? error.message : '无法读取回收站');
+    } finally {
+      if (request === trashRequest.current) setLoadingTrash(false);
+    }
+  };
+
   useEffect(() => {
     const t = setTimeout(fetchNotes, 150);
     return () => clearTimeout(t);
@@ -119,6 +143,7 @@ export function NotesPage({
 
   useEffect(() => {
     fetchSyntheses();
+    fetchTrash();
   }, []);
 
   useEffect(() => {
@@ -198,8 +223,9 @@ export function NotesPage({
   };
 
   const handleDeleteNote = async () => {
-    if (!activeNote || !confirm(`删除笔记《${activeNote.title}》并解除它的来源链接？`)) return;
+    if (!activeNote || changingTrash) return;
     const deletedId = activeNote.id;
+    setChangingTrash(true);
     try {
       await api.deleteNote(deletedId);
       setActiveNote((current) => current?.id === deletedId ? null : current);
@@ -211,10 +237,47 @@ export function NotesPage({
       })));
       fetchNotes();
       fetchSyntheses();
+      fetchTrash();
       onRefreshGlobal();
-      showToast('笔记已删除');
+      showToast('已移入回收站', deletedId);
     } catch (error) {
-      alert(error instanceof Error ? error.message : '删除笔记失败');
+      alert(error instanceof Error ? error.message : '无法移入回收站');
+    } finally {
+      setChangingTrash(false);
+    }
+  };
+
+  const handleRestoreNote = async (id: string) => {
+    if (changingTrash) return;
+    setChangingTrash(true);
+    try {
+      await api.restoreNote(id);
+      setTrash((items) => items.filter((note) => note.id !== id));
+      fetchTrash();
+      fetchNotes();
+      fetchSyntheses();
+      onRefreshGlobal();
+      showToast('笔记已恢复');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '恢复笔记失败');
+    } finally {
+      setChangingTrash(false);
+    }
+  };
+
+  const handlePurgeNote = async (note: TrashedNote) => {
+    if (changingTrash || !confirm(`永久删除《${note.title}》及其原文件？此操作无法撤销。`)) return;
+    setChangingTrash(true);
+    try {
+      await api.permanentlyDeleteNote(note.id);
+      setTrash((items) => items.filter((item) => item.id !== note.id));
+      fetchTrash();
+      onRefreshGlobal();
+      showToast('笔记已永久删除');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '永久删除笔记失败');
+    } finally {
+      setChangingTrash(false);
     }
   };
 
@@ -302,8 +365,14 @@ export function NotesPage({
   return (
     <div className="space-y-5">
       {toast && (
-        <div className="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-xl zw-btn-primary text-xs font-medium shadow-lg">
-          {toast}
+        <div role="status" className="fixed top-[max(1rem,env(safe-area-inset-top))] right-4 z-50 flex items-center gap-3 rounded-xl zw-card border-[var(--border-strong)] px-3 py-2 text-xs font-medium shadow-lg">
+          {toast.message}
+          {toast.restoreId && (
+            <button type="button" disabled={changingTrash} onClick={() => handleRestoreNote(toast.restoreId!)}
+              className="min-h-8 rounded-lg zw-btn-secondary px-2.5 disabled:opacity-50">
+              撤销
+            </button>
+          )}
         </div>
       )}
 
@@ -314,6 +383,7 @@ export function NotesPage({
           style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
         >
           <button
+            aria-pressed={subTab === 'notes'}
             onClick={() => {
               setSubTab('notes');
               setActiveSynthesis(null);
@@ -327,6 +397,7 @@ export function NotesPage({
             笔记 ({notes.length})
           </button>
           <button
+            aria-pressed={subTab === 'syntheses'}
             onClick={() => {
               setSubTab('syntheses');
               setActiveNote(null);
@@ -339,6 +410,25 @@ export function NotesPage({
           >
             <Layers className="w-3.5 h-3.5" />
             专题归纳 ({syntheses.length})
+          </button>
+          <button
+            type="button"
+            aria-pressed={subTab === 'trash'}
+            onClick={() => {
+              setSubTab('trash');
+              setActiveNote(null);
+              setActiveSynthesis(null);
+              setMultiSelectMode(false);
+              setCheckedIds([]);
+              fetchTrash();
+            }}
+            className="px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer flex items-center gap-1.5"
+            style={{
+              background: subTab === 'trash' ? 'var(--bg-card-solid)' : 'transparent',
+              color: subTab === 'trash' ? 'var(--text-primary)' : 'var(--text-muted)',
+            }}
+          >
+            <Trash2 className="size-3.5" /> 回收站{trash.length > 0 && ` (${trash.length})`}
           </button>
         </div>
 
@@ -355,18 +445,18 @@ export function NotesPage({
               {multiSelectMode ? '退出多选' : '多选归纳'}
             </button>
           )}
-          <button
+          {subTab !== 'trash' && <button
             onClick={onOpenImport}
             className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
             导入 / 新建
-          </button>
+          </button>}
         </div>
       </div>
 
       {/* Multi-select Bar */}
-      {multiSelectMode && (
+      {multiSelectMode && subTab === 'notes' && (
         <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 rounded-2xl zw-card">
           <span className="text-xs text-[var(--text-secondary)]">
             已选 <strong className="text-[var(--text-primary)]">{checkedIds.length}</strong> 篇笔记
@@ -393,7 +483,10 @@ export function NotesPage({
       )}
 
       {/* Split Workspace */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+      {subTab === 'trash' ? (
+        <TrashList notes={trash} loading={loadingTrash} error={trashError} pending={changingTrash}
+          onReload={fetchTrash} onRestore={handleRestoreNote} onDelete={handlePurgeNote} />
+      ) : <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
         {/* Left List */}
         <div className={`lg:col-span-4 space-y-3 ${showDetailMobile ? 'hidden lg:block' : 'block'}`}>
           {subTab === 'notes' ? (
@@ -614,6 +707,7 @@ export function NotesPage({
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setActiveSynthesis(null)}
+                      aria-label="返回专题列表"
                       className="lg:hidden p-1.5 rounded-lg zw-btn-secondary"
                     >
                       <ArrowLeft className="w-4 h-4" />
@@ -655,6 +749,7 @@ export function NotesPage({
                   <div className="flex items-start gap-2 min-w-0 flex-1">
                     <button
                       onClick={() => setActiveNote(null)}
+                      aria-label="返回笔记列表"
                       className="lg:hidden p-1.5 mt-0.5 rounded-lg zw-btn-secondary shrink-0"
                     >
                       <ArrowLeft className="w-4 h-4" />
@@ -688,8 +783,10 @@ export function NotesPage({
                     </button>
                     <button
                       onClick={handleDeleteNote}
-                      title="删除"
-                      className="p-2 rounded-lg text-[var(--text-muted)] hover:text-[var(--danger-fg)] cursor-pointer"
+                      title="移入回收站"
+                      aria-label="移入回收站"
+                      disabled={changingTrash}
+                      className="p-2 rounded-lg text-[var(--text-muted)] hover:text-[var(--danger-fg)] cursor-pointer disabled:opacity-50"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>
@@ -931,7 +1028,7 @@ export function NotesPage({
             </div>
           )}
         </div>
-      </div>
+      </div>}
     </div>
   );
 }

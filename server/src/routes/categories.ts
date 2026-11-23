@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { db, existingCategoryId, inTransaction, nowIso, reconcileLibraryReferences, uid } from '../db.js';
+import { nextNoteUpdatedAt } from '../shared/noteContent.js';
 
 export const categoriesRouter = Router();
 
@@ -8,7 +9,7 @@ categoriesRouter.get('/', (_req, res) => {
     .prepare(
       `SELECT c.*, COUNT(n.id) as note_count
        FROM categories c
-       LEFT JOIN notes n ON n.category_id = c.id
+       LEFT JOIN active_notes n ON n.category_id = c.id
        GROUP BY c.id
        ORDER BY c.created_at ASC`
     )
@@ -26,9 +27,9 @@ categoriesRouter.post('/', (req, res) => {
   const id = uid();
   const now = nowIso();
   db.prepare(
-    `INSERT INTO categories (id, name, parent_id, color, icon, description, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, String(name).trim(), parent, color, icon, description, now);
+    `INSERT INTO categories (id, name, parent_id, color, icon, description, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, String(name).trim(), parent, color, icon, description, now, now);
   const created = db.prepare(`SELECT *, 0 as note_count FROM categories WHERE id = ?`).get(id);
   res.status(201).json(created);
 });
@@ -40,12 +41,13 @@ categoriesRouter.put('/:id', (req, res) => {
   if (!existing) return res.status(404).json({ error: '分类不存在' });
 
   db.prepare(
-    `UPDATE categories SET name = ?, color = ?, icon = ?, description = ? WHERE id = ?`
+    `UPDATE categories SET name = ?, color = ?, icon = ?, description = ?, updated_at = ? WHERE id = ?`
   ).run(
     name?.trim() || existing.name,
     color || existing.color,
     icon || existing.icon,
     description ?? existing.description,
+    nextNoteUpdatedAt(existing.updated_at ?? existing.created_at),
     id
   );
   res.json(db.prepare(`SELECT * FROM categories WHERE id = ?`).get(id));

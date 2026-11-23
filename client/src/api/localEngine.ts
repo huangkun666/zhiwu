@@ -1,6 +1,9 @@
 import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt } from '../../../server/src/shared/noteContent';
-import { existingIds, questionSourceId, readIds } from '../../../server/src/shared/libraryReferences';
+import { existingIds, questionSourceId, readIds, tutorNoteSelection } from '../../../server/src/shared/libraryReferences';
 import { buildGraphLinks } from '../../../server/src/shared/graphLinks';
+import { describeBackup, mergeBackupSnapshots, normalizeBackupSnapshot, type BackupSnapshot } from '../../../server/src/shared/libraryBackup';
+import { createOfflineBackup, offlineSnapshot, readOfflineBackup } from './backupArchive';
+import { compressImageIfNeeded } from '../utils/imageCompress';
 import { loadPdf } from '../utils/pdf';
 import type {
   ActiveModelCapability,
@@ -18,6 +21,7 @@ import type {
   QuizQuestion,
   ReviewQueueItem,
   Synthesis,
+  TrashedNote,
   TutorMessage,
   TutorSession,
 } from '../types';
@@ -64,8 +68,33 @@ interface LocalDBState {
   studyLogs: StudyLogRecord[];
 }
 
-function noteIdsIn(state: LocalDBState, value: unknown): string[] {
-  return existingIds(value, new Set(state.notes.map(({ id }) => id)));
+function activeNotes(state: LocalDBState): Note[] {
+  return state.notes.filter((note) => !note.deleted_at);
+}
+
+function getActiveNote(state: LocalDBState, id: string | null | undefined): Note | undefined {
+  return state.notes.find((note) => note.id === id && !note.deleted_at);
+}
+
+function visibleNoteReference(state: LocalDBState, id: string | null | undefined) {
+  const note = getActiveNote(state, id);
+  return { note_id: note?.id ?? null, note_title: note?.title ?? null };
+}
+
+function noteIdsIn(state: LocalDBState, value: unknown, includeTrash = false): string[] {
+  const notes = includeTrash ? state.notes : activeNotes(state);
+  return existingIds(value, new Set(notes.map(({ id }) => id)));
+}
+
+function visibleQuiz(state: LocalDBState, quiz: Quiz): Quiz {
+  return {
+    ...quiz,
+    source_note_ids: noteIdsIn(state, quiz.source_note_ids),
+    questions: quiz.questions?.map((question) => ({
+      ...question,
+      note_id: getActiveNote(state, question.note_id)?.id ?? null,
+    })),
+  };
 }
 
 function requireCategory(state: LocalDBState, id?: string | null): string | null {
@@ -122,7 +151,8 @@ function restoreReviewedConceptLinks(state: LocalDBState) {
 }
 
 function lowestMastery(state: LocalDBState) {
-  return state.concepts.filter((concept) => concept.note_ids.length > 0)
+  const ids = new Set(activeNotes(state).map(({ id }) => id));
+  return state.concepts.filter((concept) => concept.note_ids.some((id) => ids.has(id)))
     .sort((a, b) => a.mastery_score - b.mastery_score || b.quiz_attempts - a.quiz_attempts);
 }
 
@@ -225,6 +255,8 @@ function createEmptyState(): LocalDBState {
 
 let cachedState: LocalDBState | null = null;
 let loadingState: Promise<LocalDBState> | null = null;
+let writes = Promise.resolve();
+let restoringLibrary: Promise<{ ok: boolean; notesCount: number }> | null = null;
 let useLocalStorage = false;
 
 function openIDB(): Promise<IDBDatabase> {
@@ -241,6 +273,10 @@ function openIDB(): Promise<IDBDatabase> {
 }
 
 function loadState(): Promise<LocalDBState> {
+  return restoringLibrary ? restoringLibrary.then(loadState, loadState) : readCurrentState();
+}
+
+function readCurrentState(): Promise<LocalDBState> {
   if (cachedState) return Promise.resolve(cachedState);
   return (loadingState ??= readState().finally(() => { loadingState = null; }));
 }
@@ -276,7 +312,17 @@ async function readState(): Promise<LocalDBState> {
   return cachedState;
 }
 
-async function saveState(state: LocalDBState): Promise<void> {
+function saveState(state: LocalDBState, previous = state): Promise<void> {
+  const write = writes.then(async () => {
+    if (cachedState !== previous) throw new Error('资料库已更新，请重试刚才的操作');
+    await writeState(state);
+    cachedState = state;
+  });
+  writes = write.catch(() => {});
+  return write;
+}
+
+async function writeState(state: LocalDBState): Promise<void> {
   try {
     if (useLocalStorage) {
       localStorage.setItem(STATE_KEY, JSON.stringify(state));
@@ -297,6 +343,32 @@ async function saveState(state: LocalDBState): Promise<void> {
     if (cachedState === state) cachedState = null;
     throw new Error('无法保存到设备，请检查可用的存储空间后重试', { cause: error });
   }
+}
+
+function applyOfflineBackup(incoming: BackupSnapshot) {
+  const previousRestore = restoringLibrary?.catch(() => {});
+  const restore = (async () => {
+    await previousRestore;
+    await writes;
+    const state = await readCurrentState();
+    const merged = mergeBackupSnapshots(offlineSnapshot(state), incoming);
+    const next = { ...merged.snapshot, settings: state.settings } as unknown as LocalDBState;
+    const time = nowIso();
+    for (const note of next.notes) {
+      note.source_type ||= 'markdown';
+      note.created_at ||= time;
+      note.updated_at ||= note.created_at;
+      note.word_count = countWords(noteStudyText(note));
+    }
+    reconcileLibraryReferences(next);
+    restoreReviewedConceptLinks(next);
+    await saveState(next, state);
+    return { ok: true, notesCount: merged.notesCount };
+  })().finally(() => {
+    if (restoringLibrary === restore) restoringLibrary = null;
+  });
+  restoringLibrary = restore;
+  return restore;
 }
 
 // --- Helpers ---
@@ -634,7 +706,14 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
   if (ext === '.md' || ext === '.markdown' || ext === '.txt' || file.type.startsWith('text/')) {
     const text = await file.text();
     const h1 = text.match(/^#\s+(.+)$/m);
-    return { title: h1 ? h1[1].trim() : baseTitle, content: text, sourceType: ext === '.txt' ? 'text' : 'markdown' };
+    const sourceType = ext === '.txt' ? 'text' : 'markdown';
+    const mime = sourceType === 'text' ? 'text/plain' : 'text/markdown';
+    return {
+      title: h1 ? h1[1].trim() : baseTitle,
+      content: text,
+      sourceType,
+      attachmentDataUrl: `data:${mime};base64,${await fileToBase64(file)}`,
+    };
   }
 
   const wordMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
@@ -694,8 +773,11 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
     }
     const provider = requireActiveProvider(settings);
     const base64 = await fileToBase64(file);
-    const mime = file.type.startsWith('image/') ? file.type : 'image/jpeg';
-    const ocrText = cleanOcrMarkdown(await callVisionDirect(provider, base64, mime));
+    const mime = file.type.startsWith('image/') ? file.type
+      : ext === '.jpg' ? 'image/jpeg' : `image/${ext.slice(1)}`;
+    const ocrImage = await compressImageIfNeeded(file);
+    const ocrText = cleanOcrMarkdown(await callVisionDirect(provider,
+      ocrImage === file ? base64 : await fileToBase64(ocrImage), ocrImage.type || mime));
     const dataUrl = `data:${mime};base64,${base64}`;
     // Store ONLY pure recognized Markdown in content (keep base64 image cleanly in attachment_path so AI slicing never chops off the text!)
     return {
@@ -706,7 +788,12 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
     };
   }
 
-  return { title: baseTitle, content: await file.text(), sourceType: 'text' };
+  return {
+    title: baseTitle,
+    content: await file.text(),
+    sourceType: 'text',
+    attachmentDataUrl: `data:text/plain;base64,${await fileToBase64(file)}`,
+  };
 }
 
 function enrichNote(state: LocalDBState, n: Note): Note {
@@ -715,7 +802,7 @@ function enrichNote(state: LocalDBState, n: Note): Note {
 }
 
 function requireNote(state: LocalDBState, id: string): Note {
-  const note = state.notes.find((item) => item.id === id);
+  const note = getActiveNote(state, id);
   if (!note) throw new Error('笔记不存在');
   return note;
 }
@@ -735,6 +822,7 @@ function normalizeChoiceAnswer(ans: string): string {
 export const localApi = {
   async getDashboard(): Promise<DashboardData> {
     const s = await loadState();
+    const notes = activeNotes(s);
     const now = nowIso();
     const today = todayKey();
     const dueFlashcards = s.flashcards.filter((f) => f.next_review_at <= now).length;
@@ -773,7 +861,7 @@ export const localApi = {
       .map(([date, arr]) => ({ date, accuracy: Math.round(arr.reduce((x, y) => x + y, 0) / arr.length) }));
 
     const subjectMastery = s.categories.flatMap((cat) => {
-      const noteIds = new Set(s.notes.filter((n) => n.category_id === cat.id).map(({ id }) => id));
+      const noteIds = new Set(notes.filter((n) => n.category_id === cat.id).map(({ id }) => id));
       if (noteIds.size === 0) return [];
       const cons = s.concepts.filter((c) => c.note_ids.some((id) => noteIds.has(id)));
       const mastery = cons.length
@@ -792,7 +880,7 @@ export const localApi = {
         quiz_correct: c.quiz_correct,
       }));
 
-    const recentNotes = [...s.notes]
+    const recentNotes = notes
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
       .slice(0, 5)
       .map((n) => {
@@ -810,8 +898,8 @@ export const localApi = {
 
     return {
       stats: {
-        totalNotes: s.notes.length,
-        summarizedNotes: s.notes.filter((n) => Boolean(n.summary)).length,
+        totalNotes: notes.length,
+        summarizedNotes: notes.filter((n) => Boolean(n.summary)).length,
         totalFlashcards: s.flashcards.length,
         dueFlashcards,
         totalMistakes: s.mistakes.length,
@@ -952,9 +1040,10 @@ export const localApi = {
 
   async getCategories(): Promise<Category[]> {
     const s = await loadState();
+    const notes = activeNotes(s);
     return s.categories.map((c) => ({
       ...c,
-      note_count: s.notes.filter((n) => n.category_id === c.id).length,
+      note_count: notes.filter((n) => n.category_id === c.id).length,
     }));
   },
 
@@ -984,7 +1073,7 @@ export const localApi = {
 
   async getNotes(params?: { q?: string; categoryId?: string; tag?: string; sourceType?: string; hasSummary?: string }): Promise<Note[]> {
     const s = await loadState();
-    let list = s.notes.map((n) => enrichNote(s, n));
+    let list = activeNotes(s).map((n) => enrichNote(s, n));
     if (params?.q) {
       const q = params.q.toLowerCase();
       list = list.filter(
@@ -1012,7 +1101,7 @@ export const localApi = {
   async getTags(): Promise<{ name: string; count: number }[]> {
     const s = await loadState();
     const map: Record<string, number> = {};
-    for (const n of s.notes) for (const t of n.tags) map[t] = (map[t] || 0) + 1;
+    for (const n of activeNotes(s)) for (const t of n.tags) map[t] = (map[t] || 0) + 1;
     return Object.entries(map)
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count);
@@ -1087,7 +1176,40 @@ export const localApi = {
 
   async deleteNote(id: string) {
     const s = await loadState();
-    requireNote(s, id);
+    const note = s.notes.find((item) => item.id === id);
+    if (!note) throw new Error('笔记不存在');
+    if (!note.deleted_at) {
+      note.deleted_at = nowIso();
+      note.updated_at = nextNoteUpdatedAt(note.updated_at);
+      await saveState(s);
+    }
+    return { ok: true };
+  },
+
+  async getTrashedNotes(): Promise<TrashedNote[]> {
+    const s = await loadState();
+    return s.notes.flatMap(({ id, title, source_type, source_filename, word_count, category_id, deleted_at }) => {
+      if (!deleted_at) return [];
+      const category_name = s.categories.find((category) => category.id === category_id)?.name ?? null;
+      return [{ id, title, source_type, source_filename, word_count, category_name, deleted_at }];
+    }).sort((a, b) => b.deleted_at.localeCompare(a.deleted_at));
+  },
+
+  async restoreNote(id: string) {
+    const s = await loadState();
+    const note = s.notes.find((item) => item.id === id);
+    if (!note) throw new Error('回收站中找不到这篇笔记');
+    if (note.deleted_at) {
+      note.deleted_at = null;
+      note.updated_at = nextNoteUpdatedAt(note.updated_at);
+      await saveState(s);
+    }
+    return { ok: true };
+  },
+
+  async permanentlyDeleteNote(id: string) {
+    const s = await loadState();
+    if (!s.notes.some((note) => note.id === id && note.deleted_at)) throw new Error('回收站中找不到这篇笔记');
     s.notes = s.notes.filter((x) => x.id !== id);
     reconcileLibraryReferences(s);
     await saveState(s);
@@ -1219,11 +1341,12 @@ export const localApi = {
 
   async synthesizeNotes(payload: { noteIds?: string[]; categoryId?: string | null; title?: string }): Promise<Synthesis> {
     const initial = await loadState();
+    const notes = activeNotes(initial);
     const requested = readIds(payload.noteIds);
     const target = requested.length
-      ? initial.notes.filter((n) => requested.includes(n.id))
+      ? notes.filter((n) => requested.includes(n.id))
       : payload.categoryId
-      ? initial.notes.filter((n) => n.category_id === payload.categoryId).slice(0, 10)
+      ? notes.filter((n) => n.category_id === payload.categoryId).slice(0, 10)
       : [];
     if (!target.length) throw new Error('请至少选择 1 篇笔记进行归纳');
     const provider = requireActiveProvider(initial.settings);
@@ -1255,7 +1378,8 @@ export const localApi = {
   },
 
   async getSyntheses(): Promise<Synthesis[]> {
-    return (await loadState()).syntheses;
+    const s = await loadState();
+    return s.syntheses.map((report) => ({ ...report, note_ids: noteIdsIn(s, report.note_ids) }));
   },
 
   async deleteSynthesis(id: string) {
@@ -1266,13 +1390,15 @@ export const localApi = {
   },
 
   async getQuizzes(): Promise<Quiz[]> {
-    return (await loadState()).quizzes;
+    const s = await loadState();
+    return s.quizzes.map((quiz) => visibleQuiz(s, quiz));
   },
 
   async getQuiz(id: string): Promise<Quiz> {
-    const q = (await loadState()).quizzes.find((x) => x.id === id);
+    const s = await loadState();
+    const q = s.quizzes.find((x) => x.id === id);
     if (!q) throw new Error('测验不存在');
-    return q;
+    return visibleQuiz(s, q);
   },
 
   async generateQuiz(payload: {
@@ -1286,6 +1412,7 @@ export const localApi = {
     title?: string;
   }): Promise<Quiz> {
     const initial = await loadState();
+    const notes = activeNotes(initial);
     const requested = readIds(payload.noteIds);
     let sourceNotes: Note[] = [];
     let focus = readIds(payload.focusConcepts);
@@ -1294,16 +1421,16 @@ export const localApi = {
       const weak = lowestMastery(initial).filter((concept) => !focus.length || focus.includes(concept.name)).slice(0, 5);
       focus = weak.map((concept) => concept.name);
       const ids = new Set(weak.flatMap((w) => w.note_ids));
-      sourceNotes = initial.notes.filter((n) => ids.has(n.id)).slice(0, 5);
+      sourceNotes = notes.filter((n) => ids.has(n.id)).slice(0, 5);
       missingSource = '暂无可用于专项突破的关联笔记';
     } else if (requested.length) {
-      sourceNotes = initial.notes.filter((n) => requested.includes(n.id));
+      sourceNotes = notes.filter((n) => requested.includes(n.id));
       missingSource = '所选笔记已不存在，请重新选择';
     } else if (payload.categoryId) {
-      sourceNotes = initial.notes.filter((n) => n.category_id === payload.categoryId).slice(0, 5);
+      sourceNotes = notes.filter((n) => n.category_id === payload.categoryId).slice(0, 5);
       missingSource = '所选分类没有可用笔记，请重新选择';
     } else {
-      sourceNotes = initial.notes.slice(0, 4);
+      sourceNotes = notes.slice(0, 4);
     }
     if (!sourceNotes.length) throw new Error(missingSource);
     const provider = requireActiveProvider(initial.settings);
@@ -1371,7 +1498,7 @@ export const localApi = {
     const initial = await loadState();
     const original = initial.quizzes.find((x) => x.id === id);
     if (!original?.questions) throw new Error('测验不存在');
-    if (original.status === 'completed') return { ...original, mistakesAdded: 0 };
+    if (original.status === 'completed') return { ...visibleQuiz(initial, original), mistakesAdded: 0 };
     const grades = new Map<string, { answer: string; isCorrect: boolean; score: number; feedback: string }>();
 
     for (const q of original.questions) {
@@ -1415,7 +1542,7 @@ export const localApi = {
     const s = await loadState();
     const quiz = s.quizzes.find((x) => x.id === id);
     if (!quiz?.questions) throw new Error('测验已被删除');
-    if (quiz.status === 'completed') return { ...quiz, mistakesAdded: 0 };
+    if (quiz.status === 'completed') return { ...visibleQuiz(s, quiz), mistakesAdded: 0 };
     let total = 0;
     let mistakesAdded = 0;
     const now = nowIso();
@@ -1437,8 +1564,9 @@ export const localApi = {
           existing.wrong_answer = ua || '未作答';
           existing.status = 'unmastered';
           existing.next_review_at = now;
+          existing.updated_at = now;
         } else {
-          const noteTitle = s.notes.find((n) => n.id === q.note_id)?.title || null;
+          const noteTitle = getActiveNote(s, q.note_id)?.title ?? null;
           s.mistakes.unshift({
             id: uid(),
             question_id: q.id,
@@ -1472,7 +1600,7 @@ export const localApi = {
     quiz.mistakesAdded = mistakesAdded;
     logStudy(s, 'quiz_complete', quiz.id, quiz.score);
     await saveState(s);
-    return quiz;
+    return visibleQuiz(s, quiz);
   },
 
   async deleteQuiz(id: string) {
@@ -1492,7 +1620,7 @@ export const localApi = {
     if (params?.dueOnly) list = list.filter((m) => m.status !== 'mastered' && m.next_review_at <= now);
     return list.map((m) => ({
       ...m,
-      note_title: s.notes.find((note) => note.id === m.note_id)?.title ?? null,
+      ...visibleNoteReference(s, m.note_id),
       interval_previews: previewIntervals(m.ease_factor, m.interval_days, m.repetitions),
     }));
   },
@@ -1500,7 +1628,7 @@ export const localApi = {
   async bookmarkMistake(questionId: string): Promise<Mistake> {
     const s = await loadState();
     const existing = s.mistakes.find((m) => m.question_id === questionId);
-    if (existing) return existing;
+    if (existing) return { ...existing, ...visibleNoteReference(s, existing.note_id) };
     let found: QuizQuestion | undefined;
     for (const qz of s.quizzes) {
       found = qz.questions?.find((x) => x.id === questionId);
@@ -1512,7 +1640,7 @@ export const localApi = {
       id: uid(),
       question_id: found.id,
       note_id: found.note_id || null,
-      note_title: s.notes.find((n) => n.id === found!.note_id)?.title || null,
+      note_title: getActiveNote(s, found.note_id)?.title ?? null,
       concept_name: found.concept_name || '收藏题目',
       type: found.type,
       stem: found.stem,
@@ -1532,7 +1660,7 @@ export const localApi = {
     };
     s.mistakes.unshift(m);
     await saveState(s);
-    return m;
+    return { ...m, ...visibleNoteReference(s, m.note_id) };
   },
 
   async updateMistake(id: string, payload: { userReflection?: string; status?: string }): Promise<Mistake> {
@@ -1541,21 +1669,27 @@ export const localApi = {
     if (!m) throw new Error('错题不存在');
     if (payload.userReflection !== undefined) m.user_reflection = payload.userReflection;
     if (payload.status !== undefined) m.status = payload.status as Mistake['status'];
+    m.updated_at = nowIso();
     await saveState(s);
-    return m;
+    return { ...m, ...visibleNoteReference(s, m.note_id) };
   },
 
   async diagnoseMistake(id: string): Promise<Mistake> {
+    const initial = await loadState();
+    const original = initial.mistakes.find((x) => x.id === id);
+    if (!original) throw new Error('错题不存在');
+    const provider = requireActiveProvider(initial.settings);
+    const diagnosis = await callLLMDirect(provider, [
+      { role: 'system', content: '你是错题诊断专家。用 Markdown 输出：1. 错误根因诊断 2. 核心原理重构 3. 秒杀记忆锚点。' },
+      { role: 'user', content: `考点：${original.concept_name}\n题干：${original.stem}\n正确：${original.correct_answer}\n我的错答：${original.wrong_answer}` },
+    ]);
     const s = await loadState();
     const m = s.mistakes.find((x) => x.id === id);
     if (!m) throw new Error('错题不存在');
-    const provider = requireActiveProvider(s.settings);
-    m.ai_diagnosis = await callLLMDirect(provider, [
-      { role: 'system', content: '你是错题诊断专家。用 Markdown 输出：1. 错误根因诊断 2. 核心原理重构 3. 秒杀记忆锚点。' },
-      { role: 'user', content: `考点：${m.concept_name}\n题干：${m.stem}\n正确：${m.correct_answer}\n我的错答：${m.wrong_answer}` },
-    ]);
+    m.ai_diagnosis = diagnosis;
+    m.updated_at = nowIso();
     await saveState(s);
-    return m;
+    return { ...m, ...visibleNoteReference(s, m.note_id) };
   },
 
   async generateVariant(id: string) {
@@ -1596,11 +1730,15 @@ export const localApi = {
     m.repetitions = next.repetitions;
     m.next_review_at = next.nextReviewAt;
     m.last_reviewed_at = nowIso();
+    m.updated_at = m.last_reviewed_at;
     m.status = rating === 1 ? 'unmastered' : rating === 4 || next.repetitions >= 3 ? 'mastered' : 'reviewing';
     if (m.concept_name) updateConceptMastery(s, m.concept_name, rating >= 3, m.note_id);
     logStudy(s, 'mistake_review', m.id, rating >= 3 ? 1 : 0);
     await saveState(s);
-    return { mistake: { ...m, interval_previews: previewIntervals(m.ease_factor, m.interval_days, m.repetitions) }, nextLabel: next.label };
+    return {
+      mistake: { ...m, ...visibleNoteReference(s, m.note_id), interval_previews: previewIntervals(m.ease_factor, m.interval_days, m.repetitions) },
+      nextLabel: next.label,
+    };
   },
 
   async deleteMistake(id: string) {
@@ -1614,11 +1752,12 @@ export const localApi = {
     const s = await loadState();
     const now = nowIso();
     let list = s.flashcards;
+    if (params?.noteId && !getActiveNote(s, params.noteId)) return [];
     if (params?.noteId) list = list.filter((f) => f.note_id === params.noteId);
     if (params?.dueOnly) list = list.filter((f) => f.next_review_at <= now);
     return list.map((f) => ({
       ...f,
-      note_title: s.notes.find((n) => n.id === f.note_id)?.title || null,
+      ...visibleNoteReference(s, f.note_id),
       interval_previews: previewIntervals(f.ease_factor, f.interval_days, f.repetitions),
     }));
   },
@@ -1631,8 +1770,7 @@ export const localApi = {
       .map((m) => ({
         itemType: 'mistake',
         id: m.id,
-        note_id: m.note_id,
-        note_title: s.notes.find((note) => note.id === m.note_id)?.title ?? null,
+        ...visibleNoteReference(s, m.note_id),
         concept_name: m.concept_name,
         type: m.type,
         stem: m.stem,
@@ -1648,8 +1786,7 @@ export const localApi = {
       .map((f) => ({
         itemType: 'flashcard',
         id: f.id,
-        note_id: f.note_id,
-        note_title: s.notes.find((n) => n.id === f.note_id)?.title || null,
+        ...visibleNoteReference(s, f.note_id),
         concept_name: f.concept_name,
         front: f.front,
         back: f.back,
@@ -1732,10 +1869,14 @@ export const localApi = {
     c.repetitions = next.repetitions;
     c.next_review_at = next.nextReviewAt;
     c.last_reviewed_at = nowIso();
+    c.updated_at = c.last_reviewed_at;
     if (c.concept_name) updateConceptMastery(s, c.concept_name, rating >= 3, c.note_id);
     logStudy(s, 'flashcard_review', c.id, rating >= 3 ? 1 : 0);
     await saveState(s);
-    return { card: { ...c, interval_previews: previewIntervals(c.ease_factor, c.interval_days, c.repetitions) }, nextLabel: next.label };
+    return {
+      card: { ...c, ...visibleNoteReference(s, c.note_id), interval_previews: previewIntervals(c.ease_factor, c.interval_days, c.repetitions) },
+      nextLabel: next.label,
+    };
   },
 
   async deleteFlashcard(id: string) {
@@ -1747,7 +1888,8 @@ export const localApi = {
 
   async getGraph(): Promise<{ nodes: GraphNode[]; links: GraphLink[]; weakConcepts: GraphNode[] }> {
     const s = await loadState();
-    const notes = new Map(s.notes.map((note) => [note.id, note]));
+    const active = activeNotes(s);
+    const notes = new Map(active.map((note) => [note.id, note]));
     const nodes: GraphNode[] = s.concepts.flatMap((c) => {
       const linkedNotes = c.note_ids.map((id) => notes.get(id)).filter((note): note is Note => Boolean(note));
       if (linkedNotes.length === 0) return [];
@@ -1778,7 +1920,7 @@ export const localApi = {
         conceptsByNote.set(id, concepts);
       }
     }
-    const links = buildGraphLinks([...s.notes]
+    const links = buildGraphLinks(active
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id))
       .map((note) => ({ concepts: conceptsByNote.get(note.id) || [], summary: note.summary })));
     const weakConcepts = [...nodes].sort((a, b) => a.mastery_score - b.mastery_score || b.active_mistakes - a.active_mistakes).slice(0, 12);
@@ -1786,7 +1928,8 @@ export const localApi = {
   },
 
   async getTutorSessions(): Promise<TutorSession[]> {
-    return (await loadState()).tutorSessions;
+    const s = await loadState();
+    return s.tutorSessions.map((session) => ({ ...session, note_ids: noteIdsIn(s, session.note_ids) }));
   },
 
   async createTutorSession(payload: { title?: string; mode: 'qa' | 'feynman'; noteIds?: string[]; initialPrompt?: string }): Promise<TutorSession> {
@@ -1821,7 +1964,7 @@ export const localApi = {
     const s = await loadState();
     const session = s.tutorSessions.find((x) => x.id === sessionId);
     if (!session) throw new Error('会话不存在');
-    return { session, messages: s.tutorMessages[sessionId] || [] };
+    return { session: { ...session, note_ids: noteIdsIn(s, session.note_ids) }, messages: s.tutorMessages[sessionId] || [] };
   },
 
   async sendTutorMessage(sessionId: string, payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' }) {
@@ -1831,10 +1974,12 @@ export const localApi = {
     const provider = requireActiveProvider(initial.settings);
     const requested = readIds(payload.noteIds ?? source.note_ids);
     const noteIds = noteIdsIn(initial, requested);
+    const selectNoteIds = tutorNoteSelection(source.note_ids, noteIdsIn(initial, source.note_ids), noteIds);
     const mode = payload.mode || source.mode;
+    const available = activeNotes(initial);
     const notes = requested.length
-      ? initial.notes.filter((n) => noteIds.includes(n.id))
-      : [...initial.notes].sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 4);
+      ? available.filter((n) => noteIds.includes(n.id))
+      : available.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 4);
     const ctx = notes.map((n, i) => `【笔记${i + 1}：${n.title}】\n${stripInlineImages(noteStudyText(n)).slice(0, 3500)}`).join('\n\n');
     const sys =
       mode === 'feynman'
@@ -1848,7 +1993,7 @@ export const localApi = {
     const userMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'user', content: payload.message, created_at: nowIso() };
     const assistantMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: reply, created_at: nowIso() };
     (s.tutorMessages[sessionId] ||= []).push(userMessage, assistantMessage);
-    session.note_ids = noteIdsIn(s, noteIds);
+    session.note_ids = noteIdsIn(s, selectNoteIds(session.note_ids), true);
     session.mode = mode;
     session.updated_at = nowIso();
     logStudy(s, 'tutor_chat', sessionId);
@@ -1956,44 +2101,24 @@ export const localApi = {
   // JSON Backup Export & Import for Standalone Android APK
   async exportJsonBackup(): Promise<string> {
     const s = await loadState();
-    return JSON.stringify(s, null, 2);
+    return JSON.stringify(normalizeBackupSnapshot(s), null, 2);
   },
 
   async importJsonBackup(jsonText: string) {
-    const parsed = JSON.parse(jsonText) as Partial<LocalDBState>;
-    if (!parsed || !Array.isArray(parsed.notes)) {
-      throw new Error('备份文件格式无效，请选择知悟导出的 JSON 备份文件。');
-    }
-    const current = await loadState();
-    let notesMerged = 0;
+    return applyOfflineBackup(offlineSnapshot(JSON.parse(jsonText)));
+  },
 
-    // Smart merge by ID so mobile & desktop notes never clobber each other
-    const mergeById = <T extends { id: string; updated_at?: string }>(existing: T[], incoming: T[] = []) => {
-      const map = new Map(existing.map((x) => [x.id, x]));
-      for (const item of incoming) {
-        if (!item?.id) continue;
-        const prev = map.get(item.id);
-        if (!prev || (item.updated_at && prev.updated_at && item.updated_at > prev.updated_at)) {
-          map.set(item.id, item);
-          if (existing === (current.notes as unknown as T[])) notesMerged++;
-        }
-      }
-      return Array.from(map.values());
-    };
+  async exportBackup() {
+    return createOfflineBackup(await loadState());
+  },
 
-    current.categories = mergeById(current.categories, parsed.categories || []);
-    current.notes = mergeById(current.notes, parsed.notes || []);
-    current.syntheses = mergeById(current.syntheses, parsed.syntheses || []);
-    current.concepts = mergeById(current.concepts, parsed.concepts || []);
-    current.conceptLinks = mergeById(current.conceptLinks, parsed.conceptLinks || []);
-    current.flashcards = mergeById(current.flashcards, parsed.flashcards || []);
-    current.mistakes = mergeById(current.mistakes, parsed.mistakes || []);
-    current.studyLogs = mergeById(current.studyLogs, parsed.studyLogs || []);
+  async previewBackup(file: File) {
+    const incoming = await readOfflineBackup(file, false);
+    return describeBackup(incoming.snapshot, offlineSnapshot(await loadState()), incoming);
+  },
 
-    reconcileLibraryReferences(current);
-    restoreReviewedConceptLinks(current);
-
-    await saveState(current);
-    return { ok: true, notesCount: notesMerged || parsed.notes.length };
+  async restoreBackup(file: File) {
+    const { snapshot } = await readOfflineBackup(file, true);
+    return applyOfflineBackup(snapshot);
   },
 };

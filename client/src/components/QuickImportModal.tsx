@@ -13,7 +13,6 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api/client';
-import { compressImageIfNeeded } from '../utils/imageCompress';
 import { QrScannerModal } from './QrScannerModal';
 import type { ActiveModelCapability, Category, Note } from '../types';
 
@@ -149,10 +148,8 @@ export function QuickImportModal({
           setLoading(false);
           return;
         }
-        // Automatically compress large mobile photos for 5x faster OCR & 90% storage savings
-        setStatusText('正在优化文件并解析导入...');
-        const processedFiles = await Promise.all(selectedFiles.map((f) => compressImageIfNeeded(f)));
-        const res = await api.importFiles(processedFiles, categoryId || null, tags);
+        setStatusText('正在解析并保存原文件…');
+        const res = await api.importFiles(selectedFiles, categoryId || null, tags);
         createdNotes = res.imported;
         if (res.warnings?.length) setWarnings(res.warnings);
       }
@@ -347,7 +344,7 @@ export function QuickImportModal({
                 <Upload className="w-6 h-6 mx-auto text-[var(--text-muted)] mb-2" />
                 <p className="text-xs font-medium">点击选择或将笔记拖放到这里</p>
                 <p className="text-[11px] text-[var(--text-muted)] mt-1">
-                  .md / .txt / .pdf / .docx{supportsVision ? ' / 图片（自动压缩）' : ''}
+                  .md / .txt / .pdf / .docx{supportsVision ? ' / 图片' : ''}
                 </p>
               </div>
 

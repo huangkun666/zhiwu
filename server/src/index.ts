@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { initDatabase, PROJECT_ROOT, UPLOADS_DIR } from './db.js';
 import { categoriesRouter } from './routes/categories.js';
+import { backupsRouter } from './routes/backups.js';
 import { notesRouter } from './routes/notes.js';
 import { quizzesRouter } from './routes/quizzes.js';
 import { mistakesRouter } from './routes/mistakes.js';
@@ -29,6 +30,7 @@ app.use('/uploads', express.static(UPLOADS_DIR, {
 // API routes
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', app: '知悟 (Zhiwu)' }));
 app.use('/api/dashboard', dashboardRouter);
+app.use('/api/backups', backupsRouter);
 app.use('/api/categories', categoriesRouter);
 app.use('/api/notes', notesRouter);
 app.use('/api/quizzes', quizzesRouter);

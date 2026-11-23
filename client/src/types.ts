@@ -17,6 +17,7 @@ export interface Category {
   description?: string;
   note_count?: number;
   created_at: string;
+  updated_at?: string | null;
 }
 
 export interface NoteSummary {
@@ -48,7 +49,12 @@ export interface Note {
   is_pinned: boolean;
   created_at: string;
   updated_at: string;
+  deleted_at?: string | null;
 }
+
+export type TrashedNote = Pick<Note, 'id' | 'title' | 'source_type' | 'source_filename' | 'word_count' | 'category_name'> & {
+  deleted_at: string;
+};
 
 export interface Synthesis {
   id: string;
@@ -113,6 +119,7 @@ export interface Mistake {
   next_review_at: string;
   last_reviewed_at?: string | null;
   created_at: string;
+  updated_at?: string;
   interval_previews?: Record<1 | 2 | 3 | 4, string>;
 }
 
@@ -131,6 +138,7 @@ export interface Flashcard {
   next_review_at: string;
   last_reviewed_at?: string | null;
   created_at: string;
+  updated_at?: string;
   interval_previews?: Record<1 | 2 | 3 | 4, string>;
 }
 

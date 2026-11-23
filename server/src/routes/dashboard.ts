@@ -8,8 +8,8 @@ dashboardRouter.get('/', (_req, res) => {
   const now = nowIso();
   const today = todayKey();
 
-  const totalNotes = (db.prepare(`SELECT COUNT(*) as c FROM notes`).get() as any).c;
-  const summarizedNotes = (db.prepare(`SELECT COUNT(*) as c FROM notes WHERE summary_json IS NOT NULL`).get() as any).c;
+  const totalNotes = (db.prepare(`SELECT COUNT(*) as c FROM active_notes`).get() as any).c;
+  const summarizedNotes = (db.prepare(`SELECT COUNT(*) as c FROM active_notes WHERE summary_json IS NOT NULL`).get() as any).c;
   const totalFlashcards = (db.prepare(`SELECT COUNT(*) as c FROM flashcards`).get() as any).c;
   const dueFlashcards = (
     db.prepare(`SELECT COUNT(*) as c FROM flashcards WHERE next_review_at <= ?`).get(now) as any
@@ -79,9 +79,9 @@ dashboardRouter.get('/', (_req, res) => {
   const subjectMastery = db
     .prepare(
       `WITH note_counts AS (
-        SELECT category_id, COUNT(*) AS note_count FROM notes GROUP BY category_id
+        SELECT category_id, COUNT(*) AS note_count FROM active_notes GROUP BY category_id
        ), category_concepts AS (
-        SELECT DISTINCT n.category_id, nc.concept_id FROM note_concepts nc INNER JOIN notes n ON n.id = nc.note_id
+        SELECT DISTINCT n.category_id, nc.concept_id FROM note_concepts nc INNER JOIN active_notes n ON n.id = nc.note_id
        ), scores AS (
         SELECT cc.category_id, ROUND(AVG(c.mastery_score) * 100) AS mastery
         FROM category_concepts cc INNER JOIN concepts c ON c.id = cc.concept_id GROUP BY cc.category_id
@@ -108,7 +108,7 @@ dashboardRouter.get('/', (_req, res) => {
     .prepare(
       `SELECT n.id, n.title, n.source_type, n.updated_at, n.summary_json IS NOT NULL as has_summary,
               c.name as category_name, c.color as category_color
-       FROM notes n
+       FROM active_notes n
        LEFT JOIN categories c ON n.category_id = c.id
        ORDER BY n.updated_at DESC
        LIMIT 5`

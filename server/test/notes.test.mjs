@@ -168,7 +168,7 @@ test('JSON backups keep imported source and individual chat excerpts', async () 
   assert.equal((await request(`notes?q=${encodeURIComponent('原文查找词')}`))[0].id, note.id);
 });
 
-test('deleting a source note removes live references and preserves shared concepts and saved work', async () => {
+test('trashing a source note hides its live references and restoration brings them back', async () => {
   const first = await request('categories', { method: 'POST', body: { name: '已移除的学科' }, status: 201 });
   const second = await request('categories', { method: 'POST', body: { name: '仍有笔记的学科' }, status: 201 });
   const removed = await request('notes', { method: 'POST', body: { title: '删除测试', categoryId: first.id }, status: 201 });
@@ -189,9 +189,22 @@ test('deleting a source note removes live references and preserves shared concep
     .run(JSON.stringify([removed.id, retained.id]), first.id, time, time);
   db.prepare(`INSERT INTO quiz_questions (id, quiz_id, note_id, type, stem, correct_answer) VALUES ('reference-question', 'reference-quiz', ?, 'single', '错题题干', 'A')`).run(removed.id);
   const mistake = await request('mistakes/bookmark', { method: 'POST', body: { questionId: 'reference-question' }, status: 201 });
-  const card = await request('flashcards', { method: 'POST', body: { noteId: removed.id, categoryId: first.id, front: '闪卡问题', back: '答案' }, status: 201 });
+  const card = await request('flashcards', { method: 'POST', body: {
+    noteId: removed.id, categoryId: first.id, conceptName: '独有知识点', front: '闪卡问题', back: '答案',
+  }, status: 201 });
 
   await request(`notes/${removed.id}`, { method: 'DELETE' });
+  assert.ok(db.prepare(`SELECT id FROM notes WHERE id = ?`).get(removed.id));
+  const trash = await request('notes/trash');
+  const trashed = trash.find(({ id }) => id === removed.id);
+  assert.equal(trashed.title, '删除测试');
+  await request(`notes/${removed.id}`, { method: 'DELETE' });
+  assert.deepEqual((await request('notes/trash')).find(({ id }) => id === removed.id), trashed);
+  await request(`notes/${removed.id}`, { status: 404 });
+  await request(`notes/${removed.id}`, { method: 'PUT', body: { title: '回收站内不可修改' }, status: 404 });
+  await request('quizzes/generate', { method: 'POST', body: { noteIds: [removed.id] }, status: 400 });
+  await request('flashcards/generate', { method: 'POST', body: { noteId: removed.id }, status: 404 });
+  await request('notes/synthesize', { method: 'POST', body: { noteIds: [removed.id] }, status: 400 });
   const dashboard = await request('dashboard');
   assert.equal(dashboard.subjectMastery.some(({ id }) => id === first.id), false);
   assert.equal(dashboard.subjectMastery.find(({ id }) => id === second.id).mastery, 50);
@@ -209,7 +222,37 @@ test('deleting a source note removes live references and preserves shared concep
   assert.equal(quiz.questions[0].note_id, null);
   assert.equal((await request('mistakes')).find(({ id }) => id === mistake.id).note_id, null);
   assert.equal((await request('flashcards')).find(({ id }) => id === card.id).note_id, null);
-  assert.equal((await request('flashcards/queue')).items.some(({ id }) => id === mistake.id), true);
+  assert.equal((await request(`flashcards?noteId=${removed.id}`)).length, 0);
+  const queue = (await request('flashcards/queue')).items;
+  assert.equal(queue.find(({ id }) => id === mistake.id).note_id, null);
+  assert.equal(queue.find(({ id }) => id === card.id).note_id, null);
+  const review = await request(`flashcards/${card.id}/review`, { method: 'POST', body: { rating: 3 } });
+  assert.equal(review.card.note_id, null);
+  assert.equal(review.card.repetitions, 1);
+
+  await request(`notes/trash/${removed.id}/restore`, { method: 'POST' });
+  const restored = await request(`notes/${removed.id}`);
+  assert.equal(restored.id, removed.id);
+  assert.equal(restored.deleted_at, null);
+  assert.ok(restored.updated_at > removed.updated_at);
+  await request(`notes/trash/${removed.id}/restore`, { method: 'POST' });
+  assert.equal((await request(`notes/${removed.id}`)).updated_at, restored.updated_at);
+  assert.deepEqual((await request(`tutor/sessions/${session.id}/messages`)).session.note_ids, [removed.id, retained.id]);
+  assert.deepEqual((await request('notes/syntheses/list')).find(({ id }) => id === 'reference-report').note_ids, [removed.id, retained.id]);
+  assert.equal((await request('quizzes/reference-quiz')).questions[0].note_id, removed.id);
+  assert.equal((await request('mistakes')).find(({ id }) => id === mistake.id).note_id, removed.id);
+  const restoredCard = (await request('flashcards')).find(({ id }) => id === card.id);
+  assert.equal(restoredCard.note_id, removed.id);
+  assert.equal(restoredCard.next_review_at, review.card.next_review_at);
+  assert.equal((await request('graph')).nodes.find(({ id }) => id === 'shared-concept').note_count, 2);
+
+  await request(`notes/trash/${removed.id}`, { method: 'DELETE', status: 404 });
+  await request(`notes/${removed.id}`, { method: 'DELETE' });
+  await request(`notes/trash/${removed.id}`, { method: 'DELETE' });
+  assert.equal(db.prepare(`SELECT id FROM notes WHERE id = ?`).get(removed.id), undefined);
+  assert.deepEqual(JSON.parse(db.prepare(`SELECT note_ids FROM tutor_sessions WHERE id = ?`).get(session.id).note_ids), [retained.id]);
+  assert.equal(db.prepare(`SELECT note_id FROM flashcards WHERE id = ?`).get(card.id).note_id, null);
+  assert.equal(db.prepare(`SELECT note_id FROM quiz_questions WHERE id = 'reference-question'`).get().note_id, null);
 
   const child = await request('categories', { method: 'POST', body: { name: '子分类', parentId: first.id }, status: 201 });
   await request(`categories/${first.id}`, { method: 'DELETE' });
@@ -276,7 +319,7 @@ test('removing the note that asserted a graph relation leaves only the surviving
   assert.deepEqual(relevant(await request('graph')).map(({ relation }) => relation), ['同篇共现']);
 });
 
-test('deleting a note during a tutor reply keeps the chat and drops the reference', { timeout: 5000 }, async (t) => {
+test('trashing a note during a tutor reply hides its reference until restoration', { timeout: 5000 }, async (t) => {
   const note = await request('notes', { method: 'POST', body: { title: '聊天时删除测试' }, status: 201 });
   const session = await request('tutor/sessions', { method: 'POST', body: { noteIds: [note.id] }, status: 201 });
   const model = pauseModel(t);
@@ -288,9 +331,30 @@ test('deleting a note during a tutor reply keeps the chat and drops the referenc
   const chat = await request(`tutor/sessions/${session.id}/messages`);
   assert.deepEqual(chat.session.note_ids, []);
   assert.equal(chat.messages.at(-1).content, '保存这次回答');
+  // The picker sends only visible references when chatting while this note is in the trash.
+  await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: { message: '继续对话', noteIds: [] } });
+  const other = await request('notes', { method: 'POST', body: { title: '新增参考笔记' }, status: 201 });
+  await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: { message: '参考新笔记', noteIds: [other.id] } });
+  assert.deepEqual((await request(`tutor/sessions/${session.id}/messages`)).session.note_ids, [other.id]);
+  await request(`notes/trash/${note.id}/restore`, { method: 'POST' });
+  assert.deepEqual((await request(`tutor/sessions/${session.id}/messages`)).session.note_ids, [note.id, other.id]);
 });
 
-test('grading an existing quiz after source deletion detaches the wrong answer and is safe to retry', { timeout: 5000 }, async (t) => {
+test('a tutor reply with unchanged selections preserves a newer selection', { timeout: 5000 }, async (t) => {
+  const previous = await request('notes', { method: 'POST', body: { title: '之前参考的笔记' }, status: 201 });
+  const next = await request('notes', { method: 'POST', body: { title: '新选的参考笔记' }, status: 201 });
+  const session = await request('tutor/sessions', { method: 'POST', body: { noteIds: [previous.id] }, status: 201 });
+  const model = pauseModel(t);
+  const pending = request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: { message: '之前的问题' } });
+  await model.started;
+  modelReply = () => '针对新笔记的回答';
+  await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: { message: '新问题', noteIds: [next.id] } });
+  model.reply('之前的回答');
+  await pending;
+  assert.deepEqual((await request(`tutor/sessions/${session.id}/messages`)).session.note_ids, [next.id]);
+});
+
+test('grading a quiz while its source is trashed preserves learning history and is safe to retry', { timeout: 5000 }, async (t) => {
   const note = await request('notes', { method: 'POST', body: { title: '批改时删除测试' }, status: 201 });
   const time = '2026-11-23T00:00:00.000Z';
   db.prepare(`INSERT INTO quizzes (id, title, source_note_ids, created_at) VALUES ('grading-quiz', '简答练习', ?, ?)`)
@@ -312,6 +376,41 @@ test('grading an existing quiz after source deletion detaches the wrong answer a
   assert.equal(mistake.note_id, null);
   assert.equal(mistake.wrong_count, 1);
   assert.equal((await request('dashboard')).weakConcepts.some(({ name }) => name === '批改测试知识点'), false);
+  await request(`notes/trash/${note.id}/restore`, { method: 'POST' });
+  assert.equal((await request('mistakes')).find(({ id }) => id === mistake.id).note_id, note.id);
+  assert.equal((await request('dashboard')).weakConcepts.find(({ name }) => name === '批改测试知识点')?.quiz_attempts, 1);
+});
+
+test('original attachments and search survive trash and restoration', async () => {
+  const original = Buffer.from('\uFEFF# 回收站附件\r\n\r\ntrash attachment search needle');
+  const form = new FormData();
+  form.append('files', new File([original], 'original.md', { type: 'text/markdown' }));
+  form.set('tags', JSON.stringify(['trash-only-tag']));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body: form, status: 201 });
+  assert.ok(note.attachment_path);
+  const readOriginal = async () => Buffer.from(await (await fetch(`${origin}${note.attachment_path}`)).arrayBuffer());
+  assert.deepEqual(await readOriginal(), original);
+
+  await request(`notes/${note.id}`, { method: 'DELETE' });
+  assert.deepEqual(await readOriginal(), original);
+  assert.deepEqual(await request(`notes?q=${encodeURIComponent('trash attachment search needle')}`), []);
+  assert.equal((await request('notes/meta/tags')).some(({ name }) => name === 'trash-only-tag'), false);
+  await request(`notes/trash/${note.id}/restore`, { method: 'POST' });
+  const [restored] = await request(`notes?q=${encodeURIComponent('trash attachment search needle')}`);
+  assert.equal(restored.id, note.id);
+  assert.equal(restored.attachment_path, note.attachment_path);
+  assert.deepEqual(await readOriginal(), original);
+
+  const shared = await request('notes', { method: 'POST', body: { title: '共用原文件的笔记' }, status: 201 });
+  db.prepare(`UPDATE notes SET attachment_path = ? WHERE id = ?`).run(note.attachment_path, shared.id);
+  await request(`notes/${note.id}`, { method: 'DELETE' });
+  await request(`notes/${shared.id}`, { method: 'DELETE' });
+  await request(`notes/trash/${note.id}`, { method: 'DELETE' });
+  assert.deepEqual(await readOriginal(), original);
+  await request(`notes/trash/${shared.id}`, { method: 'DELETE' });
+  const deleted = await fetch(`${origin}${note.attachment_path}`);
+  assert.equal(deleted.status, 404);
+  await deleted.body.cancel();
 });
 
 test('generating from a note deleted during AI inference saves no stale quiz', { timeout: 5000 }, async (t) => {

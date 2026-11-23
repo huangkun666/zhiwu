@@ -8,11 +8,17 @@ import { MarkdownView } from './MarkdownView';
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const controlClass = 'px-2.5 py-1.5 rounded-lg zw-btn-secondary text-xs cursor-pointer disabled:opacity-50';
 
-function getDocumentUrl(note: Note): string | null {
+const originalMime = {
+  pdf: 'application/pdf', docx: DOCX_MIME, markdown: 'text/markdown', text: 'text/plain',
+} as const;
+
+function getOriginalUrl(note: Note): string | null {
   const url = note.attachment_path;
-  if (!url || (note.source_type !== 'pdf' && note.source_type !== 'docx')) return null;
-  const mime = note.source_type === 'pdf' ? 'application/pdf' : DOCX_MIME;
-  return /^\/uploads\/[a-z0-9][\w.-]*$/i.test(url) || url.startsWith(`data:${mime};base64,`) ? url : null;
+  if (!url || note.source_type === 'image') return null;
+  const mime = originalMime[note.source_type];
+  if (!mime) return null;
+  return /^\/uploads\/[a-z0-9][\w.-]*$/i.test(url) || url.startsWith(`data:${mime};base64,`)
+    || url.startsWith('data:application/octet-stream;base64,') ? url : null;
 }
 
 function decodeAttachment(url: string): Uint8Array<ArrayBuffer> {
@@ -189,10 +195,11 @@ export function NoteSource({ note, content }: { note: Note; content: string }) {
   const [open, setOpen] = useState(false);
   const [textOnly, setTextOnly] = useState(false);
   const [previewFailed, setPreviewFailed] = useState(false);
-  const documentUrl = getDocumentUrl(note);
+  const originalUrl = getOriginalUrl(note);
   const documentNote = note.source_type === 'pdf' || note.source_type === 'docx';
-  const filename = note.source_filename || note.title;
-  const downloadName = filename.toLowerCase().endsWith(`.${note.source_type}`) ? filename : `${filename}.${note.source_type}`;
+  const documentUrl = documentNote ? originalUrl : null;
+  const extension = note.source_type === 'markdown' ? 'md' : note.source_type === 'text' ? 'txt' : note.source_type;
+  const downloadName = note.source_filename || `${note.title}.${extension}`;
 
   return (
     <details
@@ -209,12 +216,12 @@ export function NoteSource({ note, content }: { note: Note; content: string }) {
       </summary>
       {open && (
         <div className="px-3 py-3 space-y-3 border-t border-[var(--border-hairline)]">
-          {documentUrl && (
+          {originalUrl && (
             <div className="flex flex-wrap gap-2">
-              <a className={`${controlClass} inline-flex items-center gap-1.5`} href={documentUrl} download={downloadName}>
+              <a className={`${controlClass} inline-flex items-center gap-1.5`} href={originalUrl} download={downloadName}>
                 <Download className="w-3.5 h-3.5" /> 下载原文件
               </a>
-              {content.trim() && !previewFailed && (
+              {documentUrl && content.trim() && !previewFailed && (
                 <button type="button" className={controlClass} aria-pressed={textOnly} onClick={() => setTextOnly(!textOnly)}>
                   {textOnly ? '查看文档预览' : note.source_content == null ? '查看旧版笔记文字' : '查看提取文本'}
                 </button>

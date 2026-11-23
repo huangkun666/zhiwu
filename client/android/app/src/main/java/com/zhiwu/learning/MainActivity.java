@@ -26,7 +26,7 @@ import java.util.zip.ZipInputStream;
 import org.json.JSONObject;
 
 public class MainActivity extends BridgeActivity {
-    private static final int NATIVE_VERSION = 2;
+    private static final int NATIVE_VERSION = 3;
     private static final String OTA_PREFS = "ZhiwuOtaPrefs";
     private static final String KEY_OTA_VERSION = "otaVersion";
     private static final String KEY_OTA_NATIVE = "otaForNativeVersion";
@@ -46,6 +46,7 @@ public class MainActivity extends BridgeActivity {
             otaPrefs.edit().clear().apply();
         }
 
+        registerPlugin(BackupSavePlugin.class);
         super.onCreate(savedInstanceState);
 
         // Apply system bars & display cutout insets (do NOT include IME so adjustResize never double-pads)

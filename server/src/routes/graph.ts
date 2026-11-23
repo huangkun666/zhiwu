@@ -9,11 +9,11 @@ graphRouter.get('/', (_req, res) => {
     .prepare(
       `SELECT c.id, c.name, c.description, c.mastery_score, c.quiz_attempts, c.quiz_correct, c.created_at,
         cat.id as category_id, cat.name as category_name, cat.color as category_color,
-        (SELECT COUNT(*) FROM note_concepts nc INNER JOIN notes n ON n.id = nc.note_id WHERE nc.concept_id = c.id) as note_count,
+        (SELECT COUNT(*) FROM note_concepts nc INNER JOIN active_notes n ON n.id = nc.note_id WHERE nc.concept_id = c.id) as note_count,
         (SELECT COUNT(*) FROM mistakes m WHERE m.concept_name = c.name AND m.status != 'mastered') as active_mistakes
        FROM active_concepts c
        LEFT JOIN categories cat ON cat.id = (
-         SELECT n.category_id FROM note_concepts nc INNER JOIN notes n ON n.id = nc.note_id
+         SELECT n.category_id FROM note_concepts nc INNER JOIN active_notes n ON n.id = nc.note_id
          WHERE nc.concept_id = c.id AND n.category_id IS NOT NULL
          ORDER BY (n.category_id = c.category_id) DESC, n.updated_at DESC, n.id LIMIT 1
        )
@@ -26,7 +26,7 @@ graphRouter.get('/', (_req, res) => {
     .prepare(
       `SELECT c.id AS concept_id, c.name AS concept_name, n.id AS note_id, n.title, n.summary_json
        FROM note_concepts nc
-       INNER JOIN notes n ON n.id = nc.note_id
+       INNER JOIN active_notes n ON n.id = nc.note_id
        INNER JOIN concepts c ON c.id = nc.concept_id
        ORDER BY n.updated_at DESC, n.id, c.id`
     )
