@@ -3,6 +3,7 @@ import { db, existingCategoryId, existingNoteIds, inTransaction, logStudyActivit
 import { generateQuizAI, gradeShortAnswerAI } from '../services/ai.js';
 import { questionSourceId, readIds } from '../shared/libraryReferences.js';
 import { noteStudyText } from '../shared/noteContent.js';
+import { rankWeakConcepts, recordMasteryChange, type MasteryChange, type StudyConcept } from '../shared/todayLearning.js';
 
 export const quizzesRouter = Router();
 
@@ -76,14 +77,15 @@ quizzesRouter.post('/generate', async (req, res) => {
 
   if (weakOnly) {
     const names = JSON.stringify(targetConcepts);
-    const weakRows = db.prepare(`SELECT id, name FROM active_concepts
+    const matching = db.prepare(`SELECT id, name, quiz_attempts, quiz_correct, mastery_score FROM active_concepts
       WHERE ? = '[]' OR name IN (SELECT value FROM json_each(?))
-      ORDER BY mastery_score ASC, quiz_attempts DESC LIMIT 6`).all(names, names) as { id: string; name: string }[];
+      ORDER BY mastery_score ASC, quiz_attempts DESC`).all(names, names) as unknown as StudyConcept[];
+    const weakRows = (targetConcepts.length > 0 ? matching : rankWeakConcepts(matching)).slice(0, 6);
     targetConcepts = weakRows.map((row) => row.name);
     sourceNotes = db.prepare(`SELECT DISTINCT n.* FROM active_notes n INNER JOIN note_concepts nc ON nc.note_id = n.id
       WHERE nc.concept_id IN (SELECT value FROM json_each(?)) ORDER BY n.updated_at DESC LIMIT 6`)
       .all(JSON.stringify(weakRows.map(({ id }) => id)));
-    missingSource = '暂无可用于专项突破的关联笔记';
+    missingSource = '暂无符合条件的知识点，可按笔记出题';
   } else if (requestedNotes.length > 0) {
     sourceNotes = db.prepare(`SELECT * FROM active_notes WHERE id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(requestedNotes));
     missingSource = '所选笔记已不存在，请重新选择';
@@ -103,6 +105,7 @@ quizzesRouter.post('/generate', async (req, res) => {
   const safeCount = Math.max(1, Math.min(15, Number(count) || 5));
   const safeTypes =
     Array.isArray(types) && types.length > 0 ? types : (['single', 'boolean', 'short'] as const);
+  const focusName = weakOnly && targetConcepts.length === 1 ? targetConcepts[0] : null;
 
   try {
     const generated = await generateQuizAI(
@@ -124,7 +127,7 @@ quizzesRouter.post('/generate', async (req, res) => {
     const quizTitle =
       String(title || '').trim() ||
       (weakOnly
-        ? `薄弱项专项突破测验（${generated.length} 题）`
+        ? `${focusName || '薄弱知识点'}专项测验（${generated.length} 题）`
         : sourceNotes.length === 1
         ? `《${sourceNotes[0].title}》动态测验`
         : `综合动态测验（${sourceNotes.length} 篇笔记）`);
@@ -142,7 +145,7 @@ quizzesRouter.post('/generate', async (req, res) => {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
       for (const q of generated) {
         const noteId = questionSourceId(q.noteId, sourceIds);
-        insertQuestion.run(uid(), quizId, noteId, q.conceptName, q.type, q.stem,
+        insertQuestion.run(uid(), quizId, noteId, focusName || q.conceptName, q.type, q.stem,
           JSON.stringify(q.options), q.correctAnswer, q.explanation, q.memoryTip);
       }
       return getQuiz(quizId);
@@ -217,6 +220,7 @@ quizzesRouter.post('/:id/submit', async (req, res) => {
 
     let totalScore = 0;
     let mistakesAdded = 0;
+    const masteryChanges = new Map<string, MasteryChange>();
     const now = nowIso();
     for (const q of current.questions) {
       const grade = grades.get(q.id);
@@ -228,7 +232,9 @@ quizzesRouter.post('/:id/submit', async (req, res) => {
         `UPDATE quiz_questions SET user_answer = ?, is_correct = ?, ai_feedback = ?, score = ? WHERE id = ?`
       ).run(userAnswer, isCorrect ? 1 : 0, feedback, score, q.id);
 
-      if (q.concept_name) updateConceptMastery(q.concept_name, isCorrect, q.note_id);
+      if (q.concept_name) {
+        recordMasteryChange(masteryChanges, updateConceptMastery(q.concept_name, isCorrect, q.note_id));
+      }
 
       if (isCorrect) continue;
       const existingMistake = db
@@ -270,7 +276,7 @@ quizzesRouter.post('/:id/submit', async (req, res) => {
     db.prepare(`UPDATE quizzes SET score = ?, status = 'completed', completed_at = ? WHERE id = ?`)
       .run(finalScore, now, quiz.id);
     logStudyActivity('quiz_complete', quiz.id, finalScore, current.questions.length * 45);
-    return { ...getQuiz(quiz.id), mistakesAdded };
+    return { ...getQuiz(quiz.id), mistakesAdded, masteryChanges: [...masteryChanges.values()] };
   });
   if (!submitted) return res.status(404).json({ error: '测验已被删除' });
   res.json(formatQuiz(submitted));

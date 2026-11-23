@@ -14,11 +14,11 @@ import {
 } from 'lucide-react';
 import { api } from '../api/client';
 import { QrScannerModal } from './QrScannerModal';
-import type { ActiveModelCapability, Category, Note } from '../types';
+import type { ActiveModelCapability, Note } from '../types';
 
 interface QuickImportModalProps {
   open: boolean;
-  categories: Category[];
+  categoryLabels: ReadonlyMap<string, string>;
   activeCapability: ActiveModelCapability | null;
   onClose: () => void;
   onOpenSettings: () => void;
@@ -27,7 +27,7 @@ interface QuickImportModalProps {
 
 export function QuickImportModal({
   open,
-  categories,
+  categoryLabels,
   activeCapability,
   onClose,
   onOpenSettings,
@@ -396,17 +396,19 @@ export function QuickImportModal({
           )}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs text-[var(--text-secondary)] mb-1">分类</label>
+            <div className="min-w-0">
+              <label htmlFor="import-category" className="block text-xs text-[var(--text-secondary)] mb-1">分类</label>
               <select
+                id="import-category"
                 value={categoryId}
                 onChange={(e) => setCategoryId(e.target.value)}
+                title={categoryLabels.get(categoryId)}
                 className="w-full px-3 py-2.5 rounded-xl zw-input text-xs"
               >
                 <option value="">暂不分类 / 交由 AI 推荐</option>
-                {categories.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
+                {Array.from(categoryLabels, ([id, label]) => (
+                  <option key={id} value={id}>
+                    {label}
                   </option>
                 ))}
               </select>

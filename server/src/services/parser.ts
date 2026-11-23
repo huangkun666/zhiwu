@@ -19,7 +19,8 @@ export interface ParsedFileResult {
 export async function parseUploadedFile(
   filePath: string,
   originalName: string,
-  mimeType: string
+  mimeType: string,
+  { skipImageOcr = false }: { skipImageOcr?: boolean } = {}
 ): Promise<ParsedFileResult> {
   const ext = path.extname(originalName).toLowerCase();
   const baseTitle = path.basename(originalName, ext).trim() || '未命名笔记';
@@ -76,6 +77,8 @@ export async function parseUploadedFile(
     ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'].includes(ext) ||
     mimeType.startsWith('image/')
   ) {
+    if (skipImageOcr) return { title: baseTitle, content: '', sourceType: 'image' };
+
     const buf = fs.readFileSync(filePath);
     const base64 = buf.toString('base64');
     const resolvedMime = mimeType.startsWith('image/') ? mimeType : `image/${ext.replace('.', '') || 'png'}`;

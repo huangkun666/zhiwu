@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { after, before, test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import express from 'express';
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 let fixture;
@@ -40,6 +43,7 @@ before(async () => {
 
   const app = express();
   app.use(express.json());
+  app.get('/api/health', (_req, res) => res.json({ status: 'ok', app: '知悟 (Zhiwu)' }));
   app.post('/test-model/chat/completions', async (_req, res) => {
     const reply = await modelReply?.();
     res.json({ choices: [{ message: { content: reply || '测试回复' } }] });
@@ -423,4 +427,167 @@ test('generating from a note deleted during AI inference saves no stale quiz', {
   model.reply(JSON.stringify({ questions: [{ noteId: note.id, type: 'single', stem: '问题', correctAnswer: 'A' }] }));
   await pending;
   assert.equal((await request('quizzes')).length, existing);
+});
+
+const mcpScript = fileURLToPath(new URL('../mcp.mjs', import.meta.url));
+
+test('the MCP adapter requires an explicit service address', () => {
+  const result = spawnSync(process.execPath, [mcpScript], {
+    env: { ...process.env, ZHIWU_URL: '' }, encoding: 'utf8', timeout: 3000,
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ZHIWU_URL/);
+  assert.equal(result.stdout, '');
+});
+
+test('the MCP tool saves Markdown in the configured library and returns its note link', { timeout: 10000 }, async () => {
+  const client = new Client({ name: 'zhiwu-test', version: '1.0.0' });
+  const transport = new StdioClientTransport({
+    command: process.execPath, args: [mcpScript], env: { ZHIWU_URL: origin, ZHIWU_ALLOW_READ: '0' },
+  });
+  try {
+    await client.connect(transport);
+    const { tools } = await client.listTools();
+    assert.deepEqual(tools.map(({ name }) => name).sort(), [
+      'append_to_zhiwu_note', 'ensure_zhiwu_category', 'import_zhiwu_files', 'list_zhiwu_categories', 'save_to_zhiwu',
+    ]);
+    const title = '从外部 AI 保存的项目决策';
+    const content = '# 决策\n\n```ts\nconst answer = 42;\n```\n';
+    const result = await client.callTool({ name: 'save_to_zhiwu', arguments: { title, content } });
+    assert.equal(Boolean(result.isError), false, JSON.stringify(result));
+    const receipt = result.structuredContent;
+    assert.equal(receipt.title, title);
+    const link = new URL(receipt.url);
+    assert.equal(link.origin, origin);
+    assert.equal(link.searchParams.get('note'), receipt.id);
+    assert(result.content.some((item) => item.type === 'text' && item.text.includes(link.href)));
+    const note = await request(`notes/${encodeURIComponent(receipt.id)}`);
+    assert.equal(note.title, title);
+    assert.equal(note.content, content);
+    assert.equal(note.source_type, 'markdown');
+  } finally {
+    await client.close();
+  }
+});
+
+test('MCP tools can organize selected sources and read back the collected knowledge', { timeout: 15000 }, async () => {
+  const importRoot = mkdtempSync(join(fixture, 'mcp-originals-'));
+  const filename = 'résumé.md';
+  const bytes = Buffer.from('\uFEFF# 原文件回归\r\n\r\n保留这些字节。\r\n');
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+qv1sAAAAASUVORK5CYII=', 'base64');
+  writeFileSync(join(importRoot, filename), bytes);
+  writeFileSync(join(importRoot, '资料图片.png'), imageBytes);
+  const client = new Client({ name: 'zhiwu-workflow-test', version: '1.0.0' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [mcpScript], env: {
+    ZHIWU_URL: origin, ZHIWU_ALLOW_READ: '1', ZHIWU_IMPORT_DIR: importRoot,
+  } });
+  const call = async (name, args) => {
+    const result = await client.callTool({ name, arguments: args });
+    assert.equal(Boolean(result.isError), false, JSON.stringify(result));
+    return result.structuredContent;
+  };
+  try {
+    await client.connect(transport);
+    const categoryPath = ['外部知识', '记账小程序', '设计'];
+    const [category, repeated] = await Promise.all([
+      call('ensure_zhiwu_category', { categoryPath }), call('ensure_zhiwu_category', { categoryPath }),
+    ]);
+    assert.deepEqual(repeated, category);
+    assert.deepEqual(category.categoryPath, categoryPath);
+    const other = await call('ensure_zhiwu_category', { categoryPath: ['另一个项目', '设计'] });
+    assert.notEqual(other.categoryId, category.categoryId);
+    const listing = await call('list_zhiwu_categories', {});
+    const leaf = listing.categories.find(({ id }) => id === category.categoryId);
+    assert.deepEqual(leaf.categoryPath, categoryPath);
+    assert.equal(listing.categories.find(({ id }) => id === leaf.parentId).name, '记账小程序');
+    assert.equal(listing.categories.filter(({ categoryPath: path }) => path.join('/') === categoryPath.join('/')).length, 1);
+
+    const saved = await call('save_to_zhiwu', { title: '记账设计记录', content: '这是保留的方案原文。', categoryPath, tags: ['设计记录'] });
+    assert.equal(saved.categoryId, category.categoryId);
+    const excerpt = '费用分类的对话摘录检索词';
+    const appended = await call('append_to_zhiwu_note', { noteId: saved.id, excerptId: 'external-clip', content: excerpt });
+    assert.equal(appended.excerptId, 'external-clip');
+    await call('append_to_zhiwu_note', { noteId: saved.id, excerptId: 'external-clip', content: excerpt });
+    const conflict = await client.callTool({ name: 'append_to_zhiwu_note', arguments: {
+      noteId: saved.id, excerptId: 'external-clip', content: '另一份内容',
+    } });
+    assert.equal(conflict.isError, true);
+    const needle = await call('search_zhiwu_notes', { query: '摘录检索词', categoryId: category.categoryId });
+    assert.deepEqual(needle.notes.map(({ id }) => id), [saved.id]);
+    assert(needle.notes[0].excerpt.includes(excerpt));
+    const read = await call('read_zhiwu_note', { noteId: saved.id });
+    assert.equal(read.content, '这是保留的方案原文。');
+    assert.deepEqual(read.tags, ['设计记录']);
+    assert.deepEqual(read.chatExcerpts.map(({ content }) => content), [excerpt]);
+
+    const sourcePath = [...categoryPath.slice(0, -1), '参考资料'];
+    const originals = await call('import_zhiwu_files', { paths: [filename, '资料图片.png'], categoryPath: sourcePath });
+    assert.deepEqual(originals.warnings, []);
+    assert.equal(originals.notes.length, 2);
+    const original = await call('read_zhiwu_note', { noteId: originals.notes[0].id });
+    assert.equal(original.sourceFilename, filename);
+    const downloaded = await fetch(original.attachmentUrl);
+    assert.equal(downloaded.status, 200);
+    assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), bytes);
+    const image = await call('read_zhiwu_note', { noteId: originals.notes[1].id });
+    assert.equal(image.sourceFilename, '资料图片.png');
+    assert.deepEqual(Buffer.from(await (await fetch(image.attachmentUrl)).arrayBuffer()), imageBytes);
+
+    const name = '旧库中的同名分类';
+    await request('categories', { method: 'POST', body: { name }, status: 201 });
+    const chosen = await request('categories', { method: 'POST', body: { name }, status: 201 });
+    const ambiguous = await client.callTool({ name: 'ensure_zhiwu_category', arguments: { categoryPath: [name, '设计'] } });
+    assert.equal(ambiguous.isError, true);
+    const child = await call('ensure_zhiwu_category', { parentId: chosen.id, categoryPath: ['设计'] });
+    const selected = await call('save_to_zhiwu', { title: '归入指定分支', content: '选中的同名分类', categoryId: child.categoryId });
+    assert.equal(selected.categoryId, child.categoryId);
+    assert.deepEqual(selected.categoryPath, [name, '设计']);
+    assert.equal((await request('categories')).find(({ id }) => id === child.categoryId).parent_id, chosen.id);
+
+    const count = (await request('categories')).length;
+    await request('categories', { method: 'POST', body: { path: ['不会部分保存', ' '] }, status: 400 });
+    assert.equal((await request('categories')).length, count);
+  } finally {
+    await client.close();
+  }
+});
+
+test('today learning separates untested concepts and shows review and quiz progress', async () => {
+  const category = await request('categories', { method: 'POST', body: { name: '今日学习学科' }, status: 201 });
+  const note = await request('notes', { method: 'POST', body: { title: '今日学习笔记', categoryId: category.id }, status: 201 });
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO concepts (id,name,mastery_score,quiz_attempts,quiz_correct,created_at)
+    VALUES ('today-weak','专项知识点',.25,1,0,?), ('today-untested','刚提炼的知识点',.5,0,0,?)`).run(now, now);
+  db.prepare(`INSERT INTO note_concepts (note_id,concept_id) VALUES (?,'today-weak'), (?,'today-untested')`).run(note.id, note.id);
+  const baseline = await request('dashboard');
+  assert.deepEqual(baseline.subjectMastery.filter(({ id }) => id === category.id)
+    .map(({ mastery, concept_count, tested_count }) => [mastery, concept_count, tested_count]), [[25, 2, 1]]);
+  assert(baseline.weakConcepts.some(({ id }) => id === 'today-weak'));
+  assert(!baseline.weakConcepts.some(({ id }) => id === 'today-untested'));
+  assert(baseline.untestedConcepts.some(({ id }) => id === 'today-untested'));
+
+  configureTestModel();
+  modelReply = () => JSON.stringify([1, 2, 3].map((index) => ({
+    noteId: note.id, conceptName: '模型给出的别名', type: 'boolean', stem: `判断题 ${index}`, correctAnswer: '对',
+  })));
+  let quiz;
+  try {
+    quiz = await request('quizzes/generate', { method: 'POST', status: 201, body: {
+      weakOnly: true, focusConcepts: ['专项知识点'], count: 3,
+    } });
+  } finally {
+    modelReply = undefined;
+  }
+  assert.equal(quiz.questions.length, 3);
+  assert(quiz.questions.every(({ concept_name }) => concept_name === '专项知识点'));
+  const answers = Object.fromEntries(quiz.questions.map(({ id }) => [id, '对']));
+  const graded = await request(`quizzes/${quiz.id}/submit`, { method: 'POST', body: { answers } });
+  assert.deepEqual(graded.masteryChanges, [{ id: 'today-weak', name: '专项知识点', before: 25, after: 70 }]);
+  const card = await request('flashcards', { method: 'POST', body: { front: '今日练习', back: '答案', noteId: note.id }, status: 201 });
+  await request(`flashcards/${card.id}/review`, { method: 'POST', body: { rating: 3 } });
+  await request(`flashcards/${card.id}/review`, { method: 'POST', body: { rating: 3 } });
+  const after = (await request('dashboard')).todayProgress;
+  assert.equal(after.reviewedCards, baseline.todayProgress.reviewedCards + 1);
+  assert.equal(after.quizzesCompleted, baseline.todayProgress.quizzesCompleted + 1);
+  assert(after.nextReviewAt > now);
 });

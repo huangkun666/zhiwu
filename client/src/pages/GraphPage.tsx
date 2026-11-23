@@ -136,7 +136,10 @@ export function GraphPage({ onNavigate }: GraphPageProps) {
               <span>
                 {nodes.length} 个概念 · {links.length} 条关联
               </span>
-              <div className="flex items-center gap-3 text-[11px] text-[var(--text-muted)]">
+              <div className="flex flex-wrap items-center gap-3 text-[11px] text-[var(--text-muted)]">
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-[#6B7280]" /> 待测
+                </span>
                 <span className="flex items-center gap-1">
                   <span className="w-2 h-2 rounded-full bg-[#EF4444]" /> 薄弱
                 </span>
@@ -189,7 +192,7 @@ export function GraphPage({ onNavigate }: GraphPageProps) {
                 {positioned.map((n) => {
                   const isSel = selectedNode?.id === n.id;
                   const r = Math.min(25, 15 + n.note_count * 3);
-                  const fill = masteryColor(n.mastery_score);
+                  const fill = n.quiz_attempts ? masteryColor(n.mastery_score) : '#6B7280';
                   return (
                     <g key={n.id} onClick={() => setSelectedNode(n)} className="cursor-pointer">
                       {isSel && (
@@ -205,7 +208,7 @@ export function GraphPage({ onNavigate }: GraphPageProps) {
                       )}
                       <circle cx={n.x} cy={n.y} r={r} fill={fill} fillOpacity="0.88" />
                       <text x={n.x} y={n.y + 3} textAnchor="middle" fontSize="9.5" fill="#FFFFFF" fontWeight="600">
-                        {Math.round(n.mastery_score * 100)}%
+                        {n.quiz_attempts ? `${Math.round(n.mastery_score * 100)}%` : '待测'}
                       </text>
                       <text
                         x={n.x}
@@ -236,9 +239,9 @@ export function GraphPage({ onNavigate }: GraphPageProps) {
                   </div>
                   <span
                     className="text-xs font-semibold tabular-nums px-2 py-0.5 rounded-md text-white"
-                    style={{ backgroundColor: masteryColor(selectedNode.mastery_score) }}
+                    style={{ backgroundColor: selectedNode.quiz_attempts ? masteryColor(selectedNode.mastery_score) : '#6B7280' }}
                   >
-                    {Math.round(selectedNode.mastery_score * 100)}%
+                    {selectedNode.quiz_attempts ? `${Math.round(selectedNode.mastery_score * 100)}%` : '待测'}
                   </span>
                 </div>
 

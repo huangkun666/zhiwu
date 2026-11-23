@@ -12,13 +12,15 @@ import {
 } from 'lucide-react';
 import { api } from '../api/client';
 import { MarkdownView } from '../components/MarkdownView';
+import { recordMasteryChange, type MasteryChange } from '../../../server/src/shared/todayLearning';
 import type { Flashcard, Note, ReviewQueueItem } from '../types';
 
 interface ReviewPageProps {
   onRefreshGlobal: () => void;
+  onReturnHome: (masteryChanges: MasteryChange[]) => void;
 }
 
-export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
+export function ReviewPage({ onRefreshGlobal, onReturnHome }: ReviewPageProps) {
   const [tab, setTab] = useState<'queue' | 'manage'>('queue');
   const [queue, setQueue] = useState<ReviewQueueItem[]>([]);
   const [allCards, setAllCards] = useState<Flashcard[]>([]);
@@ -30,6 +32,8 @@ export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
   const [showHint, setShowHint] = useState(false);
   const [completedToday, setCompletedToday] = useState(0);
   const [lastIntervalMsg, setLastIntervalMsg] = useState('');
+  const masteryChanges = useRef(new Map<string, MasteryChange>());
+  const ratingPending = useRef(false);
 
   // Touch swipe state for mobile single-hand flashcard review
   const touchStartX = useRef<number | null>(null);
@@ -68,7 +72,8 @@ export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
   const currentItem = queue[currentIndex];
 
   const handleRate = async (rating: 1 | 2 | 3 | 4) => {
-    if (!currentItem) return;
+    if (!currentItem || ratingPending.current) return;
+    ratingPending.current = true;
     try {
       const res =
         currentItem.itemType === 'flashcard'
@@ -76,7 +81,7 @@ export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
           : await api.reviewMistake(currentItem.id, rating);
 
       setLastIntervalMsg(`下次复习：${res.nextLabel}`);
-      setCompletedToday((c) => c + 1);
+      recordMasteryChange(masteryChanges.current, res.masteryChange);
       setFlipped(false);
       setShowHint(false);
       setSwipeDx(0);
@@ -84,11 +89,14 @@ export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
       if (rating === 1) {
         setQueue((prev) => [...prev.slice(0, currentIndex), ...prev.slice(currentIndex + 1), currentItem]);
       } else {
+        setCompletedToday((c) => c + 1);
         setQueue((prev) => [...prev.slice(0, currentIndex), ...prev.slice(currentIndex + 1)]);
       }
       onRefreshGlobal();
     } catch (e: any) {
       alert(e.message);
+    } finally {
+      ratingPending.current = false;
     }
   };
 
@@ -197,17 +205,18 @@ export function ReviewPage({ onRefreshGlobal }: ReviewPageProps) {
         queue.length === 0 ? (
           <div className="max-w-xl mx-auto p-10 rounded-3xl zw-card text-center space-y-3">
             <CheckCircle2 className="w-10 h-10 mx-auto" style={{ color: 'var(--ok-fg)' }} />
-            <h2 className="text-base font-semibold">今日待复习已全部清空</h2>
+            <h2 className="text-base font-semibold">本轮复习已结束</h2>
             <p className="text-xs text-[var(--text-muted)]">
               本次已完成 {completedToday} 项主动回忆巩固。可前往闪卡库从笔记生成更多卡片。
             </p>
-            <button
-              onClick={() => setTab('manage')}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer mt-2"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              生成新闪卡
-            </button>
+            <div className="flex flex-wrap justify-center gap-2 mt-2">
+              <button type="button" onClick={() => onReturnHome([...masteryChanges.current.values()])}
+                className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer">返回今日学习</button>
+              <button type="button" onClick={() => setTab('manage')}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer">
+                <Sparkles className="w-3.5 h-3.5" /> 生成新闪卡
+              </button>
+            </div>
           </div>
         ) : (
           <div className="max-w-2xl mx-auto space-y-4">

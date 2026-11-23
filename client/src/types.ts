@@ -1,4 +1,5 @@
 import type { ChatExcerpt } from '../../server/src/shared/noteContent';
+import type { MasteryChange, StudyConcept, TodayProgress } from '../../server/src/shared/todayLearning';
 
 export type PageId =
   | 'home'
@@ -7,6 +8,14 @@ export type PageId =
   | 'review'
   | 'tutor'
   | 'settings';
+
+export interface PracticeContext {
+  subTab?: 'quiz' | 'mistakes';
+  noteIds?: string[];
+  weakOnly?: boolean;
+  focusConcepts?: string[];
+  count?: number;
+}
 
 export interface Category {
   id: string;
@@ -95,6 +104,7 @@ export interface Quiz {
   completed_at?: string | null;
   questions?: QuizQuestion[];
   mistakesAdded?: number;
+  masteryChanges?: MasteryChange[];
 }
 
 export interface Mistake {
@@ -247,8 +257,14 @@ export interface DashboardData {
   };
   heatmap: { date: string; count: number }[];
   quizTrend: { date: string; accuracy: number }[];
-  subjectMastery: { id: string; name: string; color: string; note_count: number; mastery: number | null }[];
-  weakConcepts: { id: string; name: string; mastery_score: number; quiz_attempts: number; quiz_correct: number }[];
+  subjectMastery: {
+    id: string; name: string; color: string; note_count: number;
+    mastery: number | null; concept_count: number; tested_count: number;
+  }[];
+  weakConcepts: StudyConcept[];
+  untestedConcepts: Pick<StudyConcept, 'id' | 'name'>[];
+  untestedCount: number;
+  todayProgress: TodayProgress;
   recentNotes: {
     id: string;
     title: string;

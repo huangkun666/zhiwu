@@ -190,14 +190,13 @@ mistakesRouter.post('/:id/review', (req, res) => {
      WHERE id = ?`
   ).run(next.easeFactor, next.intervalDays, next.repetitions, next.nextReviewAt, now, nextStatus, now, m.id);
 
-  if (m.concept_name) {
-    updateConceptMastery(m.concept_name, rating >= 3, m.note_id);
-  }
+  const masteryChange = m.concept_name ? updateConceptMastery(m.concept_name, rating >= 3, m.note_id) : undefined;
   logStudyActivity('mistake_review', m.id, rating >= 3 ? 1 : 0, 30);
 
   res.json({
     mistake: getMistake(m.id),
     nextLabel: next.label,
+    masteryChange,
   });
 });
 

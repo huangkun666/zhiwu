@@ -23,7 +23,10 @@ test('the offline library clears deleted note references and keeps saved learnin
     tutorSessions: [{ id: 'chat', title: '学习对话', mode: 'qa', note_ids: ['deleted-note', 'live-note', 'live-note'], created_at: time, updated_at: time }],
     tutorMessages: { chat: [{ id: 'message', content: '原有消息' }] },
     syntheses: [{ id: 'report', content: '保留归纳', note_ids: ['deleted-note', 'live-note'] }],
-    quizzes: [{ id: 'quiz', source_note_ids: ['deleted-note', 'live-note'], status: 'completed', score: 0, questions: [{ id: 'question', note_id: 'deleted-note' }] }],
+    quizzes: [
+      { id: 'quiz', source_note_ids: ['deleted-note', 'live-note'], status: 'completed', score: 0, questions: [{ id: 'question', note_id: 'deleted-note' }] },
+      { id: 'today-quiz', source_note_ids: ['live-note'], status: 'in_progress', questions: [{ id: 'today-question', note_id: 'live-note', concept_name: '共享知识点', type: 'boolean', correct_answer: '对' }] },
+    ],
     mistakes: [{ id: 'mistake', question_id: 'question', note_id: 'deleted-note', note_title: '失效标题', status: 'unmastered', next_review_at: time }],
     flashcards: [{ id: 'card', note_id: 'live-note', front: '闪卡', next_review_at: time }],
   };
@@ -43,7 +46,10 @@ test('the offline library clears deleted note references and keeps saved learnin
     const chat = await api.getTutorMessages('chat');
     assert.deepEqual(chat.session.note_ids, ['live-note']);
     assert.equal(chat.messages[0].content, '原有消息');
-    assert.deepEqual((await api.getDashboard()).subjectMastery.map(({ id, mastery }) => [id, mastery]), [['live', 50]]);
+    const dashboard = await api.getDashboard();
+    assert.deepEqual(dashboard.subjectMastery.map(({ id, mastery, tested_count }) => [id, mastery, tested_count]), [['live', 50, 1]]);
+    assert.deepEqual(dashboard.weakConcepts.map(({ id }) => id), ['shared']);
+    assert.deepEqual(dashboard.untestedConcepts.map(({ id }) => id), ['cooccurs']);
     const graph = await api.getGraph();
     assert.deepEqual(graph.nodes.map(({ id }) => id), ['shared', 'cooccurs']);
     assert.deepEqual(graph.links.map(({ relation }) => relation), ['同篇共现']);
@@ -66,6 +72,9 @@ test('the offline library clears deleted note references and keeps saved learnin
     assert.deepEqual((await api.getSyntheses())[0].note_ids, ['live-note']);
     assert.equal((await api.getFlashcards())[0].note_id, 'live-note');
     assert.equal((await api.getDashboard()).subjectMastery[0].mastery, 50);
+    const practice = await api.submitQuiz('today-quiz', { 'today-question': '对' });
+    assert.deepEqual(practice.masteryChanges, [{ id: 'shared', name: '共享知识点', before: 50, after: 63 }]);
+    assert.equal((await api.getDashboard()).todayProgress.quizzesCompleted, 1);
     await api.deleteNote('live-note');
     await api.permanentlyDeleteNote('live-note');
     assert.deepEqual((await api.getTrashedNotes()).map(({ id }) => id), []);

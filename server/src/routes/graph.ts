@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import { buildGraphLinks } from '../shared/graphLinks.js';
+import { isWeakConcept } from '../shared/todayLearning.js';
 
 export const graphRouter = Router();
 
@@ -49,7 +50,7 @@ graphRouter.get('/', (_req, res) => {
   }));
 
   // Weak concepts diagnosis: sorted by mastery ascending and active mistakes descending
-  const weakConcepts = [...nodes]
+  const weakConcepts = nodes.filter(isWeakConcept)
     .sort((a, b) => a.mastery_score - b.mastery_score || b.active_mistakes - a.active_mistakes)
     .slice(0, 12);
 

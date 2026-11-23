@@ -2,11 +2,13 @@ import { useEffect, useState } from 'react';
 import { LayoutDashboard, Network } from 'lucide-react';
 import { DashboardPage } from './DashboardPage';
 import { GraphPage } from './GraphPage';
+import type { MasteryChange } from '../../../server/src/shared/todayLearning';
 import type { PageId } from '../types';
 
 interface HomePageProps {
   initialSubTab?: 'overview' | 'graph';
   refreshTick: number;
+  masteryChanges?: MasteryChange[];
   onNavigate: (page: PageId, context?: any) => void;
   onOpenImport: () => void;
   onRefreshGlobal: () => void;
@@ -15,6 +17,7 @@ interface HomePageProps {
 export function HomePage({
   initialSubTab = 'overview',
   refreshTick,
+  masteryChanges,
   onNavigate,
   onOpenImport,
   onRefreshGlobal,
@@ -58,6 +61,7 @@ export function HomePage({
       {subTab === 'overview' ? (
         <DashboardPage
           key={`dash-${refreshTick}`}
+          masteryChanges={masteryChanges}
           onNavigate={onNavigate}
           onOpenImport={onOpenImport}
           onRefreshGlobal={onRefreshGlobal}

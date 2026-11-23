@@ -11,11 +11,12 @@ import {
   XCircle,
 } from 'lucide-react';
 import { api } from '../api/client';
-import type { Category, Note, PageId, Quiz } from '../types';
+import type { Category, Note, PageId, PracticeContext, Quiz } from '../types';
 
 interface QuizPageProps {
   categories: Category[];
-  initialContext?: { noteIds?: string[]; weakOnly?: boolean; focusConcepts?: string[] } | null;
+  categoryLabels: ReadonlyMap<string, string>;
+  initialContext?: PracticeContext | null;
   onRefreshGlobal: () => void;
   onNavigate: (page: PageId, context?: any) => void;
 }
@@ -27,7 +28,7 @@ const QUESTION_TYPES = [
   { id: 'short', label: '简答 (AI批改)' },
 ] as const;
 
-export function QuizPage({ categories, initialContext, onRefreshGlobal, onNavigate }: QuizPageProps) {
+export function QuizPage({ categories, categoryLabels, initialContext, onRefreshGlobal, onNavigate }: QuizPageProps) {
   const [view, setView] = useState<'setup' | 'taking' | 'result'>('setup');
   const [notes, setNotes] = useState<Note[]>([]);
   const [history, setHistory] = useState<Quiz[]>([]);
@@ -36,7 +37,7 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
   const [selectedNoteIds, setSelectedNoteIds] = useState<string[]>([]);
   const [selectedCatId, setSelectedCatId] = useState<string>('');
   const [focusConcepts, setFocusConcepts] = useState<string[]>([]);
-  const [count, setCount] = useState(5);
+  const [count, setCount] = useState(initialContext?.count ?? 5);
   const [difficulty, setDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
   const [selectedTypes, setSelectedTypes] = useState<('single' | 'multiple' | 'boolean' | 'short')[]>([
     'single',
@@ -70,6 +71,7 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
 
   useEffect(() => {
     if (!initialContext) return;
+    if (initialContext.count) setCount(initialContext.count);
     if (initialContext.weakOnly) {
       setSourceMode('weak');
       setFocusConcepts(initialContext.focusConcepts || []);
@@ -291,9 +293,11 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
               <div className="text-3xl font-semibold tracking-tight tabular-nums">{pct}%</div>
               <div className="text-[10px] text-[var(--text-muted)]">得分</div>
             </div>
-            <button onClick={() => setView('setup')} className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer">
-              再出一套
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={() => onNavigate('home', { masteryChanges: activeQuiz.masteryChanges })}
+                className="px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer">返回今日学习</button>
+              <button onClick={() => setView('setup')} className="px-4 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer">再出一套</button>
+            </div>
           </div>
         </div>
 
@@ -402,7 +406,7 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
             {[
               { id: 'notes', label: '指定笔记' },
               { id: 'category', label: '学科分类' },
-              { id: 'weak', label: '薄弱专项' },
+              { id: 'weak', label: '知识点专项' },
             ].map((m) => (
               <button
                 key={m.id}
@@ -461,7 +465,7 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
               <option value="">全部最近笔记</option>
               {categories.map((c) => (
                 <option key={c.id} value={c.id} disabled={!notes.some((note) => note.category_id === c.id)}>
-                  {c.name} ({c.note_count || 0} 篇)
+                  {categoryLabels.get(c.id) ?? c.name} ({c.note_count || 0} 篇)
                 </option>
               ))}
             </select>
@@ -472,7 +476,7 @@ export function QuizPage({ categories, initialContext, onRefreshGlobal, onNaviga
               className="p-3.5 rounded-xl border text-xs"
               style={{ background: 'var(--warn-bg)', borderColor: 'var(--warn-border)', color: 'var(--warn-fg)' }}
             >
-              自动提取正确率最低的知识点{focusConcepts.length ? `（聚焦：${focusConcepts.join('、')}）` : ''}关联笔记出题。
+              {focusConcepts.length ? `围绕 ${focusConcepts.join('、')} 的关联笔记出题。` : '根据已评估的薄弱知识点及其关联笔记出题。'}
             </div>
           )}
         </div>

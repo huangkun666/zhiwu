@@ -1,6 +1,7 @@
 import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt } from '../../../server/src/shared/noteContent';
 import { existingIds, questionSourceId, readIds, tutorNoteSelection } from '../../../server/src/shared/libraryReferences';
 import { buildGraphLinks } from '../../../server/src/shared/graphLinks';
+import { isWeakConcept, rankWeakConcepts, recordMasteryChange, splitStudyConcepts, type MasteryChange } from '../../../server/src/shared/todayLearning';
 import { describeBackup, mergeBackupSnapshots, normalizeBackupSnapshot, type BackupSnapshot } from '../../../server/src/shared/libraryBackup';
 import { createOfflineBackup, offlineSnapshot, readOfflineBackup } from './backupArchive';
 import { compressImageIfNeeded } from '../utils/imageCompress';
@@ -150,10 +151,9 @@ function restoreReviewedConceptLinks(state: LocalDBState) {
   }
 }
 
-function lowestMastery(state: LocalDBState) {
+function activeConcepts(state: LocalDBState) {
   const ids = new Set(activeNotes(state).map(({ id }) => id));
-  return state.concepts.filter((concept) => concept.note_ids.some((id) => ids.has(id)))
-    .sort((a, b) => a.mastery_score - b.mastery_score || b.quiz_attempts - a.quiz_attempts);
+  return state.concepts.filter((concept) => concept.note_ids.some((id) => ids.has(id)));
 }
 
 const DEFAULT_PROVIDERS: AIProviderConfig[] = [
@@ -490,9 +490,11 @@ function updateConceptMastery(state: LocalDBState, name: string, isCorrect: bool
   const id = upsertConcept(state, name, '', note?.category_id, note?.id);
   const c = state.concepts.find((x) => x.id === id);
   if (!c) return;
+  const before = c.quiz_attempts > 0 ? Math.round(c.mastery_score * 100) : null;
   c.quiz_attempts += 1;
   if (isCorrect) c.quiz_correct += 1;
   c.mastery_score = Number(((c.quiz_correct + 0.5) / (c.quiz_attempts + 1)).toFixed(3));
+  return { id: c.id, name: c.name, before, after: Math.round(c.mastery_score * 100) };
 }
 
 // --- Direct On-Device AI Client (works directly from Android APK via CapacitorHttp) ---
@@ -826,8 +828,12 @@ export const localApi = {
     const now = nowIso();
     const today = todayKey();
     const dueFlashcards = s.flashcards.filter((f) => f.next_review_at <= now).length;
-    const activeMistakes = s.mistakes.filter((m) => m.status !== 'mastered').length;
-    const dueMistakes = s.mistakes.filter((m) => m.status !== 'mastered' && m.next_review_at <= now).length;
+    const reviewableMistakes = s.mistakes.filter((m) => m.status !== 'mastered');
+    const dueMistakes = reviewableMistakes.filter((m) => m.next_review_at <= now).length;
+    const nextReviewAt = [...s.flashcards, ...reviewableMistakes].reduce<string | null>((next, item) => {
+      const date = item.next_review_at;
+      return date > now && (!next || date < next) ? date : next;
+    }, null);
     const completedQuizzes = s.quizzes.filter((q) => q.status === 'completed' && q.score != null);
     const avgAccuracy =
       completedQuizzes.length > 0
@@ -835,7 +841,15 @@ export const localApi = {
         : null;
 
     const heatMap: Record<string, number> = {};
-    for (const l of s.studyLogs) heatMap[l.date_key] = (heatMap[l.date_key] || 0) + 1;
+    const todaysActivities = new Map<string, Set<string>>();
+    for (const log of s.studyLogs) {
+      heatMap[log.date_key] = (heatMap[log.date_key] || 0) + 1;
+      if (log.date_key === today) {
+        const entries = todaysActivities.get(log.activity_type) ?? new Set<string>();
+        entries.add(log.entity_id ?? log.id);
+        todaysActivities.set(log.activity_type, entries);
+      }
+    }
     const heatmap: { date: string; count: number }[] = [];
     for (let i = 111; i >= 0; i--) {
       const dk = todayKey(new Date(Date.now() - i * 86400 * 1000));
@@ -864,21 +878,13 @@ export const localApi = {
       const noteIds = new Set(notes.filter((n) => n.category_id === cat.id).map(({ id }) => id));
       if (noteIds.size === 0) return [];
       const cons = s.concepts.filter((c) => c.note_ids.some((id) => noteIds.has(id)));
-      const mastery = cons.length
-        ? Math.round((cons.reduce((a, b) => a + b.mastery_score, 0) / cons.length) * 100)
+      const tested = cons.filter(({ quiz_attempts }) => quiz_attempts > 0);
+      const mastery = tested.length
+        ? Math.round((tested.reduce((a, b) => a + b.mastery_score, 0) / tested.length) * 100)
         : null;
-      return [{ id: cat.id, name: cat.name, color: cat.color, note_count: noteIds.size, mastery }];
+      return [{ id: cat.id, name: cat.name, color: cat.color, note_count: noteIds.size, mastery,
+        concept_count: cons.length, tested_count: tested.length }];
     }).sort((a, b) => b.note_count - a.note_count);
-
-    const weakConcepts = lowestMastery(s)
-      .slice(0, 5)
-      .map((c) => ({
-        id: c.id,
-        name: c.name,
-        mastery_score: c.mastery_score,
-        quiz_attempts: c.quiz_attempts,
-        quiz_correct: c.quiz_correct,
-      }));
 
     const recentNotes = notes
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
@@ -903,7 +909,7 @@ export const localApi = {
         totalFlashcards: s.flashcards.length,
         dueFlashcards,
         totalMistakes: s.mistakes.length,
-        activeMistakes,
+        activeMistakes: reviewableMistakes.length,
         dueMistakes,
         totalDueReviews: dueFlashcards + dueMistakes,
         totalQuizzes: completedQuizzes.length,
@@ -914,7 +920,13 @@ export const localApi = {
       heatmap,
       quizTrend,
       subjectMastery,
-      weakConcepts,
+      ...splitStudyConcepts(activeConcepts(s)),
+      todayProgress: {
+        reviewedCards: todaysActivities.get('flashcard_review')?.size ?? 0,
+        reviewedMistakes: todaysActivities.get('mistake_review')?.size ?? 0,
+        quizzesCompleted: todaysActivities.get('quiz_complete')?.size ?? 0,
+        nextReviewAt,
+      },
       recentNotes,
     };
   },
@@ -1418,11 +1430,12 @@ export const localApi = {
     let focus = readIds(payload.focusConcepts);
     let missingSource = '笔记库暂无笔记，请先导入至少一篇笔记。';
     if (payload.weakOnly) {
-      const weak = lowestMastery(initial).filter((concept) => !focus.length || focus.includes(concept.name)).slice(0, 5);
+      const concepts = activeConcepts(initial);
+      const weak = (focus.length ? concepts.filter((concept) => focus.includes(concept.name)) : rankWeakConcepts(concepts)).slice(0, 6);
       focus = weak.map((concept) => concept.name);
       const ids = new Set(weak.flatMap((w) => w.note_ids));
       sourceNotes = notes.filter((n) => ids.has(n.id)).slice(0, 5);
-      missingSource = '暂无可用于专项突破的关联笔记';
+      missingSource = '暂无符合条件的知识点，可按笔记出题';
     } else if (requested.length) {
       sourceNotes = notes.filter((n) => requested.includes(n.id));
       missingSource = '所选笔记已不存在，请重新选择';
@@ -1434,6 +1447,7 @@ export const localApi = {
     }
     if (!sourceNotes.length) throw new Error(missingSource);
     const provider = requireActiveProvider(initial.settings);
+    const focusName = payload.weakOnly && focus.length === 1 ? focus[0] : null;
 
     const count = Math.max(1, Math.min(12, payload.count || 5));
     const types = payload.types?.length ? payload.types : ['single', 'boolean', 'short'];
@@ -1468,7 +1482,7 @@ export const localApi = {
         id: uid(),
         quiz_id: quizId,
         note_id: questionSourceId(q.noteId, sourceIds),
-        concept_name: q.conceptName || '综合知识',
+        concept_name: focusName || q.conceptName || '综合知识',
         type: t,
         stem: q.stem || '',
         options: t === 'boolean' ? ['对', '错'] : t === 'short' ? [] : Array.isArray(q.options) ? q.options : [],
@@ -1545,6 +1559,7 @@ export const localApi = {
     if (quiz.status === 'completed') return { ...visibleQuiz(s, quiz), mistakesAdded: 0 };
     let total = 0;
     let mistakesAdded = 0;
+    const masteryChanges = new Map<string, MasteryChange>();
     const now = nowIso();
     for (const q of quiz.questions) {
       const grade = grades.get(q.id);
@@ -1555,7 +1570,9 @@ export const localApi = {
       q.ai_feedback = feedback;
       q.score = score;
       total += score;
-      if (q.concept_name) updateConceptMastery(s, q.concept_name, isCorrect, q.note_id);
+      if (q.concept_name) {
+        recordMasteryChange(masteryChanges, updateConceptMastery(s, q.concept_name, isCorrect, q.note_id));
+      }
 
       if (!isCorrect) {
         const existing = s.mistakes.find((m) => m.question_id === q.id);
@@ -1600,7 +1617,7 @@ export const localApi = {
     quiz.mistakesAdded = mistakesAdded;
     logStudy(s, 'quiz_complete', quiz.id, quiz.score);
     await saveState(s);
-    return visibleQuiz(s, quiz);
+    return { ...visibleQuiz(s, quiz), masteryChanges: [...masteryChanges.values()] };
   },
 
   async deleteQuiz(id: string) {
@@ -1732,12 +1749,13 @@ export const localApi = {
     m.last_reviewed_at = nowIso();
     m.updated_at = m.last_reviewed_at;
     m.status = rating === 1 ? 'unmastered' : rating === 4 || next.repetitions >= 3 ? 'mastered' : 'reviewing';
-    if (m.concept_name) updateConceptMastery(s, m.concept_name, rating >= 3, m.note_id);
+    const masteryChange = m.concept_name ? updateConceptMastery(s, m.concept_name, rating >= 3, m.note_id) : undefined;
     logStudy(s, 'mistake_review', m.id, rating >= 3 ? 1 : 0);
     await saveState(s);
     return {
       mistake: { ...m, ...visibleNoteReference(s, m.note_id), interval_previews: previewIntervals(m.ease_factor, m.interval_days, m.repetitions) },
       nextLabel: next.label,
+      masteryChange,
     };
   },
 
@@ -1870,12 +1888,13 @@ export const localApi = {
     c.next_review_at = next.nextReviewAt;
     c.last_reviewed_at = nowIso();
     c.updated_at = c.last_reviewed_at;
-    if (c.concept_name) updateConceptMastery(s, c.concept_name, rating >= 3, c.note_id);
+    const masteryChange = c.concept_name ? updateConceptMastery(s, c.concept_name, rating >= 3, c.note_id) : undefined;
     logStudy(s, 'flashcard_review', c.id, rating >= 3 ? 1 : 0);
     await saveState(s);
     return {
       card: { ...c, ...visibleNoteReference(s, c.note_id), interval_previews: previewIntervals(c.ease_factor, c.interval_days, c.repetitions) },
       nextLabel: next.label,
+      masteryChange,
     };
   },
 
@@ -1923,7 +1942,7 @@ export const localApi = {
     const links = buildGraphLinks(active
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id))
       .map((note) => ({ concepts: conceptsByNote.get(note.id) || [], summary: note.summary })));
-    const weakConcepts = [...nodes].sort((a, b) => a.mastery_score - b.mastery_score || b.active_mistakes - a.active_mistakes).slice(0, 12);
+    const weakConcepts = nodes.filter(isWeakConcept).sort((a, b) => a.mastery_score - b.mastery_score || b.active_mistakes - a.active_mistakes).slice(0, 12);
     return { nodes, links, weakConcepts };
   },
 

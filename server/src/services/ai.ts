@@ -499,7 +499,7 @@ export async function generateQuizAI(
 
   const focusHint =
     config.focusConcepts && config.focusConcepts.length > 0
-      ? `\n请重点针对以下薄弱知识点出题：${config.focusConcepts.join('、')}`
+      ? `\n请围绕这些知识点出题：${config.focusConcepts.join('、')}`
       : '';
 
   const raw = await callLLM(

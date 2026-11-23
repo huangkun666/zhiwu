@@ -1,6 +1,7 @@
 import { Capacitor } from '@capacitor/core';
 import { localApi } from './localEngine';
 import type { BackupPreview } from '../../../server/src/shared/libraryBackup';
+import type { MasteryChange } from '../../../server/src/shared/todayLearning';
 import type {
   AISettings,
   AIProviderConfig,
@@ -53,7 +54,7 @@ const serverApi = {
     const qs = sp.toString();
     return request<Note[]>(`/api/notes${qs ? `?${qs}` : ''}`);
   },
-  getNote: (id: string) => request<Note>(`/api/notes/${id}`),
+  getNote: (id: string) => request<Note>(`/api/notes/${encodeURIComponent(id)}`),
   getTags: () => request<{ name: string; count: number }[]>('/api/notes/meta/tags'),
   createNote: (payload: { title: string; content: string; categoryId?: string | null; tags?: string[]; sourceType?: string }) =>
     request<Note>('/api/notes', { method: 'POST', body: JSON.stringify(payload) }),
@@ -130,7 +131,7 @@ const serverApi = {
       memoryTip: string;
     }>(`/api/mistakes/${id}/variant`, { method: 'POST' }),
   reviewMistake: (id: string, rating: 1 | 2 | 3 | 4) =>
-    request<{ mistake: Mistake; nextLabel: string }>(`/api/mistakes/${id}/review`, {
+    request<{ mistake: Mistake; nextLabel: string; masteryChange?: MasteryChange }>(`/api/mistakes/${id}/review`, {
       method: 'POST',
       body: JSON.stringify({ rating }),
     }),
@@ -155,7 +156,7 @@ const serverApi = {
       body: JSON.stringify({ noteId, count }),
     }),
   reviewFlashcard: (id: string, rating: 1 | 2 | 3 | 4) =>
-    request<{ card: Flashcard; nextLabel: string }>(`/api/flashcards/${id}/review`, {
+    request<{ card: Flashcard; nextLabel: string; masteryChange?: MasteryChange }>(`/api/flashcards/${id}/review`, {
       method: 'POST',
       body: JSON.stringify({ rating }),
     }),

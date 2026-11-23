@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { db, nowIso, todayKey } from '../db.js';
 import { seedSampleData } from '../services/seed.js';
+import { splitStudyConcepts, type StudyConcept, type TodayProgress } from '../shared/todayLearning.js';
 
 export const dashboardRouter = Router();
 
@@ -29,6 +30,15 @@ dashboardRouter.get('/', (_req, res) => {
   const todayActions = (
     db.prepare(`SELECT COUNT(*) as c FROM study_logs WHERE date_key = ?`).get(today) as any
   ).c;
+  const completedToday = db.prepare(`SELECT
+      COUNT(DISTINCT CASE WHEN activity_type = 'flashcard_review' THEN COALESCE(entity_id,id) END) AS reviewedCards,
+      COUNT(DISTINCT CASE WHEN activity_type = 'mistake_review' THEN COALESCE(entity_id,id) END) AS reviewedMistakes,
+      COUNT(DISTINCT CASE WHEN activity_type = 'quiz_complete' THEN COALESCE(entity_id,id) END) AS quizzesCompleted
+    FROM study_logs WHERE date_key = ?`).get(today) as Omit<TodayProgress, 'nextReviewAt'>;
+  const { nextReviewAt } = db.prepare(`SELECT MIN(next_review_at) AS nextReviewAt FROM (
+    SELECT next_review_at FROM flashcards WHERE next_review_at > ?
+    UNION ALL SELECT next_review_at FROM mistakes WHERE status != 'mastered' AND next_review_at > ?
+  )`).get(now, now) as Pick<TodayProgress, 'nextReviewAt'>;
 
   // Heatmap for past 112 days (16 weeks)
   const heatmapRows = db
@@ -83,25 +93,25 @@ dashboardRouter.get('/', (_req, res) => {
        ), category_concepts AS (
         SELECT DISTINCT n.category_id, nc.concept_id FROM note_concepts nc INNER JOIN active_notes n ON n.id = nc.note_id
        ), scores AS (
-        SELECT cc.category_id, ROUND(AVG(c.mastery_score) * 100) AS mastery
+        SELECT cc.category_id, ROUND(AVG(CASE WHEN c.quiz_attempts > 0 THEN c.mastery_score END) * 100) AS mastery,
+          COUNT(*) AS concept_count, COUNT(CASE WHEN c.quiz_attempts > 0 THEN 1 END) AS tested_count
         FROM category_concepts cc INNER JOIN concepts c ON c.id = cc.concept_id GROUP BY cc.category_id
        )
-       SELECT cat.id, cat.name, cat.color, counts.note_count, scores.mastery
+       SELECT cat.id, cat.name, cat.color, counts.note_count, scores.mastery,
+         COALESCE(scores.concept_count, 0) AS concept_count, COALESCE(scores.tested_count, 0) AS tested_count
        FROM categories cat INNER JOIN note_counts counts ON counts.category_id = cat.id
        LEFT JOIN scores ON scores.category_id = cat.id
        ORDER BY counts.note_count DESC, cat.created_at ASC`
     )
     .all();
 
-  // Weakest concepts quick list
-  const weakConcepts = db
+  const concepts = db
     .prepare(
       `SELECT id, name, mastery_score, quiz_attempts, quiz_correct
        FROM active_concepts
-       ORDER BY mastery_score ASC, quiz_attempts DESC
-       LIMIT 5`
+       ORDER BY created_at DESC, id ASC`
     )
-    .all();
+    .all() as unknown as StudyConcept[];
 
   // Recent notes
   const recentNotes = db
@@ -133,7 +143,8 @@ dashboardRouter.get('/', (_req, res) => {
     heatmap,
     quizTrend,
     subjectMastery,
-    weakConcepts,
+    ...splitStudyConcepts(concepts),
+    todayProgress: { ...completedToday, nextReviewAt },
     recentNotes,
   });
 });

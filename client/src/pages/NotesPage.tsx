@@ -26,10 +26,10 @@ import { api } from '../api/client';
 import { MarkdownView } from '../components/MarkdownView';
 import { NoteSource } from '../components/NoteSource';
 import { TrashList } from '../components/TrashList';
-import type { Category, Note, PageId, Synthesis, TrashedNote } from '../types';
+import type { Note, PageId, Synthesis, TrashedNote } from '../types';
 
 interface NotesPageProps {
-  categories: Category[];
+  categoryLabels: ReadonlyMap<string, string>;
   initialNoteId?: string | null;
   onRefreshGlobal: () => void;
   onOpenImport: () => void;
@@ -39,7 +39,7 @@ interface NotesPageProps {
 const CAT_COLORS = ['#6366F1', '#0F766E', '#D97706', '#E11D48', '#8B5CF6', '#0284C7'];
 
 export function NotesPage({
-  categories,
+  categoryLabels,
   initialNoteId,
   onRefreshGlobal,
   onOpenImport,
@@ -347,7 +347,7 @@ export function NotesPage({
 
   const handleCreateCategory = async () => {
     if (!newCatName.trim()) return;
-    await api.createCategory({ name: newCatName.trim(), color: CAT_COLORS[categories.length % CAT_COLORS.length] });
+    await api.createCategory({ name: newCatName.trim(), color: CAT_COLORS[categoryLabels.size % CAT_COLORS.length] });
     setNewCatName('');
     setShowNewCat(false);
     onRefreshGlobal();
@@ -355,6 +355,9 @@ export function NotesPage({
 
   const toggleCheck = (id: string) =>
     setCheckedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  const getCategoryLabel = (note: Note) =>
+    (note.category_id && categoryLabels.get(note.category_id)) || note.category_name;
 
   const showDetailMobile = Boolean((subTab === 'notes' && activeNote) || (subTab === 'syntheses' && activeSynthesis));
   const legacy = useMemo(() => splitLegacyChatExcerpts(activeNote?.content ?? ''), [activeNote?.content]);
@@ -542,19 +545,19 @@ export function NotesPage({
                     >
                       全部
                     </button>
-                    {categories.map((c) => {
-                      const on = selectedCat === c.id;
+                    {Array.from(categoryLabels, ([id, label]) => {
+                      const on = selectedCat === id;
                       return (
                         <button
-                          key={c.id}
-                          onClick={() => setSelectedCat(on ? '' : c.id)}
-                          className="px-2.5 py-1 rounded-lg text-xs font-medium transition cursor-pointer"
+                          key={id}
+                          onClick={() => setSelectedCat(on ? '' : id)}
+                          className="max-w-full break-words px-2.5 py-1 rounded-lg text-xs font-medium transition cursor-pointer"
                           style={{
                             background: on ? 'var(--btn-primary-bg)' : 'var(--bg-subtle)',
                             color: on ? 'var(--btn-primary-fg)' : 'var(--text-secondary)',
                           }}
                         >
-                          {c.name}
+                          {label}
                         </button>
                       );
                     })}
@@ -598,6 +601,7 @@ export function NotesPage({
                   notes.map((n) => {
                     const isActive = activeNote?.id === n.id;
                     const isChecked = checkedIds.includes(n.id);
+                    const categoryLabel = getCategoryLabel(n);
                     return (
                       <div
                         key={n.id}
@@ -629,25 +633,26 @@ export function NotesPage({
                                   .slice(0, 90)}
                             </p>
                             <div className="flex items-center justify-between mt-2 gap-2 text-[10px] text-[var(--text-muted)]">
-                              <div className="flex items-center gap-1.5">
-                                {n.category_name && (
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                {categoryLabel && (
                                   <span
-                                    className="px-1.5 py-0.5 rounded"
+                                    title={categoryLabel}
+                                    className="truncate px-1.5 py-0.5 rounded"
                                     style={{ background: 'var(--bg-subtle)', color: 'var(--text-secondary)' }}
                                   >
-                                    {n.category_name}
+                                    {categoryLabel}
                                   </span>
                                 )}
                                 {n.summary && (
                                   <span
-                                    className="px-1.5 py-0.5 rounded"
+                                    className="shrink-0 px-1.5 py-0.5 rounded"
                                     style={{ background: 'var(--bg-subtle)', color: 'var(--text-primary)' }}
                                   >
                                     已总结
                                   </span>
                                 )}
                               </div>
-                              <span className="tabular-nums">{n.word_count} 字</span>
+                              <span className="shrink-0 tabular-nums">{n.word_count} 字</span>
                             </div>
                           </div>
                         </div>
@@ -794,8 +799,8 @@ export function NotesPage({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
-                  <span className="px-2 py-0.5 rounded-md" style={{ background: 'var(--bg-subtle)' }}>
-                    {activeNote.category_name || '未分类'}
+                  <span className="max-w-full break-words px-2 py-0.5 rounded-md" style={{ background: 'var(--bg-subtle)' }}>
+                    {getCategoryLabel(activeNote) || '未分类'}
                   </span>
                   <span>·</span>
                   <span className="tabular-nums">{activeNote.word_count} 字</span>
@@ -941,14 +946,16 @@ export function NotesPage({
                   <div className="space-y-3">
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <select
+                        aria-label="分类"
                         value={editCategoryId}
                         onChange={(e) => setEditCategoryId(e.target.value)}
-                        className="px-3 py-2 rounded-xl zw-input text-xs"
+                        title={categoryLabels.get(editCategoryId)}
+                        className="w-full min-w-0 px-3 py-2 rounded-xl zw-input text-xs"
                       >
                         <option value="">未分类</option>
-                        {categories.map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.name}
+                        {Array.from(categoryLabels, ([id, label]) => (
+                          <option key={id} value={id}>
+                            {label}
                           </option>
                         ))}
                       </select>

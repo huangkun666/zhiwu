@@ -528,10 +528,12 @@ export function updateConceptMastery(conceptName: string, isCorrect: boolean, no
     ? db.prepare(`SELECT id, category_id FROM notes WHERE id = ?`).get(noteId) as { id: string; category_id: string | null } | undefined
     : undefined;
   const conceptId = upsertConcept(trimmed, '', source?.category_id, source?.id);
-  const row = db.prepare(`SELECT quiz_attempts, quiz_correct FROM concepts WHERE id = ?`).get(conceptId) as {
+  const row = db.prepare(`SELECT quiz_attempts, quiz_correct, mastery_score FROM concepts WHERE id = ?`).get(conceptId) as {
     quiz_attempts: number;
     quiz_correct: number;
+    mastery_score: number;
   };
+  const before = row.quiz_attempts > 0 ? Math.round(row.mastery_score * 100) : null;
   const attempts = (row?.quiz_attempts || 0) + 1;
   const correct = (row?.quiz_correct || 0) + (isCorrect ? 1 : 0);
   // Smoothed Bayesian-like mastery score so 1 correct answer doesn't immediately become 100%
@@ -542,4 +544,5 @@ export function updateConceptMastery(conceptName: string, isCorrect: boolean, no
     mastery,
     conceptId
   );
+  return { id: conceptId, name: trimmed, before, after: Math.round(mastery * 100) };
 }

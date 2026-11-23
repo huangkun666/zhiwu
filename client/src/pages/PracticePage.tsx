@@ -2,23 +2,20 @@ import { useEffect, useState } from 'react';
 import { AlertTriangle, FileCheck2 } from 'lucide-react';
 import { MistakesPage } from './MistakesPage';
 import { QuizPage } from './QuizPage';
-import type { Category, PageId } from '../types';
+import type { Category, PageId, PracticeContext } from '../types';
 
 interface PracticePageProps {
   categories: Category[];
+  categoryLabels: ReadonlyMap<string, string>;
   activeMistakesCount: number;
-  initialContext?: {
-    subTab?: 'quiz' | 'mistakes';
-    noteIds?: string[];
-    weakOnly?: boolean;
-    focusConcepts?: string[];
-  } | null;
+  initialContext?: PracticeContext | null;
   onRefreshGlobal: () => void;
   onNavigate: (page: PageId, context?: any) => void;
 }
 
 export function PracticePage({
   categories,
+  categoryLabels,
   activeMistakesCount,
   initialContext,
   onRefreshGlobal,
@@ -75,6 +72,7 @@ export function PracticePage({
       {subTab === 'quiz' ? (
         <QuizPage
           categories={categories}
+          categoryLabels={categoryLabels}
           initialContext={initialContext}
           onRefreshGlobal={onRefreshGlobal}
           onNavigate={onNavigate}

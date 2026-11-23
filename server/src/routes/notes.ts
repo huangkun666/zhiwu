@@ -71,6 +71,25 @@ function formatNote(row: any) {
   };
 }
 
+function formatSearchResult(row: Record<string, unknown>, query: string) {
+  const { id, title, category_id, source_filename, tags, summary, content, source_content, chat_excerpts } = formatNote(row)!;
+  const texts = [content, source_content, ...chat_excerpts.map(({ content }: ChatExcerpt) => content)]
+    .filter((text): text is string => typeof text === 'string' && Boolean(text.trim()));
+  const needle = query.toLowerCase();
+  const abstract = typeof summary?.abstract === 'string' ? summary.abstract : '';
+  let excerpt = (abstract || texts[0] || '').slice(0, 240);
+  if (needle) {
+    for (const text of texts) {
+      const match = text.toLowerCase().indexOf(needle);
+      if (match < 0) continue;
+      const offset = Math.max(0, match - 48);
+      excerpt = `${offset ? '…' : ''}${text.slice(offset, offset + 240)}${text.length > offset + 240 ? '…' : ''}`;
+      break;
+    }
+  }
+  return { id, title, category_id, source_filename, tags, excerpt };
+}
+
 function getNoteRow(id: string) {
   return db.prepare(
     `SELECT n.*, c.name as category_name, c.color as category_color
@@ -89,25 +108,12 @@ notesRouter.get('/', (req, res) => {
   const tag = String(req.query.tag || '').trim();
   const sourceType = String(req.query.sourceType || '').trim();
   const hasSummary = String(req.query.hasSummary || '').trim();
+  const compact = req.query.view === 'compact';
+  const requestedLimit = Number(req.query.limit);
+  const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? requestedLimit : null;
 
   const conditions: string[] = [];
   const params: (string | number)[] = [];
-
-  if (q) {
-    // Combine FTS5 match + LIKE fallback so Chinese substring search is 100% accurate
-    const likeTerm = `%${q}%`;
-    const likeParams = Array<string>(5).fill(likeTerm);
-    const safeFts = q.replace(/["'*():^]/g, ' ').trim();
-    if (safeFts) {
-      conditions.push(
-        `(n.id IN (SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?) OR ${noteMatchesLike})`
-      );
-      params.push(`"${safeFts}"`, ...likeParams);
-    } else {
-      conditions.push(noteMatchesLike);
-      params.push(...likeParams);
-    }
-  }
 
   if (categoryId === 'uncategorized') {
     conditions.push(`n.category_id IS NULL`);
@@ -132,31 +138,30 @@ notesRouter.get('/', (req, res) => {
     conditions.push(`n.summary_json IS NULL`);
   }
 
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  const sql = `
-    SELECT n.*, c.name as category_name, c.color as category_color
-    FROM active_notes n
-    LEFT JOIN categories c ON n.category_id = c.id
-    ${where}
-    ORDER BY n.is_pinned DESC, n.updated_at DESC
-  `;
+  const select = (textMatch = '', textParams: string[] = []) => {
+    const predicates = [textMatch, ...conditions].filter(Boolean);
+    const sql = `SELECT n.*, c.name as category_name, c.color as category_color
+      FROM active_notes n LEFT JOIN categories c ON n.category_id = c.id
+      ${predicates.length ? `WHERE ${predicates.join(' AND ')}` : ''}
+      ORDER BY n.is_pinned DESC, n.updated_at DESC${limit ? ' LIMIT ?' : ''}`;
+    const bindings = limit ? [...textParams, ...params, limit] : [...textParams, ...params];
+    const statement = db.prepare(sql);
+    if (compact) return Array.from(statement.iterate(...bindings), (row) => formatSearchResult(row, q));
+    return statement.all(...bindings).map(formatNote);
+  };
+  if (!q) return res.json(select());
 
-  try {
-    const rows = db.prepare(sql).all(...params);
-    res.json(rows.map(formatNote));
-  } catch {
-    // Fallback without FTS if special query syntax occurs
-    const likeTerm = `%${q}%`;
-    const fallbackRows = db
-      .prepare(
-        `SELECT n.*, c.name as category_name, c.color as category_color
-         FROM active_notes n LEFT JOIN categories c ON n.category_id = c.id
-         WHERE ${noteMatchesLike}
-         ORDER BY n.is_pinned DESC, n.updated_at DESC`
-      )
-      .all(...Array<string>(5).fill(likeTerm));
-    res.json(fallbackRows.map(formatNote));
+  const likeParams = Array<string>(5).fill(`%${q}%`);
+  const safeFts = q.replace(/["'*():^]/g, ' ').trim();
+  if (safeFts) {
+    try {
+      return res.json(select(`(n.id IN (SELECT note_id FROM notes_fts WHERE notes_fts MATCH ?) OR ${noteMatchesLike})`,
+        [`"${safeFts}"`, ...likeParams]));
+    } catch {
+      // Use substring matching with the same filters if FTS cannot parse the query.
+    }
   }
+  res.json(select(noteMatchesLike, likeParams));
 });
 
 // Get all unique tags
@@ -278,6 +283,8 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
   }
 
   const categoryId = req.body?.categoryId ? String(req.body.categoryId) : null;
+  const compact = req.body?.view === 'compact';
+  const skipImageOcr = req.body?.ocrImages === 'false';
   let extraTags: string[] = [];
   if (req.body?.tags) {
     try {
@@ -293,26 +300,25 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
   const warnings: string[] = [];
 
   for (const file of files) {
-    // Fix UTF-8 filename encoding quirk in multer/busboy on Windows/browsers
+    // Decode UTF-8 filenames received as Latin-1 while retaining already-decoded Unicode names.
     let originalName = file.originalname;
-    try {
-      const decoded = Buffer.from(file.originalname, 'latin1').toString('utf8');
-      if (!decoded.includes('\uFFFD') && /[\u4e00-\u9fff]/.test(decoded)) {
-        originalName = decoded;
+    if (/^[\x00-\xff]+$/.test(originalName)) {
+      try {
+        originalName = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.from(originalName, 'latin1'));
+      } catch {
+        // Keep valid legacy Latin-1 filenames.
       }
-    } catch {
-      // keep original
     }
 
     const attachmentUrl = `/uploads/${file.filename}`;
     try {
-      const parsed = await parseUploadedFile(file.path, originalName, file.mimetype);
+      const parsed = await parseUploadedFile(file.path, originalName, file.mimetype, { skipImageOcr });
       if (parsed.warning) warnings.push(`${originalName}: ${parsed.warning}`);
 
       const id = uid();
       const now = nowIso();
       const isImage = parsed.sourceType === 'image';
-      const row = inTransaction(() => {
+      const note = inTransaction(() => {
         const category = existingCategoryId(categoryId);
         if (categoryId && !category) throw new Error('分类已不存在，请重新选择');
         db.prepare(
@@ -336,9 +342,10 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
         );
         syncNoteFts(id, parsed.title, parsed.content, extraTags);
         logStudyActivity('note_import', id);
-        return getNoteRow(id);
+        if (compact) return { id, title: parsed.title, category_id: category, source_filename: originalName };
+        return formatNote(getNoteRow(id));
       });
-      imported.push(formatNote(row));
+      imported.push(note);
     } catch (err: any) {
       // Remove uploaded temp file on rejection/failure
       fs.unlink(file.path, () => {});
@@ -383,7 +390,10 @@ notesRouter.put('/:id/chat-excerpts/:excerptId', (req, res) => {
   }
 
   const result = editNoteChat(id, (current) => {
-    if (current.chat_excerpts.some((excerpt) => excerpt.id === excerptId)) return current;
+    const existing = current.chat_excerpts.find(({ id }) => id === excerptId);
+    if (existing) {
+      return existing.content === content ? current : { error: '该摘录编号已有其他内容，请使用新的摘录编号' };
+    }
     const excerpt = { id: excerptId, content, created_at: nowIso() };
     return { ...current, chat_excerpts: [...current.chat_excerpts, excerpt] };
   });

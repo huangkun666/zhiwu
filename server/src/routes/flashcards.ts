@@ -170,14 +170,13 @@ flashcardsRouter.post('/:id/review', (req, res) => {
      WHERE id = ?`
   ).run(next.easeFactor, next.intervalDays, next.repetitions, next.nextReviewAt, now, now, card.id);
 
-  if (card.concept_name) {
-    updateConceptMastery(card.concept_name, rating >= 3, card.note_id);
-  }
+  const masteryChange = card.concept_name ? updateConceptMastery(card.concept_name, rating >= 3, card.note_id) : undefined;
   logStudyActivity('flashcard_review', card.id, rating >= 3 ? 1 : 0, 20);
 
   res.json({
     card: getCard(card.id),
     nextLabel: next.label,
+    masteryChange,
   });
 });
 
