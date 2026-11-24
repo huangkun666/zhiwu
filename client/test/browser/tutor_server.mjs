@@ -37,7 +37,7 @@ try {
   db = database.db;
   const app = express();
   app.use(express.json({ limit: '20mb' }));
-  for (const name of ['categories', 'dashboard', 'notes', 'tutor', 'settings']) {
+  for (const name of ['categories', 'dashboard', 'notes', 'tutor', 'settings', 'backups', 'transfer']) {
     const routes = await import(pathToFileURL(join(compiled, 'routes', name + '.js')));
     app.use('/api/' + name, routes[name + 'Router']);
   }

@@ -44,7 +44,7 @@ node --test client/test/*.test.mjs
 | 助教检索、原文引用 | [检索和续查](../../server/test/active-tutor.test.mjs)、[来源范围](../../server/test/tutor-context.test.mjs)、[两端交互](../../client/test/browser/tutor_retrieval.py) | 用中文问没有目录的长笔记和英文 PDF。核对实际原文、引用页或段落，以及返回对话后的位置。 |
 | 历史对话 | [两端共用的旧会话样例](../../server/test/fixtures/tutor-history.mjs)、[离线写入和重试](../../client/test/tutor-history.test.mjs)、[桌面与安卓界面](../../client/test/browser/tutor_history.py) | 准备超过 30 个旧会话，按标题、用户问题和助教回答查找。核对分页、续聊、改名及取消或确认删除。手机点「历史对话」时检查消息区的尺寸。 |
 | 学习进度、图谱或自动出题 | [桌面笔记](../../server/test/notes.test.mjs)、[离线库](../../client/test/library.test.mjs) | 同时准备已评估和待测知识点。验证只有可用来源参与实时统计，已有复习排期和测验结果仍可见。 |
-| 备份格式、保存或扫码传输 | [桌面备份](../../server/test/backup.test.mjs)、[离线归档](../../client/test/backup.test.mjs)、[安卓保存](../../client/test/backup-save.test.mjs)、[接收备份](../../server/test/backup-transfer.test.mjs) | 桌面与安卓双向恢复。检查原文件字节和学习进度，重试同一份及失败的归档。原生保存选择器和取消行为需要设备验证。 |
+| 备份格式、保存或扫码传输 | [桌面备份](../../server/test/backup.test.mjs)、[离线归档](../../client/test/backup.test.mjs)、[安卓保存](../../client/test/backup-save.test.mjs)、[备份设置入口](../../client/test/browser/backup_settings.py)、[接收备份](../../server/test/backup-transfer.test.mjs) | 从设置分别导出和恢复，检查原文件字节、学习进度及重复恢复。安卓用系统选择器实际保存并测试取消。旧 APK 检查导出按钮，以及同一个快传入口接收文件、同步笔记和发送备份。 |
 | MCP 或分类 | [MCP 集成](../../server/test/notes.test.mjs)、[文件范围](../../server/test/mcp-files.test.mjs)、[分类路径](../../server/test/category-paths.test.mjs) | 用 stdio 客户端验证默认工具、读权限、重名分支、可打开的回执和撤销入口。 |
 
 服务端集成测试使用临时数据库及回环端口。受限环境中若端口或文件链接权限导致测试失败或跳过，记录具体原因，并在允许这些能力的本机测试环境重跑相关用例。浏览器窄视口用于验证移动布局，原生选择器、WebView 存储和 OTA 安装在涉及这些行为时用安卓设备或模拟器验证。

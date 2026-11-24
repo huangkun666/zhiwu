@@ -12,7 +12,6 @@ import {
   ImageOff,
   Loader2,
   Moon,
-  QrCode,
   RefreshCw,
   RotateCcw,
   Save,
@@ -60,9 +59,7 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [modelFilter, setModelFilter] = useState('');
   const [modelsError, setModelsError] = useState('');
-  const [qrSendOpen, setQrSendOpen] = useState(false);
-  const [qrScanOpen, setQrScanOpen] = useState(false);
-  const [qrBackupOnly, setQrBackupOnly] = useState(false);
+  const [transferOpen, setTransferOpen] = useState(false);
 
   // Remote branch & commit update state
   const nativeOta = getNativeOtaState();
@@ -523,42 +520,8 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
 
       <LibraryBackupPanel
         onRestored={onSettingsChanged}
-        onOpenBackupTransfer={() => {
-          setQrBackupOnly(true);
-          setQrScanOpen(true);
-        }}
+        onOpenTransfer={() => setTransferOpen(true)}
       />
-
-      <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-4">
-        <div>
-          <h2 className="font-semibold text-sm">局域网快传</h2>
-          <p className="text-xs text-[var(--text-muted)] mt-0.5">
-            电脑和手机连接同一 Wi-Fi 后，可扫码传输文件。
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2.5">
-          {!IS_STANDALONE_MODE ? (
-            <button
-              onClick={() => setQrSendOpen(true)}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
-            >
-              <QrCode className="w-3.5 h-3.5" />
-              打开扫码快传
-            </button>
-          ) : (
-            <button
-              onClick={() => {
-                setQrBackupOnly(false);
-                setQrScanOpen(true);
-              }}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
-            >
-              <QrCode className="w-3.5 h-3.5" />
-              扫码从电脑导入 / 同步
-            </button>
-          )}
-        </div>
-      </div>
 
       {/* Application Update: Read-only Repo + Branch & Commit Selector */}
       <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-4">
@@ -871,13 +834,11 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
         )}
       </div>
 
-      <QrSendModal open={qrSendOpen} onClose={() => setQrSendOpen(false)} />
-      <QrScannerModal
-        open={qrScanOpen}
-        backupOnly={qrBackupOnly}
-        onClose={() => setQrScanOpen(false)}
-        onCompleted={() => onSettingsChanged?.()}
-      />
+      {IS_STANDALONE_MODE ? (
+        <QrScannerModal open={transferOpen} onClose={() => setTransferOpen(false)} onCompleted={onSettingsChanged} />
+      ) : (
+        <QrSendModal open={transferOpen} onClose={() => setTransferOpen(false)} />
+      )}
     </div>
   );
 }

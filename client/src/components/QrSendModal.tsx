@@ -323,9 +323,9 @@ export function QrSendModal({ open, onClose }: QrSendModalProps) {
 
               <p className="text-[11px] text-[var(--text-muted)]">
                 {receivingBackup ? (
-                  <>在同一 Wi-Fi 下，从手机打开 <strong>「扫码保存到电脑」</strong>。发送完成后，备份可在这里下载，30 分钟内有效。</>
+                  <>手机连接同一 Wi-Fi，在设置里打开 <strong>「局域网快传」</strong> 扫码并确认发送。收到备份后，在这里下载 ZIP。接收码 30 分钟内有效。</>
                 ) : (
-                  <>打开安卓手机「知悟」App → 点击 <strong>「+ 导入 → 扫码导入文件」</strong> 对准上方二维码即可秒传（同 Wi-Fi，30 分钟内有效）。</>
+                  <>手机连接同一 Wi-Fi，在设置里打开 <strong>「局域网快传」</strong> 扫码接收。二维码 30 分钟内有效。</>
                 )}
               </p>
 

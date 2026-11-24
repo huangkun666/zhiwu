@@ -156,7 +156,7 @@ transferRouter.get('/backup-receive/:receipt/download', (req, res) => {
     return res.status(404).json({ error: '备份文件尚未接收完成或已过期' });
   }
   res.setHeader('Cache-Control', 'no-store');
-  res.download(backup.path, `zhiwu-backup-${new Date().toISOString().slice(0, 10)}.zip`);
+  res.download(path.basename(backup.path), `zhiwu-backup-${new Date().toISOString().slice(0, 10)}.zip`, { root: BACKUP_TRANSFER_DIR });
 });
 
 transferRouter.get('/backup/:token', (req, res) => {

@@ -2,36 +2,44 @@ import { useRef, useState } from 'react';
 import { Archive, AlertCircle, CheckCircle2, Download, Loader2, QrCode, Upload } from 'lucide-react';
 import { api } from '../api/client';
 import type { BackupPreview } from '../../../server/src/shared/libraryBackup';
-import { canSaveBackupFile, saveBackupFile } from '../utils/saveBackupFile';
+import { chooseBackupDestination, saveBackupFile } from '../utils/saveBackupFile';
 
 interface LibraryBackupPanelProps {
   onRestored?: () => void;
-  onOpenBackupTransfer: () => void;
+  onOpenTransfer: () => void;
 }
 
 const button = 'inline-flex min-h-10 items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold cursor-pointer disabled:cursor-default disabled:opacity-50';
 
-export function LibraryBackupPanel({ onRestored, onOpenBackupTransfer }: LibraryBackupPanelProps) {
+export function LibraryBackupPanel({ onRestored, onOpenTransfer }: LibraryBackupPanelProps) {
   const input = useRef<HTMLInputElement>(null);
   const [pending, setPending] = useState<'export' | 'preview' | 'restore' | null>(null);
   const [candidate, setCandidate] = useState<{ file: File; preview: BackupPreview } | null>(null);
   const [feedback, setFeedback] = useState<{ kind: 'success' | 'warning' | 'error'; message: string } | null>(null);
-  const canSave = canSaveBackupFile();
+  const [readyToShare, setReadyToShare] = useState<{ blob: Blob; filename: string; missingAttachments: number } | null>(null);
 
   const exportBackup = async () => {
-    if (!canSave) {
-      onOpenBackupTransfer();
-      return;
-    }
     setPending('export');
     setFeedback(null);
     try {
-      const { blob, missingAttachments } = await api.exportBackup();
-      const day = new Date().toLocaleDateString('sv-SE');
-      if (await saveBackupFile(blob, `zhiwu-backup-${day}.zip`)) {
-        setFeedback(missingAttachments > 0 ? {
-          kind: 'warning', message: `已导出备份。有 ${missingAttachments} 份原文件当前不可用，对应笔记已备份。`,
-        } : { kind: 'success', message: '已导出完整备份。' });
+      const filename = readyToShare?.filename ?? `zhiwu-backup-${new Date().toLocaleDateString('sv-SE')}.zip`;
+      const destination = readyToShare ? 'share' : await chooseBackupDestination(filename);
+      if (!destination) {
+        setFeedback({ kind: 'warning', message: '备份尚未保存。可以重新导出。如果手机没有弹出保存窗口，请用「局域网快传」扫描电脑的「接收备份」码。' });
+        return;
+      }
+      const { blob, missingAttachments } = readyToShare ?? await api.exportBackup();
+      if (destination === 'share' && !readyToShare) {
+        // File sharing needs a fresh tap after a potentially long ZIP export.
+        setReadyToShare({ blob, missingAttachments, filename });
+        return;
+      }
+      if (await saveBackupFile(blob, filename, destination)) {
+        setReadyToShare(null);
+        const saved = destination === 'share' ? '备份已交给所选应用。' : destination === 'download' ? '已开始下载备份 ZIP。' : '已保存备份 ZIP。';
+        setFeedback(missingAttachments ? {
+          kind: 'warning', message: `${saved}有 ${missingAttachments} 份原文件当前不可用，对应笔记已备份。`,
+        } : { kind: 'success', message: saved });
       }
     } catch (error) {
       setFeedback({ kind: 'error', message: error instanceof Error ? error.message : '导出备份失败' });
@@ -41,6 +49,7 @@ export function LibraryBackupPanel({ onRestored, onOpenBackupTransfer }: Library
   };
 
   const previewBackup = async (file: File) => {
+    setReadyToShare(null);
     setCandidate(null);
     setFeedback(null);
     setPending('preview');
@@ -55,6 +64,7 @@ export function LibraryBackupPanel({ onRestored, onOpenBackupTransfer }: Library
 
   const restoreBackup = async () => {
     if (!candidate) return;
+    setReadyToShare(null);
     setFeedback(null);
     setPending('restore');
     try {
@@ -82,17 +92,23 @@ export function LibraryBackupPanel({ onRestored, onOpenBackupTransfer }: Library
         <Archive className="mt-0.5 size-4 shrink-0 text-[var(--text-secondary)]" />
         <div>
           <h2 id="library-backup-title" className="text-sm font-semibold">完整备份</h2>
-          <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">把原文件、笔记、回收站和学习进度一起带到另一台电脑或安卓设备。</p>
+          <p className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">把笔记、原文件、历史对话、回收站和学习进度保存为 ZIP。手机和电脑连上同一 Wi-Fi 后也可以扫码互传。</p>
         </div>
       </div>
       <div className="flex flex-wrap gap-2">
         <button type="button" onClick={exportBackup} disabled={pending !== null} className={`${button} zw-btn-primary`}>
-          {pending === 'export' ? <Loader2 className="size-3.5 animate-spin" /> : canSave ? <Download className="size-3.5" /> : <QrCode className="size-3.5" />}
-          {pending === 'export' ? '正在生成备份' : canSave ? '导出完整备份' : '扫码保存到电脑'}
+          {pending === 'export' ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+          {pending === 'export' ? '正在导出备份' : readyToShare ? '保存或分享 ZIP' : '导出完整备份'}
         </button>
         <button type="button" onClick={() => input.current?.click()} disabled={pending !== null} className={`${button} zw-btn-secondary`}>
           {pending === 'preview' ? <Loader2 className="size-3.5 animate-spin" /> : <Upload className="size-3.5" />}
           {pending === 'preview' ? '正在读取备份' : '选择备份恢复'}
+        </button>
+        <button type="button" onClick={() => {
+          setReadyToShare(null);
+          onOpenTransfer();
+        }} disabled={pending !== null} className={`${button} zw-btn-secondary`}>
+          <QrCode className="size-3.5" /> 局域网快传
         </button>
         <input ref={input} type="file" accept=".zip,.zhiwu,.json,application/zip,application/json" hidden
           onChange={(event) => {
@@ -101,6 +117,7 @@ export function LibraryBackupPanel({ onRestored, onOpenBackupTransfer }: Library
             if (file) void previewBackup(file);
           }} />
       </div>
+      {readyToShare && <p role="status" className="text-xs leading-relaxed text-[var(--text-secondary)]">ZIP 已生成。点「保存或分享 ZIP」选择接收文件的应用。</p>}
       {candidate && (
         <div className="space-y-4 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-3.5 sm:p-4">
           <div>

@@ -37,24 +37,87 @@ test('saving a backup waits for the Android picker and commits only complete out
     return {};
   };
 
-  const { canSaveBackupFile, saveBackupFile } = await testServer.ssrLoadModule('/src/utils/saveBackupFile.ts');
-  assert.equal(canSaveBackupFile(), true);
+  const { chooseBackupDestination, saveBackupFile } = await testServer.ssrLoadModule('/src/utils/saveBackupFile.ts');
+  const target = await chooseBackupDestination('library.zip');
+  assert.equal(target, 'native');
   const bytes = Uint8Array.from([0, 255, 7, 209]);
   const blob = new Blob([bytes], { type: 'application/zip' });
-  assert.equal(await saveBackupFile(blob, 'library.zip'), false);
+  assert.equal(await saveBackupFile(blob, 'library.zip', target), false);
   assert.deepEqual(calls.map(({ method }) => method), ['chooseFile']);
 
   cancel = false;
   calls.length = 0;
-  assert.equal(await saveBackupFile(blob, 'library.zip'), true);
+  assert.equal(await saveBackupFile(blob, 'library.zip', target), true);
   assert.deepEqual(calls.map(({ method }) => method), ['chooseFile', 'writeChunk', 'finish']);
   assert.deepEqual(calls[0].value, { filename: 'library.zip', mimeType: 'application/zip', size: bytes.length });
   assert.deepEqual(new Uint8Array(Buffer.from(calls[1].value.base64, 'base64')), bytes);
 
   diskError = true;
   calls.length = 0;
-  await assert.rejects(saveBackupFile(blob, 'library.zip'), /write failed/);
+  await assert.rejects(saveBackupFile(blob, 'library.zip', target), /write failed/);
   assert.deepEqual(calls.map(({ method }) => method), ['chooseFile', 'writeChunk', 'abort']);
+});
+
+test('an older APK can save locally with the system WebView picker, including cancel and failed writes', async (t) => {
+  t.mock.method(Capacitor, 'isPluginAvailable', () => false);
+  const { chooseBackupDestination, saveBackupFile } = await testServer.ssrLoadModule('/src/utils/saveBackupFile.ts');
+  const calls = [];
+  const blob = new Blob(['example ZIP bytes'], { type: 'application/zip' });
+  let writeError = false;
+  const handle = { createWritable: async () => ({
+    write: async (data) => {
+      calls.push('write');
+      assert.equal(data, blob);
+      if (writeError) throw new Error('disk full');
+    },
+    close: async () => calls.push('close'),
+    abort: async () => calls.push('abort'),
+  }) };
+  const original = globalThis.showSaveFilePicker;
+  t.after(() => {
+    if (original) globalThis.showSaveFilePicker = original;
+    else delete globalThis.showSaveFilePicker;
+  });
+  globalThis.showSaveFilePicker = async ({ suggestedName }) => {
+    assert.equal(suggestedName, 'library.zip');
+    calls.push('pick');
+    return handle;
+  };
+  const picking = chooseBackupDestination('library.zip');
+  assert.deepEqual(calls, ['pick'], 'open the picker during the original click');
+  const destination = await picking;
+  assert.equal(await saveBackupFile(blob, 'library.zip', destination), true);
+  assert.deepEqual(calls, ['pick', 'write', 'close']);
+  writeError = true;
+  await assert.rejects(saveBackupFile(blob, 'library.zip', destination), /disk full/);
+  assert.deepEqual(calls.slice(-2), ['write', 'abort']);
+  globalThis.showSaveFilePicker = async () => { throw new DOMException('cancelled', 'AbortError'); };
+  assert.equal(await chooseBackupDestination('library.zip'), null);
+});
+
+test('an older APK offers file sharing only when the system accepts a ZIP, and keeps cancellation distinct', async (t) => {
+  t.mock.method(Capacitor, 'isPluginAvailable', () => false);
+  const { chooseBackupDestination, saveBackupFile } = await testServer.ssrLoadModule('/src/utils/saveBackupFile.ts');
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  t.after(() => Object.defineProperty(globalThis, 'navigator', original));
+  let shareCount = 0;
+  const navigator = {
+    canShare: ({ files: [file] }) => file.type === 'application/zip' && file.name === 'library.zip',
+    share: async ({ files: [file] }) => {
+      shareCount++;
+      assert.equal(await file.text(), 'ZIP data');
+      if (shareCount === 1) throw new DOMException('cancelled', 'AbortError');
+    },
+  };
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: navigator });
+  const target = await chooseBackupDestination('library.zip');
+  assert.equal(target, 'share');
+  const blob = new Blob(['ZIP data'], { type: 'application/zip' });
+  assert.equal(await saveBackupFile(blob, 'library.zip', target), false);
+  assert.equal(await saveBackupFile(blob, 'library.zip', target), true);
+  navigator.canShare = () => false;
+  await assert.rejects(chooseBackupDestination('library.zip'), /局域网快传.*接收备份/);
+  assert.equal(shareCount, 2);
 });
 
 test('backup QR destinations are explicit local addresses with a receive token', async () => {

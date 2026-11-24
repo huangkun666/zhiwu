@@ -9,7 +9,7 @@ import express from 'express';
 test('a backup can be received in chunks and downloaded only with the desktop receipt', async () => {
   const dist = resolve(fileURLToPath(new URL('../dist/', import.meta.url)));
   const fixture = mkdtempSync(join(dist, 'backup-transfer-test-'));
-  const copiedDist = join(fixture, 'server', 'dist');
+  const copiedDist = join(fixture, '.zhiwu', 'server', 'dist');
   mkdirSync(copiedDist, { recursive: true });
   for (const entry of ['db.js', 'routes', 'services', 'shared']) {
     cpSync(join(dist, entry), join(copiedDist, entry), { recursive: true });

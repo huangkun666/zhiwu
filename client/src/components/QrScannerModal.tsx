@@ -10,7 +10,6 @@ interface QrScannerModalProps {
   open: boolean;
   onClose: () => void;
   onCompleted?: (result: { kind: 'files' | 'sync'; notes?: Note[]; count: number }) => void;
-  backupOnly?: boolean;
 }
 
 function base64ToFile(base64: string, name: string, mimeType: string): File {
@@ -20,7 +19,7 @@ function base64ToFile(base64: string, name: string, mimeType: string): File {
   return new File([bytes], name, { type: mimeType || 'application/octet-stream' });
 }
 
-export function QrScannerModal({ open, onClose, onCompleted, backupOnly = false }: QrScannerModalProps) {
+export function QrScannerModal({ open, onClose, onCompleted }: QrScannerModalProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -54,10 +53,6 @@ export function QrScannerModal({ open, onClose, onCompleted, backupOnly = false 
     const destination = parseBackupReceiveUrl(url);
     stopCamera();
     setCameraPaused(true);
-    if (backupOnly && !destination) {
-      setError('请扫描电脑端「接收备份」的二维码');
-      return;
-    }
     if (!url || !/^https?:\/\//i.test(url)) {
       setError('未识别到有效的快传链接（需以 http:// 或 https:// 开头）');
       return;
@@ -217,7 +212,7 @@ export function QrScannerModal({ open, onClose, onCompleted, backupOnly = false 
         >
           <div className="flex items-center gap-2">
             <QrCode className="w-4 h-4" />
-            <h3 id="qr-scanner-title" className="font-semibold text-sm">{backupOnly ? '扫码保存到电脑' : '扫码导入文件 / 同步电脑笔记'}</h3>
+            <h3 id="qr-scanner-title" className="font-semibold text-sm">局域网快传</h3>
           </div>
           <button
             type="button"
@@ -234,9 +229,9 @@ export function QrScannerModal({ open, onClose, onCompleted, backupOnly = false 
         </div>
 
         <div className="p-5 space-y-4">
-          {backupOnly && !doneMsg && (
+          {!doneMsg && (
             <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-              在同一 Wi-Fi 下，打开电脑的「手机与电脑快传 → 接收备份」，再扫描接收二维码。
+              手机和电脑连上同一 Wi-Fi，在电脑的「局域网快传」选择发送文件、同步笔记或接收备份，再用手机扫码。
             </p>
           )}
           {/* Camera Viewfinder */}
@@ -318,8 +313,8 @@ export function QrScannerModal({ open, onClose, onCompleted, backupOnly = false 
                     value={manualUrl}
                     disabled={Boolean(busyText)}
                     onChange={(e) => setManualUrl(e.target.value)}
-                    aria-label={backupOnly ? '备份接收链接' : '快传链接'}
-                    placeholder={backupOnly ? '粘贴备份接收链接' : '粘贴快传链接'}
+                    aria-label="快传链接"
+                    placeholder="粘贴快传链接"
                     className="w-full pl-8 pr-3 py-2 rounded-xl zw-input text-xs font-mono"
                   />
                 </div>
@@ -329,7 +324,7 @@ export function QrScannerModal({ open, onClose, onCompleted, backupOnly = false 
                   onClick={() => handleTransferUrl(manualUrl)}
                   className="px-3.5 py-2 rounded-xl zw-btn-primary text-xs font-semibold disabled:opacity-45 cursor-pointer"
                 >
-                  {backupOnly ? '连接' : '拉取'}
+                  连接
                 </button>
               </div>
             </div>
