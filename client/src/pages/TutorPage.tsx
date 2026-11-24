@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   BookMarked,
   BookOpen,
@@ -21,6 +21,7 @@ import { TutorHistory } from '../components/TutorHistory';
 import { TutorModeDialog } from '../components/TutorModeDialog';
 import { TutorNoteEditCard } from '../components/TutorNoteEditCard';
 import { useTutorHistory } from './useTutorHistory';
+import { useTutorTurns } from './useTutorTurns';
 import type { Note, TutorMessage, TutorMode, TutorSession } from '../types';
 
 interface NewSessionOptions {
@@ -31,6 +32,7 @@ interface NewSessionOptions {
 }
 
 interface TutorPageProps {
+  visible: boolean;
   initialContext?: NewSessionOptions & {
     sessionId?: string;
     scrollTop?: number;
@@ -42,18 +44,27 @@ interface TutorPageProps {
 
 type NoteAppend = { noteId: string; excerptId: string };
 
-export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onSessionChange }: TutorPageProps) {
+export function TutorPage({ visible, initialContext, onRefreshGlobal, onOpenCitation, onSessionChange }: TutorPageProps) {
   const history = useTutorHistory();
   const [historyOpen, setHistoryOpen] = useState(false);
   const [modeDialog, setModeDialog] = useState<'create' | 'settings' | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   const [activeSession, setActiveSession] = useState<TutorSession | null>(null);
   const [messages, setMessages] = useState<TutorMessage[]>([]);
+  const replies = useTutorTurns();
+  const turn = replies.turns.get(activeSession?.id ?? null);
+  const sending = Boolean(turn && !turn.error);
+  const streamingText = turn?.text ?? '';
+  const visibleStream = cleanHistory(streamingText);
+  const retrievalStatus = turn?.status;
+  const previous = turn?.previous ?? messages;
+  const question = turn?.question;
   const mode = activeSession?.mode ?? 'general';
   const visibleMessages = useMemo(() => {
-    const openingMode = messages[0]?.role === 'assistant' && tutorOpeningMode(messages[0].content);
-    const visible = openingMode && openingMode !== mode ? messages.slice(1) : messages;
-    return visible.map(message => {
+    const saved = question ? [...previous, question] : previous;
+    const openingMode = saved[0]?.role === 'assistant' && tutorOpeningMode(saved[0].content);
+    const displayed = openingMode && openingMode !== mode ? saved.slice(1) : saved;
+    return displayed.map(message => {
       const assistant = message.role === 'assistant';
       const text = assistant ? cleanHistory(message.content) : message.content;
       return {
@@ -62,14 +73,10 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
         content: text === message.content ? text : text.trimEnd(),
       };
     });
-  }, [messages, mode]);
+  }, [previous, question, mode]);
   const [selectedNoteIds, setSelectedNoteIds] = useState<string[]>([]);
   const [discardedNoteIds, setDiscardedNoteIds] = useState<string[]>([]);
   const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
-  const [streamingText, setStreamingText] = useState('');
-  const visibleStream = cleanHistory(streamingText);
-  const [retrievalStatus, setRetrievalStatus] = useState('');
   const [showContextPicker, setShowContextPicker] = useState(false);
   const [toast, setToast] = useState<{ message: string; append?: NoteAppend } | null>(null);
   const [noteActionBusy, setNoteActionBusy] = useState(false);
@@ -78,7 +85,8 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
   const sessionRequest = useRef(0);
   const activeId = useRef<string | null>(null);
   const openingId = useRef<string | null>(null);
-  const pendingSend = useRef<symbol | null>(null);
+  const pageVisible = useRef(visible);
+  useLayoutEffect(() => { pageVisible.current = visible; }, [visible]);
   const toastTimer = useRef<number | undefined>(undefined);
   const noteRequest = useRef(0);
   const availableSelection = useMemo(
@@ -105,30 +113,41 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
     }
   };
 
-  const resetReply = () => {
-    pendingSend.current = null;
-    setSending(false);
-    setStreamingText('');
-    setRetrievalStatus('');
-  };
-
   const displaySession = (session: TutorSession, savedMessages: TutorMessage[]) => {
-    resetReply();
     activeId.current = session.id;
     setActiveSession(session);
-    onSessionChange(session.id);
-    setMessages(savedMessages);
+    if (pageVisible.current) onSessionChange(session.id);
+    setMessages([...savedMessages]);
     setSelectedNoteIds(session.selection_ids ?? session.note_ids ?? []);
     setDiscardedNoteIds([]);
     setInput('');
     setShowContextPicker(false);
   };
 
-  const openSession = async (id: string, request = ++sessionRequest.current) => {
+  const openSession = async (id: string, request = ++sessionRequest.current, refreshActive = false) => {
     openingId.current = id;
-    if (activeId.current === id) return;
-    const res = await api.getTutorMessages(id);
-    if (request === sessionRequest.current) displaySession(res.session, res.messages);
+    const alreadyOpen = activeId.current === id;
+    const wasPending = replies.get(id);
+    if (alreadyOpen && (!refreshActive || wasPending)) return;
+    let res = await api.getTutorMessages(id);
+    if (request !== sessionRequest.current) return;
+    if (wasPending && !replies.get(id)) {
+      // The reply may have been saved while this older snapshot was loading.
+      res = await api.getTutorMessages(id);
+    }
+    if (request !== sessionRequest.current) return;
+    if (!alreadyOpen) {
+      displaySession(res.session, res.messages);
+      return;
+    }
+    // A second window or a restored backup can change a conversation while we are away.
+    const oldSelection = activeSession?.selection_ids ?? activeSession?.note_ids ?? [];
+    setSelectedNoteIds(ids => ids.length === oldSelection.length && ids.every((value, i) => value === oldSelection[i])
+      ? res.session.selection_ids ?? res.session.note_ids ?? [] : ids);
+    const panel = conversationRef.current;
+    if (panel && panel.scrollTop + panel.clientHeight < panel.scrollHeight - 1) restoreScrollTop.current = panel.scrollTop;
+    setActiveSession(res.session);
+    setMessages([...res.messages]);
   };
 
   const selectSession = async (id: string) => {
@@ -184,118 +203,97 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
     await history.refreshAfterEdit(id, updated);
   };
 
+  const clearSession = () => {
+    activeId.current = null;
+    setActiveSession(null);
+    if (pageVisible.current) onSessionChange(null);
+    setMessages([]);
+    setInput('');
+    setSelectedNoteIds([]);
+    setDiscardedNoteIds([]);
+    setShowContextPicker(false);
+  };
+
   const deleteSession = async (id: string) => {
     await api.deleteTutorSession(id);
+    replies.forget(id);
     if (openingId.current === id) {
       ++sessionRequest.current;
       openingId.current = null;
     }
-    if (activeId.current === id) {
-      activeId.current = null;
-      resetReply();
-      setActiveSession(null);
-      onSessionChange(null);
-      setMessages([]);
-      setInput('');
-      setSelectedNoteIds([]);
-      setDiscardedNoteIds([]);
-      setShowContextPicker(false);
-    }
+    if (activeId.current === id) clearSession();
     await history.refreshAfterEdit(id);
   };
 
   useEffect(() => {
-    const request = sessionRequest.current;
+    if (!visible) {
+      setHistoryOpen(false);
+      setModeDialog(null);
+      return;
+    }
+    let left = false;
+    const request = initialContext ? ++sessionRequest.current : sessionRequest.current;
     const firstPage = history.refresh();
+    restoreScrollTop.current = initialContext?.scrollTop;
     void Promise.resolve().then(async () => {
-      if (request !== sessionRequest.current) return;
-      if (initialContext?.sessionId) await openSession(initialContext.sessionId);
-      else if (initialContext) await startNewSession(initialContext);
-      else {
-        const rows = await firstPage;
-        if (request === sessionRequest.current && rows?.length) await openSession(rows[0].id);
+      if (left || request !== sessionRequest.current) return;
+      if (initialContext && !initialContext.sessionId) return startNewSession(initialContext);
+      const id = initialContext?.sessionId ?? activeId.current;
+      if (id) {
+        if (id === activeId.current) onSessionChange(id);
+        try {
+          await openSession(id, request, true);
+          return;
+        } catch (cause) {
+          if (left || request !== sessionRequest.current) return;
+          if (!(cause instanceof Error) || cause.message !== '会话不存在') throw cause;
+          replies.forget(id);
+          clearSession();
+        }
       }
-    }).catch(e => showToast(e.message || '无法打开对话'));
-    return () => {
-      ++sessionRequest.current;
-      activeId.current = null;
-      openingId.current = null;
-      pendingSend.current = null;
-    };
-  }, []);
+      if (!replies.get(null)) {
+        const rows = await firstPage;
+        if (!left && request === sessionRequest.current && rows?.length) await openSession(rows[0].id);
+      }
+    }).catch(e => { if (!left) showToast(e.message || '无法打开对话'); });
+    return () => { left = true; };
+  }, [visible, initialContext]);
 
   useEffect(() => {
-    if (mode !== 'general') void refreshContextNotes();
-  }, [mode, activeSession?.id]);
+    if (visible && mode !== 'general') void refreshContextNotes();
+  }, [visible, mode, activeSession?.id]);
 
   useEffect(() => {
     const panel = conversationRef.current;
-    if (!panel || !messages.length) return;
+    if (!panel || !visibleMessages.length) return;
+    if (initialContext?.sessionId && initialContext.sessionId !== activeId.current && restoreScrollTop.current !== undefined) return;
     panel.scrollTop = restoreScrollTop.current ?? panel.scrollHeight;
     restoreScrollTop.current = undefined;
-  }, [messages, streamingText, sending]);
+  }, [visible, visibleMessages, streamingText, sending]);
 
-  const handleSend = async (customText?: string) => {
+  const handleSend = (customText?: string, retry = false) => {
+    const id = activeId.current;
+    const existing = replies.get(id);
+    if (existing && !existing.error) return;
     const text = (customText ?? input).trim();
-    if (!text || pendingSend.current) return;
-    const request = Symbol();
-    pendingSend.current = request;
-    setSending(true);
-    setRetrievalStatus('');
-    setStreamingText('');
-    let session = activeSession;
-    try {
-      if (!session) {
-        const opening = ++sessionRequest.current;
-        openingId.current = null;
-        const created = await api.createTutorSession({ mode, title: text.slice(0, 22) });
-        void history.refresh();
-        if (pendingSend.current !== request || opening !== sessionRequest.current) return;
-        activeId.current = created.id;
-        setActiveSession(created);
-        onSessionChange(created.id);
-        session = created;
-      }
-      const optimisticUser: TutorMessage = {
-        id: `temp-${Date.now()}`, session_id: session.id,
-        role: 'user', content: text, created_at: new Date().toISOString(),
-      };
-      setInput('');
-      setMessages((prev) => [...prev, optimisticUser]);
-      const res = await api.sendTutorMessageStream(
-        session.id,
-        mode === 'general' ? { message: text, mode } : { message: text, mode, noteIds: selectedNoteIds, discardedNoteIds },
-        (delta) => { if (pendingSend.current === request) setStreamingText((prev) => prev + delta); },
-        (status) => { if (pendingSend.current === request) setRetrievalStatus(status); },
-      );
+    const payload = retry ? existing?.payload : mode === 'general'
+      ? { message: text, mode }
+      : { message: text, mode, noteIds: selectedNoteIds, discardedNoteIds };
+    if (!payload?.message) return;
+    const request = ++sessionRequest.current;
+    if (!retry) setInput('');
+    void replies.send(id, payload, existing?.previous ?? messages, created => {
       void history.refresh();
-      if (activeId.current !== session.id) return;
-      if (pendingSend.current === request) {
-        if (mode !== 'general') setDiscardedNoteIds(prev => prev.filter(id => !discardedNoteIds.includes(id)));
-        setStreamingText('');
+      if (sessionRequest.current === request) displaySession(created, []);
+    }, (savedId, saved) => {
+      void history.refresh();
+      if (activeId.current !== savedId) return;
+      setMessages(saved);
+      const discarded = payload.discardedNoteIds;
+      if (discarded?.length) {
+        setDiscardedNoteIds(prev => prev.filter(noteId => !discarded.includes(noteId)));
       }
-      setMessages(prev => prev.some(m => m.id === res.assistantMessage.id) ? prev
-        : [...prev.filter(m => m.id !== optimisticUser.id), res.userMessage, res.assistantMessage]);
-    } catch (e: any) {
-      if (pendingSend.current !== request) return;
-      if (!session) { showToast(e.message || '无法新建对话'); return; }
-      setStreamingText('');
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `err-${Date.now()}`,
-          session_id: session!.id,
-          role: 'assistant',
-          content: `> **提示**：${e.message || '助教暂时无法回复，请检查「设置」中的模型配置。'}`,
-          created_at: new Date().toISOString(),
-        },
-      ]);
-    } finally {
-      if (pendingSend.current === request) {
-        pendingSend.current = null;
-        setSending(false);
-      }
-    }
+    });
   };
 
   // Closed-loop沉淀: Save an AI reply directly as a Flashcard
@@ -363,6 +361,7 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
       ? ['给我出一道追问，检验我是否真懂了', '我用大白话复述一遍，你帮我挑刺打分', '这个概念最容易在什么边界条件下误用？']
       : ['用生活类比帮我讲透核心原理', '提炼这份笔记最易混淆的 3 个考点', '这些知识实际怎么用？'];
 
+  if (!visible) return null;
   return (
     <div className="grid h-full min-h-0 grid-cols-1 grid-rows-[minmax(0,1fr)] lg:grid-cols-12 lg:gap-4">
       {toast && (
@@ -534,6 +533,13 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
           )}
 
           {/* Live Streaming Assistant Bubble */}
+          {turn?.error && (
+            <div role="alert" className="space-y-2 text-sm">
+              <p className="break-words">{turn.error}</p>
+              <button type="button" className="zw-btn-secondary rounded-lg px-3 py-1.5"
+                onClick={() => handleSend(undefined, true)}>重试</button>
+            </div>
+          )}
           {sending && (
             <div className="flex justify-start">
               <div

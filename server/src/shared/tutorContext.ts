@@ -108,6 +108,7 @@ export async function prepareTutorTurn(
   let trace: string[] = [];
   let facts: string[] = adjacent?.reason ? [adjacent.reason] : [];
   let scan: Awaited<ReturnType<typeof scanOriginals>> | undefined;
+  let scanInvalidated = false;
   let scopeChanged = false;
 
   async function refresh() {
@@ -117,6 +118,7 @@ export async function prepareTutorTurn(
       for (const unit of scores.keys()) if (!allowed.has(unit.document.note.id)) scores.delete(unit);
       trace = [];
       facts = [];
+      scanInvalidated ||= !!scan;
       scan = undefined;
       scopeChanged = true;
     }
@@ -152,7 +154,7 @@ export async function prepareTutorTurn(
       rememberHits(result.hits.map(hit => hit.unit), 12);
     }
   }
-  if ((adjacent ? adjacent.action : needsPlan || cursor || (generalLibrary && exhaustive)) && !literalLookup) {
+  if ((adjacent ? adjacent.action : needsPlan || cursor || exhaustive) && !literalLookup) {
     progress?.('正在查找参考资料…');
     let visionReads = 0;
     for (let round = 0; round < 6; round++) {
@@ -249,10 +251,11 @@ export async function prepareTutorTurn(
   const target = editing ? editTarget(docs, question, focused, used, !!citedReply(history)) : undefined;
   const role = mode === 'general' ? '你是知悟的对话助手。本轮查阅了用户的笔记。用自然语言直接回答；没有找到对应原文就如实说明。'
     : mode === 'feynman' ? '你是知悟的费曼考官。先评估解释，再用一两个追问引导学习。' : '你是知悟的笔记助教。直接、准确地回答。';
+  const scanInstructions = scan || scanInvalidated ? '\n检查进度由应用附在回答末尾。资料尚未全部核对时，结论限于现有依据。' : '';
   const messages: TutorMessage[] = [
-    { role: 'system', content: `${role} 资料是只读证据。对由本轮原文支持的结论紧跟相应编号，如 [S2]，应用会生成引用。只用下列实际编号，禁止自行编写来源链接。历史回答及聊天摘录不能代替原件。分别核对版本、单位、例外和表格列。依据不足就指出缺少的条件，通用知识标为延伸补充。已索引页数与本轮读回的段数不同。\n资料覆盖：\n${info || '无可用笔记'}\n工具记录：${[...facts, scan?.status, scopeChanged ? '部分笔记已变更，本轮已排除' : ''].filter(Boolean).join('；')}\n全文检索节选及已读原文：\n${material.join('\n\n') || '本轮未获得可用原文'}` },
+    { role: 'system', content: `${role} 资料是只读证据。对由本轮原文支持的结论紧跟相应编号，如 [S2]，应用会生成引用。只用下列实际编号，禁止自行编写来源链接。历史回答及聊天摘录不能代替原件。分别核对版本、单位、例外和表格列。依据不足就指出缺少的条件，通用知识标为延伸补充。已索引页数与本轮读回的段数不同。${scanInstructions}\n资料覆盖：\n${info || '无可用笔记'}\n工具记录：${[...facts, scan?.status, scopeChanged ? '部分笔记已变更，本轮已排除' : ''].filter(Boolean).join('；')}\n全文检索节选及已读原文：\n${material.join('\n\n') || '本轮未获得可用原文'}` },
     ...recentHistory(history, mode === 'general'),
-    { role: 'user', content: question },
+    { role: 'user', content: cursor && (scan || scanInvalidated || literalLookup) ? `${question}\n此前要核对的问题：${query}` : question },
   ];
   if (editing) {
     const preview = target?.units.filter(u => u.block.field === 'body').slice(0, 2).map(u => u.block.text).join('\n\n') ?? '';
@@ -261,6 +264,7 @@ export async function prepareTutorTurn(
   function render(reply: string, allowed = new Set(docs.map(d => d.note.id))) {
     const cited = new Set<Unit>();
     const link = (unit: Unit) => citationLink(unit.document.note, unit.block);
+    const activeScan = scan && docs.every(d => allowed.has(d.note.id)) ? scan : undefined;
     let answer = stripTutorMetadata(reply)
       .replace(/\[S(\d+)\]/g, (_, number: string) => {
         const unit = offered.get('S' + number);
@@ -268,7 +272,7 @@ export async function prepareTutorTurn(
         cited.add(unit);
         return link(unit);
       }).trim();
-    if (!cited.size) {
+    if (!cited.size && !activeScan?.findings.length) {
       const consulted = [...offered.values()].filter(u => allowed.has(u.document.note.id)).slice(0, 3);
       if (consulted.length) answer += '\n\n本轮查阅：' + consulted.map(link).join('、');
     }
@@ -284,11 +288,13 @@ export async function prepareTutorTurn(
       const next = exactOffset + exactListing.length;
       if (next < exactTotal) answer += `\n已列出前 ${next} 处，可继续查看。\n${progressMarker({ scope: '*', signature: exactSignature, next, question: query, literal })}`;
     }
-    if (scan && docs.every(d => allowed.has(d.note.id))) {
-      const additional = scan.findings.filter(({ unit, quote }) => !cited.has(unit) || !answer.includes(quote));
+    if (activeScan) {
+      const additional = activeScan.findings.filter(({ unit, quote }) => !cited.has(unit) || !answer.includes(quote));
       if (additional.length) answer += '\n\n逐段查到的原文：\n' + additional.map(({ unit, quote }) =>
         `- ${quote.replace(/[\r\n]+/g, ' ')} ${link(unit)}`).join('\n');
-      answer += '\n\n' + scan.footer;
+      answer += '\n\n' + activeScan.footer;
+    } else if (scan || scanInvalidated) {
+      answer += '\n\n逐段检查已中止，检查期间资料已变更。';
     }
     const gaps = coverage.filter(d => d.gap && allowed.has(d.note.id));
     for (const doc of gaps.slice(0, 5)) answer += `\n\n《${doc.note.title}》：${doc.gap}。`;
@@ -299,5 +305,5 @@ export async function prepareTutorTurn(
     }
     return answer;
   }
-  return { messages, render };
+  return { messages, render, scanFallback: scan || scanInvalidated ? '模型未能生成回答。' : undefined };
 }

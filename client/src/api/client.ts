@@ -2,6 +2,7 @@ import { Capacitor } from '@capacitor/core';
 import { localApi } from './localEngine';
 import type { BackupPreview } from '../../../server/src/shared/libraryBackup';
 import type { MasteryChange } from '../../../server/src/shared/todayLearning';
+import type { TutorChatPayload } from '../../../server/src/shared/tutorHistory';
 import type {
   AISettings,
   AIProviderConfig,
@@ -186,14 +187,14 @@ const serverApi = {
     request<TutorSession>('/api/tutor/sessions', { method: 'POST', body: JSON.stringify(payload) }),
   getTutorMessages: (sessionId: string) =>
     request<{ session: TutorSession; messages: TutorMessage[] }>(`/api/tutor/sessions/${encodeURIComponent(sessionId)}/messages`),
-  sendTutorMessage: (sessionId: string, payload: { message: string; noteIds?: string[]; discardedNoteIds?: string[]; mode?: TutorMode }) =>
+  sendTutorMessage: (sessionId: string, payload: TutorChatPayload) =>
     request<{ userMessage: TutorMessage; assistantMessage: TutorMessage }>(`/api/tutor/sessions/${encodeURIComponent(sessionId)}/chat`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   sendTutorMessageStream: async (
     sessionId: string,
-    payload: { message: string; noteIds?: string[]; discardedNoteIds?: string[]; mode?: TutorMode },
+    payload: TutorChatPayload,
     onDelta: (delta: string) => void,
     progress?: (message: string) => void,
   ): Promise<{ userMessage: TutorMessage; assistantMessage: TutorMessage }> => {

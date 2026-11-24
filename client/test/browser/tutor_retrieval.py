@@ -33,6 +33,7 @@ PDF_NAME = "Optical inspection handbook"
 BODY_NAME = "Field notebook"
 BODY_ORIGINAL = "Original register for the instrument housing. Preserve this signed record."
 NEW_CODE = "NB-REVISED-72"
+PARTIAL_SCAN_ANSWER = "INCOMPLETE_SCAN_SUMMARY"
 
 
 def field_entry(number):
@@ -121,6 +122,36 @@ class EditWitness(Witness):
         return "建议修正夜班验收码。\n\n```zhiwu-edit\n" + json.dumps(proposal) + "\n```"
 
 
+class ScanRequestFailure(Exception):
+    pass
+
+
+class ScanWitness:
+    def __init__(self, question, issue=None):
+        self.question = question
+        self.issue = issue
+        self.attempts = []
+        self.errors = []
+
+    def respond(self, body):
+        if not body["messages"][0]["content"].startswith("ZHIWU_SCAN"):
+            if self.issue == "request":
+                raise ScanRequestFailure()
+            return "本轮记录已整理。"
+        request = json.loads(body["messages"][-1]["content"])
+        assert request["question"] == self.question, request["question"]
+        keys = [key for key, _ in request["originals"]]
+        self.attempts.append((keys, body.get("response_format")))
+        if self.issue == "request":
+            raise ScanRequestFailure()
+        if self.issue == "format":
+            return '{"findings":['
+        if self.issue == "quote":
+            return json.dumps({"findings": [{"unit": keys[0], "quote": "虚构的测试摘录"}]})
+        return json.dumps({"findings": [{"unit": key, "quote": "备用供电仍可用。"}
+                                        for key, source in request["originals"] if "备用供电仍可用。" in source]})
+
+
 class Model(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -152,6 +183,20 @@ class Model(BaseHTTPRequestHandler):
             else:
                 self.headers_for("application/json")
                 self.wfile.write(json.dumps({"choices": [{"message": {"content": reply}}]}).encode())
+        except ScanRequestFailure:
+            if body.get("stream"):
+                token = json.dumps({"choices": [{"delta": {"content": PARTIAL_SCAN_ANSWER}}]})
+                partial = f"data: {token}\n\n".encode()
+                self.send_response(200)
+                # Close early so the gateway reports a transport failure after the first delta.
+                self.send_header("Content-Length", str(len(partial) + 200))
+                self.headers_for("text/event-stream")
+                self.wfile.write(partial)
+                self.wfile.flush()
+            else:
+                self.send_response(503)
+                self.headers_for("text/plain")
+                self.wfile.write(b"Fixture model could not read the requested paragraphs")
         except Exception as error:
             witness.errors.append(repr(error))
             self.send_error(500, "Fixture model protocol mismatch")
@@ -211,6 +256,85 @@ class TutorBrowserTest(unittest.TestCase):
             if page.evaluate("document.visibilityState === 'visible' && innerWidth > 0 && innerHeight > 0"):
                 return page
         self.fail("No visible APK WebView target")
+
+
+class TutorScanStatusTest(TutorBrowserTest):
+    def check_scan_statuses(self, mode, viewport):
+        origin = self.origins[mode]
+        with self.browser.new_context(viewport=viewport, service_workers="block") as context:
+            page = context.new_page()
+            page.goto(origin)
+            page.evaluate("""async (model) => {
+                const {api} = await import('/src/api/client.ts');
+                const settings = await api.getSettings();
+                settings.providers.find(p => p.id === 'local').baseUrl = model;
+                await api.saveSettings({...settings, activeProviderId:'local'});
+                const entries = Array.from({length: 43}, (_, i) =>
+                    `实验 ${i + 1}。${'记录了设备的运行情况。'.repeat(20)}${i === 42 ? '备用供电仍可用。' : ''}`);
+                await api.createNote({title: '供电实验记录', content: entries.join('\\n\\n')});
+            }""", self.model_origin)
+            page.get_by_role("button", name="助教", exact=True).click()
+            messages = page.get_by_role("region", name="对话消息")
+            field = page.locator("textarea")
+            send = page.get_by_role("button", name="发送消息")
+            streams = []
+            page.on("response", lambda r: streams.append(r) if "/chat-stream" in r.url else None)
+            question = "逐段核对供电实验记录"
+            for issue, reason in [("request", "模型请求未成功或没有返回内容"),
+                                  ("format", "模型返回的结果格式无法解析"),
+                                  ("quote", "模型摘录与原文不符")]:
+                with self.subTest(mode=mode, issue=issue):
+                    page.get_by_role("button", name="新建对话", exact=True).click()
+                    dialog = page.get_by_role("dialog", name="新建对话", exact=True)
+                    dialog.get_by_role("radio", name="深度答疑", exact=True).check()
+                    dialog.get_by_role("button", name="创建对话", exact=True).click()
+                    expect(dialog).to_be_hidden()
+                    self.model.witness = witness = ScanWitness(question, issue)
+                    field.fill(question)
+                    send.click()
+                    status = messages.get_by_text(re.compile(r"本轮完成 0 段，累计 0/43 段。.*" + reason))
+                    expect(status).to_be_visible(timeout=30000)
+                    expect(status).to_contain_text("重试逐段检查")
+                    expect(messages.get_by_text("虚构的测试摘录")).to_have_count(0)
+                    expect(messages.get_by_text("可继续检查剩余段落")).to_have_count(0)
+                    self.assertEqual(witness.errors, [])
+                    self.assertEqual(len(witness.attempts), 3)
+                    self.assertEqual(witness.attempts[0][1], {"type": "json_object"})
+                    if issue == "request":
+                        self.assertEqual(witness.attempts[1], (witness.attempts[0][0], None))
+                        expect(messages.get_by_text("模型未能生成回答。", exact=True)).to_be_visible()
+                        expect(messages.get_by_text(PARTIAL_SCAN_ANSWER)).to_have_count(0)
+                        if mode == "desktop":
+                            self.assertIn(PARTIAL_SCAN_ANSWER, streams[-1].text())
+                        saved = page.evaluate("""async () => {
+                            const {api} = await import('/src/api/client.ts');
+                            const [{id}] = await api.getTutorSessions();
+                            const {messages} = await api.getTutorMessages(id);
+                            return messages.at(-1).content;
+                        }""")
+                        self.assertIn(reason, saved)
+                        self.assertIn("模型未能生成回答。", saved)
+                        self.assertNotIn(PARTIAL_SCAN_ANSWER, saved)
+                    else:
+                        self.assertLess(len(witness.attempts[1][0]), len(witness.attempts[0][0]))
+            self.model.witness = witness = ScanWitness(question)
+            field.fill("重试逐段检查")
+            send.click()
+            expect(messages.get_by_text(re.compile(r"本轮完成 43 段，累计 43/43 段"))).to_be_visible(timeout=30000)
+            citation = messages.get_by_role("link", name="供电实验记录 · 正文第 43 段", exact=True)
+            expect(citation).to_be_visible()
+            self.assertEqual(witness.errors, [])
+            self.assertEqual([key for keys, _ in witness.attempts for key in keys], [f"N1 #{i}" for i in range(1, 44)])
+            citation.click()
+            expect(page.locator("mark[data-source-target]").filter(has_text="备用供电仍可用。")).to_be_in_viewport()
+            page.get_by_role("button", name="返回对话").click()
+            expect(messages.get_by_text(re.compile(r"累计 43/43 段"))).to_be_visible()
+
+    def test_desktop_sqlite(self):
+        self.check_scan_statuses("desktop", {"width": 1440, "height": 960})
+
+    def test_standalone_indexeddb(self):
+        self.check_scan_statuses("standalone", {"width": 390, "height": 844})
 
 
 class TutorRetrievalTest(TutorBrowserTest):
@@ -358,7 +482,7 @@ class TutorRetrievalTest(TutorBrowserTest):
                 citation.click()
                 if kind == "pdf":
                     self.assertEqual(params.get("page"), [str(PDF_PAGE)])
-                    expect(page.get_by_role("img", name=f"PDF 第 {PDF_PAGE} 页", exact=True)).to_be_visible()
+                    expect(page.get_by_role("img", name=f"PDF 第 {PDF_PAGE} 页", exact=True)).to_be_visible(timeout=20000)
                     expect(page.get_by_text(f"第 {PDF_PAGE} / 32 页", exact=True)).to_be_visible()
                 else:
                     expect(page.locator("mark[data-source-target]").filter(has_text=answer)).to_be_in_viewport()

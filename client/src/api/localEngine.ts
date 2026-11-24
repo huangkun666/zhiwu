@@ -1,6 +1,6 @@
 import { prepareTutorTurn, runTutorChat } from '../../../server/src/shared/tutorContext';
 import { stripTutorNoteEdit } from '../../../server/src/shared/tutorNoteEdit';
-import { compareTutorHistory, readTutorHistoryCursor, tutorHistoryPage, tutorSessionTitle } from '../../../server/src/shared/tutorHistory';
+import { compareTutorHistory, readTutorHistoryCursor, savedTutorPair, tutorHistoryPage, tutorMessageIds, tutorSessionTitle, type TutorChatPayload } from '../../../server/src/shared/tutorHistory';
 import { isTutorMode, newTutorMode, requireTutorMode, tutorDefaultTitles, type TutorMode } from '../../../server/src/shared/tutorMode';
 import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, reviewedNoteContent, stripInlineImages } from '../../../server/src/shared/noteContent';
 import { existingIds, questionSourceId, readIds, tutorNoteScope, tutorNoteSelection } from '../../../server/src/shared/libraryReferences';
@@ -949,7 +949,6 @@ function normalizeChoiceAnswer(ans: string): string {
 }
 
 type TutorSettings = Partial<Pick<TutorSession, 'title' | 'mode'>>;
-type TutorChatPayload = { message: string; noteIds?: string[]; discardedNoteIds?: string[]; mode?: TutorMode };
 
 async function updateLocalTutorSession(state: LocalDBState, session: TutorSession, changes: TutorSettings) {
   let saved = writes;
@@ -993,9 +992,9 @@ async function localTutorReply(
     const current = (state: LocalDBState) => new Set(activeNotes(state)
       .filter(note => versions.get(note.id) === note.updated_at).map(note => note.id));
     const turn = await prepareTutorTurn(mode, notes, automatic, history, payload.message,
-      query => callLLMDirect(provider, query, { temperature: 0, maxTokens: query[0].content.startsWith('ZHIWU_SCAN') ? 1800 : 300 }),
+      (query, options) => callLLMDirect(provider, query, { temperature: 0, maxTokens: 300, ...options }),
       async () => current(await loadState()), readLocalPdfPageWithVision, progress);
-    return { messages: turn.messages, render: (reply: string, state: LocalDBState) => turn.render(reply, current(state)), selectNoteIds };
+    return { ...turn, render: (reply: string, state: LocalDBState) => turn.render(reply, current(state)), selectNoteIds };
   }
   return runTutorChat(mode, history, payload.message, messages => callLLMDirect(provider, messages), readNotes);
 }
@@ -2229,6 +2228,12 @@ export const localApi = {
     if (!source) throw new Error('会话不存在');
     const message = String(payload.message || '').trim();
     if (!message) throw new Error('消息内容不能为空');
+    const ids = tutorMessageIds(sessionId, payload.turnId);
+    const saved = savedTutorPair(initial.tutorMessages[sessionId] ?? [], ids, message);
+    if (saved) {
+      await waitForSavedState(initial);
+      return saved;
+    }
     const mode = payload.mode === undefined ? source.mode : requireTutorMode(payload.mode);
     const provider = requireActiveProvider(initial.settings);
     if (mode !== source.mode) await updateLocalTutorSession(initial, source, { mode });
@@ -2236,8 +2241,13 @@ export const localApi = {
     const s = await loadState();
     const session = s.tutorSessions.find((item) => item.id === sessionId);
     if (!session) throw new Error('会话已被删除');
-    const userMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
-    const assistantMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: sources ? sources.render(reply, s) : reply, created_at: nowIso() };
+    const concurrent = savedTutorPair(s.tutorMessages[sessionId] ?? [], ids, message);
+    if (concurrent) {
+      await waitForSavedState(s);
+      return concurrent;
+    }
+    const userMessage: TutorMessage = { id: ids?.user ?? uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
+    const assistantMessage: TutorMessage = { id: ids?.assistant ?? uid(), session_id: sessionId, role: 'assistant', content: sources ? sources.render(reply, s) : reply, created_at: nowIso() };
     (s.tutorMessages[sessionId] ||= []).push(userMessage, assistantMessage);
     if (sources?.selectNoteIds) session.note_ids = noteIdsIn(s, sources.selectNoteIds(session.note_ids), true);
     session.updated_at = nextNoteUpdatedAt(session.updated_at);

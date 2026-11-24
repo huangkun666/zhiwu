@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { prepareTutorTurn } from '../dist/shared/tutorContext.js';
+import { prepareTutorTurn, runTutorChat } from '../dist/shared/tutorContext.js';
+import { progressMarker, scopeSignature } from '../dist/shared/tutorScan.js';
+import { catalog } from '../dist/shared/tutorSearch.js';
 import { sourceBlocks } from '../dist/shared/tutorSources.js';
 
 test('a tutor changes its search term and reads a previously unseen paragraph before citing it', async () => {
@@ -77,6 +79,156 @@ test('semantic reading validates original quotations and resumes from the last v
     JSON.stringify({ findings: [{ unit: 'N1 #1', quote: 'unverified output' }] }));
   assert.match(invalid.render(''), /累计 0\/130/);
   assert.doesNotMatch(invalid.messages[0].content, /unverified output/);
+});
+
+test('semantic reading accepts a fenced JSON result and recovers the exact original PDF whitespace', async () => {
+  const source = '供电中断\r\n  后，读数保留。';
+  const note = { id: 'power', title: '电源记录', content: '', source_type: 'pdf', source_content: source,
+    source_pages: [{start: 0, end: source.length, status: 'text'}] };
+  const turn = await prepareTutorTurn('qa', [note], false, [], '逐段检查断电记录', async ([system]) => {
+    assert.match(system.content, /^ZHIWU_SCAN/);
+    return '本段有一条证据。\n```json\n' + JSON.stringify({ findings: [{ unit: 'N1 #1', quote: '供电中断 后，读数保留。' }] }) + '\n```\n检查完毕。';
+  });
+  const answer = turn.render('记录如下。');
+  assert.match(answer, /累计 1\/1/);
+  assert.match(answer, /供电中断 {3}后，读数保留。.*\?note=power&part=source&at=1&sig=[^)]*&page=1/);
+});
+
+test('semantic reading retries an invalid result with fewer originals and advances on valid empty findings', async () => {
+  const note = { id: 'retry', title: '实验记录', content: Array.from({ length: 43 }, (_, i) =>
+    `实验 ${i + 1}。${'这是另一项实验的观察。'.repeat(20)}`).join('\n\n') };
+  const visits = [];
+  const turn = await prepareTutorTurn('qa', [note], false, [], '逐段找出断电记录', async ([, request]) => {
+    const keys = JSON.parse(request.content).originals.map(([key]) => key);
+    visits.push(keys);
+    return visits.length === 1 ? '{"findings":[{"unit":"N1 #1"' : '{"findings":[]}';
+  });
+  const answer = turn.render('已对照记录。');
+  assert.ok(visits.length >= 2);
+  assert.deepEqual(visits[1], visits[0].slice(0, visits[1].length));
+  assert.ok(visits[1].length < visits[0].length);
+  assert.deepEqual(visits.slice(1).flat(), Array.from({ length: 43 }, (_, i) => `N1 #${i + 1}`));
+  assert.match(answer, /累计 43\/43/);
+  assert.doesNotMatch(answer, /zhiwu-scan|可继续检查/);
+});
+
+test('semantic reading reports validation failures, preserves verified evidence, and retries from the last complete batch', async () => {
+  const note = { id: 'evidence', title: '实验记录', content: Array.from({ length: 43 }, (_, i) =>
+    `证据 ${i + 1}。${'这是另一项实验的观察。'.repeat(20)}`).join('\n\n') };
+  const question = '逐段找出实验记录';
+  let attempts = 0;
+  let completed = [];
+  const first = await prepareTutorTurn('qa', [note], false, [], question, async ([, request]) => {
+    const { originals } = JSON.parse(request.content);
+    if (!attempts++) {
+      completed = originals.map(([key]) => key);
+      return '{"findings":[]}';
+    }
+    return JSON.stringify({ findings: [
+      { unit: originals[0][0], quote: `证据 ${completed.length + 1}。` },
+      { unit: originals[0][0], quote: '杜撰的引文。' },
+    ] });
+  });
+  const answer = first.render('部分核对结果。');
+  assert.match(answer, new RegExp(`累计 ${completed.length}/43`));
+  assert.match(answer, /摘录与原文不符/);
+  assert.match(answer, new RegExp(`证据 ${completed.length + 1}。.*part=body&at=${completed.length + 1}&sig=`));
+  assert.doesNotMatch(answer, /杜撰的引文|可继续检查/);
+  const visits = [];
+  const second = await prepareTutorTurn('qa', [note], false,
+    [{ role: 'user', content: question }, { role: 'assistant', content: answer }], '重试逐段检查', async ([, request]) => {
+      const input = JSON.parse(request.content);
+      assert.equal(input.question, question);
+      visits.push(...input.originals.map(([key]) => key));
+      return '{"findings":[]}';
+    });
+  assert.equal(visits[0], `N1 #${completed.length + 1}`);
+  assert.match(second.render('已完成检查。'), /累计 43\/43/);
+});
+
+test('semantic reading identifies persistent request and response-format failures without counting unread content', async () => {
+  const note = { id: 'errors', title: '实验记录', content: '实验记录正文。' };
+  const results = [
+    [/模型请求未成功/, () => { throw Error('injected connection failure'); }],
+    [/模型返回的结果格式无法解析/, () => '暂时无法提供结果。'],
+  ];
+  for (const [message, result] of results) {
+    let visits = 0;
+    const turn = await prepareTutorTurn('qa', [note], false, [], '逐段检查实验记录', async () => {
+      visits++;
+      return result();
+    });
+    const answer = turn.render('未完成检查。');
+    assert.ok(visits > 1 && visits <= 3);
+    assert.match(answer, /累计 0\/1/);
+    assert.match(answer, message);
+    assert.doesNotMatch(answer, /可继续检查|injected connection failure/);
+  }
+});
+
+test('semantic reading can retry the same group when a provider rejects structured responses', async () => {
+  const note = { id: 'older-api', title: '实验记录', content: '实验记录正文。' };
+  const attempts = [];
+  const turn = await prepareTutorTurn('qa', [note], false, [], '逐段检查实验记录', async ([, request], options) => {
+    attempts.push([JSON.parse(request.content).originals, !!options?.jsonMode]);
+    if (options?.jsonMode) throw Error('structured responses unsupported');
+    return '```json\n{"findings":[]}\n```';
+  });
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[0], [attempts[1][0], true]);
+  assert.equal(attempts[1][1], false);
+  assert.match(turn.render('已完成。'), /累计 1\/1/);
+});
+
+test('a restored progress marker resumes only with the same source content', async () => {
+  const note = { id: 'restored', title: '实验记录', content: '原来的第一段。\n\n第二段。' };
+  const question = '逐段核对实验记录';
+  const marker = progressMarker({ scope: '*', signature: scopeSignature(catalog([note])), next: 1, question });
+  const history = [{ role: 'assistant', content: `累计 1/2。\n${marker}` }];
+  async function retry(source) {
+    const visits = [];
+    const turn = await prepareTutorTurn('qa', [source], false, history, '继续', async ([, request]) => {
+      const input = JSON.parse(request.content);
+      assert.equal(input.question, question);
+      visits.push(...input.originals.map(([key]) => key));
+      return '{"findings":[]}';
+    });
+    return { visits, answer: turn.render('已完成。') };
+  }
+  const unchanged = await retry(note);
+  assert.deepEqual(unchanged.visits, ['N1 #2']);
+  assert.match(unchanged.answer, /本轮完成 1 段，累计 2\/2/);
+  const changed = await retry({ ...note, content: '修改后的第一段。\n\n第二段。' });
+  assert.deepEqual(changed.visits, ['N1 #1', 'N1 #2']);
+  assert.match(changed.answer, /资料已变更.*本轮完成 2 段，累计 2\/2/);
+});
+
+test('semantic reading withholds stale findings and progress if a source changes before saving', async () => {
+  const note = { id: 'concurrent', title: '实验记录', content: '实验记录正文。' };
+  for (const duringScan of [true, false]) {
+    const current = new Set([note.id]);
+    const { render } = await prepareTutorTurn('qa', [note], false, [], '逐段检查实验记录', async () => {
+      if (duringScan) current.clear();
+      return JSON.stringify({ findings: [{ unit: 'N1 #1', quote: note.content }] });
+    }, async () => current);
+    const answer = render('已核对。', new Set());
+    assert.match(answer, /检查期间资料已变更/);
+    assert.doesNotMatch(answer, /实验记录正文|\?note=|累计 1\/1|zhiwu-scan/);
+  }
+});
+
+test('semantic reading keeps verified findings when the final answer request fails', async () => {
+  const note = { id: 'answer-failure', title: '实验记录', content: '此设备断电后保留读数。' };
+  const question = '逐段核对断电记录';
+  const { reply, sources } = await runTutorChat('qa', [], question, async () => {
+    throw Error('injected answer connection failure');
+  }, () => prepareTutorTurn('qa', [note], false, [], question, async () =>
+    JSON.stringify({ findings: [{ unit: 'N1 #1', quote: note.content }] })));
+  const output = sources.render(reply);
+  assert.match(output, /模型未能生成回答/);
+  assert.match(output, /累计 1\/1/);
+  assert.match(output, /此设备断电后保留读数。.*\?note=answer-failure&part=body&at=1/);
+  assert.doesNotMatch(output, /injected answer connection failure/);
 });
 
 test('reading a scanned page yields only a verified physical-page citation and reports extraction gaps', async () => {

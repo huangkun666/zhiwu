@@ -3,7 +3,7 @@ import { db, existingNoteIds, inTransaction, logStudyActivity, nowIso, uid } fro
 import { callLLM, tutorChatAI, tutorChatStreamAI } from '../services/ai.js';
 import { existingIds, readIds, tutorNoteScope, tutorNoteSelection } from '../shared/libraryReferences.js';
 import { nextNoteUpdatedAt } from '../shared/noteContent.js';
-import { readTutorHistoryCursor, tutorHistoryPage, tutorSessionTitle } from '../shared/tutorHistory.js';
+import { readTutorHistoryCursor, savedTutorPair, tutorHistoryPage, tutorMessageIds, tutorSessionTitle, type TutorChatPayload } from '../shared/tutorHistory.js';
 import { prepareTutorTurn, runTutorChat } from '../shared/tutorContext.js';
 import { newTutorMode, requireTutorMode, tutorDefaultTitles, type TutorMode } from '../shared/tutorMode.js';
 import { ensurePdfPageIndexes, readPdfPageWithVision } from '../services/pdfPageIndex.js';
@@ -31,13 +31,24 @@ function updateSession(id: string, changes: Partial<Pick<StoredTutorSession, 'ti
   });
 }
 
+function readSavedTutorPair(sessionId: string, ids: ReturnType<typeof tutorMessageIds>, message: string) {
+  if (!ids) return;
+  const rows = db.prepare('SELECT * FROM tutor_messages WHERE session_id = ? AND id IN (?, ?)').all(
+    sessionId, ids.user, ids.assistant,
+  ) as unknown as { id: string; session_id: string; role: string; content: string; created_at: string }[];
+  return savedTutorPair(rows, ids, message);
+}
+
 async function answerTutor(
   session: StoredTutorSession,
   message: string,
-  options?: { mode?: string; noteIds?: unknown; discardedNoteIds?: unknown },
+  options?: TutorChatPayload,
   onDelta?: (text: string) => void,
   progress?: (message: string) => void,
 ) {
+  const ids = tutorMessageIds(session.id, options?.turnId);
+  const saved = readSavedTutorPair(session.id, ids, message);
+  if (saved) return saved;
   const mode = options?.mode === undefined ? session.mode : requireTutorMode(options.mode);
   // Older clients set the mode with their next message. Apply that choice before awaiting the model.
   if (mode !== session.mode) updateSession(session.id, { mode });
@@ -63,23 +74,27 @@ async function answerTutor(
       return new Set(rows.flatMap(row => versions.get(String(row.id)) === row.updated_at ? [String(row.id)] : []));
     };
     const turn = await prepareTutorTurn(mode, notes, automatic, history, message,
-      (query) => callLLM(query, { temperature: 0, maxTokens: query[0].content.startsWith('ZHIWU_SCAN') ? 1800 : 300 }),
+      (query, options) => callLLM(query, { temperature: 0, maxTokens: 300, ...options }),
       async () => current(), readPdfPageWithVision, progress);
-    return { messages: turn.messages, render: (reply: string) => turn.render(reply, current()), selectNoteIds };
+    return { ...turn, render: (reply: string) => turn.render(reply, current()), selectNoteIds };
   }
   const { reply, sources } = await runTutorChat(mode, history, message,
     (messages, emit) => onDelta ? tutorChatStreamAI(mode, messages, emit ?? (() => {})) : tutorChatAI(mode, messages),
     readNotes, onDelta);
-  return saveTutorReply(session.id, message, () => sources ? sources.render(reply) : reply, sources?.selectNoteIds);
+  return saveTutorReply(session.id, message, () => sources ? sources.render(reply) : reply, ids, sources?.selectNoteIds);
 }
 
-function saveTutorReply(sessionId: string, message: string, renderReply: () => string, selectNoteIds?: (latest: unknown) => string[]) {
+function saveTutorReply(sessionId: string, message: string, renderReply: () => string,
+  ids: ReturnType<typeof tutorMessageIds>, selectNoteIds?: (latest: unknown) => string[]) {
   return inTransaction(() => {
+    // Another attempt may have completed while this one was waiting for the model.
+    const saved = readSavedTutorPair(sessionId, ids, message);
+    if (saved) return saved;
     const session = db.prepare(`SELECT note_ids, updated_at FROM tutor_sessions WHERE id = ?`).get(sessionId) as
       Pick<StoredTutorSession, 'note_ids' | 'updated_at'> | undefined;
     if (!session) throw new Error('会话已被删除');
-    const userMessage = { id: uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
-    const assistantMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: renderReply(), created_at: new Date(Date.now() + 10).toISOString() };
+    const userMessage = { id: ids?.user ?? uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
+    const assistantMessage = { id: ids?.assistant ?? uid(), session_id: sessionId, role: 'assistant', content: renderReply(), created_at: new Date(Date.now() + 10).toISOString() };
     const insert = db.prepare(`INSERT INTO tutor_messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)`);
     for (const saved of [userMessage, assistantMessage]) {
       insert.run(saved.id, sessionId, saved.role, saved.content, saved.created_at);
@@ -87,8 +102,8 @@ function saveTutorReply(sessionId: string, message: string, renderReply: () => s
     const updatedAt = Date.parse(assistantMessage.created_at) > Date.parse(session.updated_at)
       ? assistantMessage.created_at : nextNoteUpdatedAt(session.updated_at);
     if (selectNoteIds) {
-      const ids = existingNoteIds(selectNoteIds(session.note_ids), true);
-      db.prepare('UPDATE tutor_sessions SET note_ids = ? WHERE id = ?').run(JSON.stringify(ids), sessionId);
+      const selected = existingNoteIds(selectNoteIds(session.note_ids), true);
+      db.prepare('UPDATE tutor_sessions SET note_ids = ? WHERE id = ?').run(JSON.stringify(selected), sessionId);
     }
     db.prepare('UPDATE tutor_sessions SET updated_at = ? WHERE id = ?').run(updatedAt, sessionId);
     logStudyActivity('tutor_chat', sessionId, null, 60);

@@ -29,6 +29,17 @@ export async function verifyTutorModes(t, api) {
     assert.equal((await api.messages(older)).session.mode, 'qa');
     await assert.rejects(api.create({ mode: 'unrecognized' }), /模式/);
   });
+  await t.test('retrying a saved turn after a lost receipt returns the same pair once', async () => {
+    const { id } = await api.create();
+    const payload = { message: '只用常识解释日落', turnId: 'a2cd8ce79ab84b639b3ef4f2fb4b87c5' };
+    let calls = 0;
+    api.model(() => { calls++; return '地球的自转改变了观察方向。'; });
+    const saved = await api.send(id, payload);
+    const { userMessage, assistantMessage } = (await api.stream(id, payload)).result;
+    assert.deepEqual({ userMessage, assistantMessage }, saved);
+    assert.deepEqual((await api.messages(id)).messages, [saved.userMessage, saved.assistantMessage]);
+    assert.equal(calls, 1);
+  });
   await t.test('persists mode before sending and round-trips it with selections and history', async () => {
     const session = await api.create({ mode: 'qa', title: '自选标题', noteIds: [source] });
     const initial = await api.messages(session.id);

@@ -1,4 +1,33 @@
 import { stripTutorMetadata } from './tutorScan.js';
+import type { TutorMode } from './tutorMode.js';
+
+export interface TutorChatPayload {
+  message: string;
+  mode?: TutorMode;
+  noteIds?: string[];
+  discardedNoteIds?: string[];
+  turnId?: string;
+}
+
+export function tutorMessageIds(sessionId: string, turnId: unknown) {
+  if (turnId === undefined) return;
+  if (typeof turnId !== 'string' || !/^[0-9a-f]{32}$/.test(turnId)) throw new Error('无效的提问标识');
+  const prefix = `turn-${sessionId}-${turnId}`;
+  return { user: prefix + '-user', assistant: prefix + '-assistant' };
+}
+
+export function savedTutorPair<T extends { id: string; role: string; content: string }>(
+  messages: T[], ids: ReturnType<typeof tutorMessageIds>, question: string,
+) {
+  if (!ids) return;
+  const userMessage = messages.find(item => item.id === ids.user);
+  const assistantMessage = messages.find(item => item.id === ids.assistant);
+  if (!userMessage && !assistantMessage) return;
+  if (userMessage?.role !== 'user' || userMessage.content !== question || assistantMessage?.role !== 'assistant') {
+    throw new Error('本次提问标识与已保存的问答不一致');
+  }
+  return { userMessage, assistantMessage };
+}
 
 export const TUTOR_HISTORY_PAGE_SIZE = 30;
 export const TUTOR_TITLE_MAX_LENGTH = 200;

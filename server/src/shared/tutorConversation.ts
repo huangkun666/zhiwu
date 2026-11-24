@@ -103,7 +103,7 @@ export function generalTutorReply(onDelta?: (delta: string) => void) {
   };
 }
 
-export async function runTutorChat<T extends { messages: TutorMessage[] }>(
+export async function runTutorChat<T extends { messages: TutorMessage[]; scanFallback?: string }>(
   mode: TutorMode, history: TutorMessage[], question: string,
   answer: (messages: TutorMessage[], onDelta?: (delta: string) => void) => Promise<string>,
   readNotes: () => Promise<T>, onDelta?: (delta: string) => void,
@@ -121,5 +121,11 @@ export async function runTutorChat<T extends { messages: TutorMessage[] }>(
   const sources = await readNotes();
   // Only the validated preview belongs in the chat UI. Its generated JSON stays private to this turn.
   const showDelta = isNoteEditRequest(question, !!citedReply(history)) ? undefined : onDelta;
-  return { reply: await answer(sources.messages, showDelta), sources };
+  try {
+    const reply = await answer(sources.messages, showDelta);
+    return { reply: reply.trim() ? reply : sources.scanFallback ?? reply, sources };
+  } catch (error) {
+    if (!sources.scanFallback) throw error;
+    return { reply: sources.scanFallback, sources };
+  }
 }

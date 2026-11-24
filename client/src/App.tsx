@@ -186,8 +186,8 @@ export default function App() {
           <ReviewPage onRefreshGlobal={refreshGlobal}
             onReturnHome={(masteryChanges) => handleNavigate('home', { masteryChanges })} />
         )}
-        {page === 'tutor' && <TutorPage key={pageContext?.sessionId} initialContext={pageContext}
-          onRefreshGlobal={refreshGlobal} onOpenCitation={openTutorCitation} onSessionChange={rememberTutorSession} />}
+        <TutorPage visible={page === 'tutor'} initialContext={page === 'tutor' ? pageContext : null}
+          onRefreshGlobal={refreshGlobal} onOpenCitation={openTutorCitation} onSessionChange={rememberTutorSession} />
         {page === 'settings' && (
           <SettingsPage
             theme={theme}

@@ -37,11 +37,12 @@ node --test client/test/*.test.mjs
 | --- | --- | --- |
 | 笔记、导入、撤销或回收站 | [桌面笔记](../../server/test/notes.test.mjs)、[离线库](../../client/test/library.test.mjs) | 桌面和安卓离线各验证一遍。打开原件，撤销一条摘录，移入回收站再恢复。查看引用数量、展开列表和首页统计。 |
 | 对话模式 | [新建、切换和续聊](../../client/test/browser/tutor_modes.py) | 桌面和手机的「新建对话」均默认普通模式。输入知识问题再追问，检查模型收到聊天上下文，笔记库中的独有文字未发出。原会话改为深度答疑或费曼后，核对参考资料、消息和刷新后的模式。 |
+| 对话中途切页 | [生成中离开、返回与重试](../../client/test/browser/tutor_pending.py) | 从首条问题自动建会话时切到首页。检索期间切到笔记和其他对话，再回到原会话查看问题与进度。分别让模型成功和失败，核对后台回答、原问题重试及刷新后的消息条数。 |
 | 对话修改笔记 | [提案与目标原文](../../server/test/tutor-note-edit.test.mjs)、[应用修改与重试](../../client/test/browser/tutor_note_edit.py) | 确认操作前核对原文，应用后重新打开。覆盖版本冲突、同名笔记、过期来源、旧摘录保留和重试去重。 |
 | MCP 配置入口 | [桌面和独立版配置](../../client/test/browser/mcp_settings.py)、[stdio 集成](../../server/test/notes.test.mjs) | 在「设置 → MCP 配置」分别选择读与编辑权限，复制到外部客户端。用临时库核对读取、改名或改正文，并验证版本过期时的行为。 |
 | 手机远程 MCP | [工具与存储](../../client/test/phone-mcp.test.mjs)、[原生桥](../../client/test/mobile-mcp-bridge.test.mjs)、[APK 与 HTTPS 转发](../../client/test/browser/phone_mcp.py) | 用临时手机库从外部 MCP 客户端读写，核对切换应用后的访问、同一笔记经两个地址读回、权限变更与关闭后的旧令牌。 |
 | 手机助教顶部间距 | [浏览器安全区](../../client/test/browser/reader_tutor.py)、[APK 屏幕实测](../../client/test/browser/phone_mcp.py) | 从系统状态栏下沿量到「普通对话／历史对话／新建对话」工具栏的上沿。两者间只有工具栏边框。普通浏览器还应留足系统安全区。 |
-| 助教检索、原文引用 | [检索和续查](../../server/test/active-tutor.test.mjs)、[来源范围](../../server/test/tutor-context.test.mjs)、[两端交互](../../client/test/browser/tutor_retrieval.py) | 用中文问没有目录的长笔记和英文 PDF。核对实际原文、引用页或段落，以及返回对话后的位置。 |
+| 助教检索、原文引用 | [检索和续查](../../server/test/active-tutor.test.mjs)、[来源范围](../../server/test/tutor-context.test.mjs)、[两端交互](../../client/test/browser/tutor_retrieval.py) | 用中文问没有目录的长笔记和英文 PDF，核对引用与返回位置。让模型返回截断的 JSON 或错引原文，再模拟请求失败，检查自动重试、暂停原因和续读的起点。 |
 | 历史对话 | [两端共用的旧会话样例](../../server/test/fixtures/tutor-history.mjs)、[离线写入和重试](../../client/test/tutor-history.test.mjs)、[桌面与安卓界面](../../client/test/browser/tutor_history.py) | 准备超过 30 个旧会话，按标题、用户问题和助教回答查找。核对分页、续聊、改名及取消或确认删除。手机点「历史对话」时检查消息区的尺寸。 |
 | 学习进度、图谱或自动出题 | [桌面笔记](../../server/test/notes.test.mjs)、[离线库](../../client/test/library.test.mjs) | 同时准备已评估和待测知识点。验证只有可用来源参与实时统计，已有复习排期和测验结果仍可见。 |
 | 备份格式、保存或扫码传输 | [桌面备份](../../server/test/backup.test.mjs)、[离线归档](../../client/test/backup.test.mjs)、[安卓保存](../../client/test/backup-save.test.mjs)、[备份设置入口](../../client/test/browser/backup_settings.py)、[接收备份](../../server/test/backup-transfer.test.mjs) | 从设置分别导出和恢复，检查原文件字节、学习进度及重复恢复。安卓用系统选择器实际保存并测试取消。旧 APK 检查导出按钮，以及同一个快传入口接收文件、同步笔记和发送备份。 |
