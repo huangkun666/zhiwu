@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { ChevronDown, Copy, Plug } from 'lucide-react';
 import { getMcpAdapterPath, IS_STANDALONE_MODE } from '../api/client';
+import { isAndroidPhoneMcp, isPhoneMcpAvailable } from '../api/phoneMcpBridge';
+import { OTA_APK_URL } from '../utils/ota';
+import { PhoneMcpSettings } from './PhoneMcpSettings';
 
 type Access = 'create' | 'read' | 'edit';
 interface McpInputs { address: string; script: string; directory: string; access: Access }
@@ -33,6 +36,29 @@ function configError(values: McpInputs) {
 
 export function McpConfigPanel() {
   const [open, setOpen] = useState(false);
+  return (
+    <section className="rounded-2xl zw-card p-4 sm:p-5">
+      <h2><button type="button" aria-expanded={open} aria-controls="mcp-setup" aria-label="MCP 配置"
+        onClick={() => setOpen(!open)} className="flex min-h-10 w-full items-center gap-2 text-left text-sm font-semibold">
+        <Plug className="size-4" aria-hidden="true" />MCP 配置
+        <span className="text-xs font-normal text-[var(--text-secondary)]">连接外部 AI</span>
+        <ChevronDown className={`ml-auto size-4 ${open ? 'rotate-180' : ''}`} aria-hidden="true" />
+      </button></h2>
+      <div id="mcp-setup" hidden={!open} className="mt-3 space-y-4 text-sm">
+        {isAndroidPhoneMcp() ? open && (isPhoneMcpAvailable()
+          ? <PhoneMcpSettings />
+          : <div className="space-y-2">
+              <p>请安装新版知悟 APK，安装后可在这里开启手机的 MCP 服务。</p>
+              <a className="inline-flex min-h-10 items-center rounded-xl px-3.5 zw-btn-secondary"
+                href={OTA_APK_URL} target="_blank" rel="noreferrer">下载新版 APK</a>
+            </div>)
+          : <DesktopMcpSettings open={open} />}
+      </div>
+    </section>
+  );
+}
+
+function DesktopMcpSettings({ open }: { open: boolean }) {
   const [values, setValues] = useState(initialInputs);
   const [status, setStatus] = useState('');
   const configBox = useRef<HTMLTextAreaElement>(null);
@@ -71,17 +97,10 @@ export function McpConfigPanel() {
     }
   }
   const inputClass = 'mt-1.5 w-full rounded-xl zw-input px-3 py-2 text-sm';
-  return (
-    <section className="rounded-2xl zw-card p-4 sm:p-5">
-      <h2><button type="button" aria-expanded={open} aria-controls="mcp-setup" aria-label="MCP 配置"
-        onClick={() => setOpen(!open)} className="flex min-h-10 w-full items-center gap-2 text-left text-sm font-semibold">
-        <Plug className="size-4" aria-hidden="true" />MCP 配置
-        <span className="text-xs font-normal text-[var(--text-secondary)]">连接外部 AI</span>
-        <ChevronDown className={`ml-auto size-4 ${open ? 'rotate-180' : ''}`} aria-hidden="true" />
-      </button></h2>
-      {open && <div id="mcp-setup" className="mt-3 space-y-4 text-sm">
+  return open && (
+      <>
         <p className="text-xs leading-relaxed text-[var(--text-secondary)]">在运行外部 AI 的电脑上准备 Node.js 和已安装依赖的知悟项目。把下方配置粘贴到该 AI 客户端的 MCP 设置，重新加载后即可使用知悟工具。</p>
-        {IS_STANDALONE_MODE && <p className="text-xs text-[var(--text-secondary)]">外部 AI 会读写下方地址对应的桌面资料库。手机本机的笔记可通过完整备份转移到桌面。</p>}
+        {IS_STANDALONE_MODE && <p className="text-xs text-[var(--text-secondary)]">这份配置连接下方地址的桌面资料库。在新版知悟安卓 APK 中开启 MCP，即可让外部 AI 直接使用手机笔记。</p>}
         <label className="block">桌面知悟服务地址<input className={inputClass} value={values.address}
           placeholder="http://电脑地址:3001" type="url" onChange={e => change({ address: e.target.value })} /></label>
         <label className="block">适配器脚本路径<input className={inputClass} value={values.script}
@@ -102,7 +121,6 @@ export function McpConfigPanel() {
             <Copy className="size-3.5" aria-hidden="true" />复制配置</button>
           <span role="status" className="text-xs">{status}</span>
         </div>
-      </div>}
-    </section>
+      </>
   );
 }

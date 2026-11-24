@@ -4,6 +4,7 @@ import { compareTutorHistory, readTutorHistoryCursor, tutorHistoryPage, tutorSes
 import { isTutorMode, newTutorMode, requireTutorMode, tutorDefaultTitles, type TutorMode } from '../../../server/src/shared/tutorMode';
 import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, reviewedNoteContent, stripInlineImages } from '../../../server/src/shared/noteContent';
 import { existingIds, questionSourceId, readIds, tutorNoteScope, tutorNoteSelection } from '../../../server/src/shared/libraryReferences';
+import { categoryPaths } from '../../../server/src/shared/categoryPaths';
 import { buildGraphLinks } from '../../../server/src/shared/graphLinks';
 import { isWeakConcept, rankWeakConcepts, recordMasteryChange, splitStudyConcepts, type MasteryChange } from '../../../server/src/shared/todayLearning';
 import { describeBackup, mergeBackupSnapshots, normalizeBackupSnapshot, type BackupSnapshot } from '../../../server/src/shared/libraryBackup';
@@ -108,6 +109,31 @@ function visibleQuiz(state: LocalDBState, quiz: Quiz): Quiz {
 function requireCategory(state: LocalDBState, id?: string | null): string | null {
   if (id && !state.categories.some((category) => category.id === id)) throw new Error('分类已不存在，请重新选择');
   return id || null;
+}
+
+function newCategory(name: string, parentId: string | null, color = '#3B5BDB', description = ''): Category {
+  return { id: uid(), name, parent_id: parentId, color, icon: 'folder', description, note_count: 0, created_at: nowIso() };
+}
+
+function resolveCategoryPath(state: LocalDBState, path: string[], parentId?: string) {
+  if (!path.length || path.some(name => !name.trim())) throw new Error('分类路径需要按顺序填写每一级的名称');
+  const names = path.map(name => name.trim());
+  let parent = requireCategory(state, parentId);
+  const fullPath = parent ? [...(categoryPaths(state.categories).get(parent) ?? [])] : [];
+  const additions: Category[] = [];
+  for (const name of names) {
+    fullPath.push(name);
+    const matches = state.categories.filter(c => (c.parent_id ?? null) === parent && c.name === name);
+    if (matches.length > 1) throw new Error(`有多个同名分类「${fullPath.join(' / ')}」，请确认要使用的分类编号`);
+    if (matches.length) {
+      parent = matches[0].id;
+    } else {
+      const category = newCategory(name, parent);
+      additions.push(category);
+      parent = category.id;
+    }
+  }
+  return { id: parent!, path: fullPath, additions };
 }
 
 function reconcileLibraryReferences(state: LocalDBState) {
@@ -321,6 +347,10 @@ async function readState(): Promise<LocalDBState> {
   cachedState = { ...createEmptyState(), ...saved };
   cachedState.tutorMessages = Object.assign(Object.create(null), cachedState.tutorMessages);
   for (const note of cachedState.notes) {
+    note.content ??= '';
+    note.tags ??= [];
+    note.created_at ||= note.updated_at || '1970-01-01T00:00:00.000Z';
+    note.updated_at ||= note.created_at;
     if (note.source_type === 'pdf') note.source_pages = readPdfPages(note.source_pages, note.source_content ?? '');
   }
   cachedState.settings = normalizeLocalSettings(cachedState.settings);
@@ -337,6 +367,12 @@ function saveState(state: LocalDBState, previous = state): Promise<void> {
   });
   writes = write.catch(() => {});
   return write;
+}
+
+// A concurrent edit may already be visible in the cache while its IndexedDB transaction is pending.
+async function waitForSavedState(state: LocalDBState, pending = writes) {
+  await pending;
+  if (cachedState !== state) throw new Error('资料库已更新，请重试刚才的操作');
 }
 
 async function writeState(state: LocalDBState): Promise<void> {
@@ -895,11 +931,17 @@ function requireNote(state: LocalDBState, id: string): Note {
   return note;
 }
 
+// Capture this operation's title and version before another UI or MCP edit can supersede them.
+async function savedNote(state: LocalDBState, note: Note, pending = writes): Promise<Note> {
+  const result = enrichNote(state, note);
+  await waitForSavedState(state, pending);
+  return result;
+}
+
 async function saveNoteText(state: LocalDBState, note: Note): Promise<Note> {
   note.word_count = countWords(noteStudyText(note));
   note.updated_at = nextNoteUpdatedAt(note.updated_at);
-  await saveState(state);
-  return enrichNote(state, note);
+  return savedNote(state, note, saveState(state));
 }
 
 function normalizeChoiceAnswer(ans: string): string {
@@ -1191,26 +1233,32 @@ export const localApi = {
   async getCategories(): Promise<Category[]> {
     const s = await loadState();
     const notes = activeNotes(s);
-    return s.categories.map((c) => ({
+    const categories = s.categories.map((c) => ({
       ...c,
       note_count: notes.filter((n) => n.category_id === c.id).length,
     }));
+    await waitForSavedState(s);
+    return categories;
   },
 
   async createCategory(payload: { name: string; color?: string; description?: string }): Promise<Category> {
     const s = await loadState();
-    const c: Category = {
-      id: uid(),
-      name: payload.name.trim(),
-      color: payload.color || '#3B5BDB',
-      icon: 'folder',
-      description: payload.description || '',
-      note_count: 0,
-      created_at: nowIso(),
-    };
+    const c = newCategory(payload.name.trim(), null, payload.color || undefined, payload.description);
     s.categories.push(c);
     await saveState(s);
     return c;
+  },
+
+  async ensureCategoryPath(path: string[], parentId?: string) {
+    const s = await loadState();
+    const selected = resolveCategoryPath(s, path, parentId);
+    if (selected.additions.length) {
+      s.categories.push(...selected.additions);
+      await saveState(s);
+    } else {
+      await waitForSavedState(s);
+    }
+    return { categoryId: selected.id, categoryPath: selected.path };
   },
 
   async deleteCategory(id: string) {
@@ -1240,6 +1288,7 @@ export const localApi = {
     if (params?.sourceType) list = list.filter((n) => n.source_type === params.sourceType);
     if (params?.hasSummary === 'true') list = list.filter((n) => Boolean(n.summary));
     if (params?.hasSummary === 'false') list = list.filter((n) => !n.summary);
+    await waitForSavedState(s);
     return list.sort((a, b) => Number(b.is_pinned) - Number(a.is_pinned) || b.updated_at.localeCompare(a.updated_at));
   },
 
@@ -1247,6 +1296,11 @@ export const localApi = {
     await ensureLocalPdfPageIndexes([id]);
     const s = await loadState();
     return enrichNote(s, requireNote(s, id));
+  },
+
+  async getStoredNote(id: string): Promise<Note> {
+    const s = await loadState();
+    return savedNote(s, requireNote(s, id));
   },
 
   async getTags(): Promise<{ name: string; count: number }[]> {
@@ -1258,31 +1312,47 @@ export const localApi = {
       .sort((a, b) => b.count - a.count);
   },
 
-  async createNote(payload: { title: string; content: string; categoryId?: string | null; tags?: string[]; sourceType?: string }): Promise<Note> {
+  async createNote(payload: { title: string; content: string; categoryId?: string | null; categoryPath?: string[];
+    tags?: string[]; sourceType?: string; requestId?: string }): Promise<Note> {
     const s = await loadState();
+    if (payload.categoryId && payload.categoryPath) throw new Error('请填写分类编号或分类路径中的一项');
+    const selected = payload.categoryPath ? resolveCategoryPath(s, payload.categoryPath) : undefined;
+    const category = selected?.id ?? requireCategory(s, payload.categoryId);
+    const id = payload.requestId ? `mcp-${payload.requestId.toLowerCase()}` : uid();
+    const title = payload.title.trim() || '未命名笔记';
+    const content = payload.content || '';
+    const tags = payload.tags || [];
+    const existing = payload.requestId && s.notes.find(note => note.id === id);
+    if (existing) {
+      if (existing.deleted_at || existing.title !== title || existing.content !== content || existing.category_id !== category
+        || JSON.stringify(existing.tags) !== JSON.stringify(tags)) throw new Error('该收录编号已被使用，请核对原笔记');
+      return savedNote(s, existing);
+    }
     const now = nowIso();
     const note: Note = {
-      id: uid(),
-      title: payload.title.trim() || '未命名笔记',
-      content: payload.content || '',
+      id, title, content,
       summary: null,
-      category_id: requireCategory(s, payload.categoryId),
-      tags: payload.tags || [],
+      category_id: category,
+      tags,
       source_type: (payload.sourceType as Note['source_type']) || 'markdown',
-      word_count: countWords(payload.content || ''),
+      word_count: countWords(content),
       is_pinned: false,
       created_at: now,
       updated_at: now,
     };
+    if (selected) s.categories.push(...selected.additions);
     s.notes.unshift(note);
     logStudy(s, 'note_import', note.id);
-    await saveState(s);
-    return enrichNote(s, note);
+    return savedNote(s, note, saveState(s));
   },
 
-  async updateNote(id: string, payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean; expectedUpdatedAt?: string }): Promise<Note> {
+  async updateNote(id: string, payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[];
+    isPinned?: boolean; expectedUpdatedAt?: string; ifUnmodifiedSince?: string }): Promise<Note> {
     const s = await loadState();
     const n = requireNote(s, id);
+    if (payload.ifUnmodifiedSince !== undefined && payload.ifUnmodifiedSince !== n.updated_at) {
+      throw new Error('笔记已更新，请重新打开后再保存');
+    }
     const checked = reviewedNoteContent(n, payload.content, payload.expectedUpdatedAt);
     if ('error' in checked) throw new Error(checked.error);
     if (payload.categoryId !== undefined) n.category_id = requireCategory(s, payload.categoryId);
@@ -1298,7 +1368,11 @@ export const localApi = {
     const s = await loadState();
     const note = requireNote(s, id);
     const excerpts = readChatExcerpts(note.chat_excerpts);
-    if (excerpts.some((excerpt) => excerpt.id === excerptId)) return enrichNote(s, note);
+    const existing = excerpts.find((excerpt) => excerpt.id === excerptId);
+    if (existing) {
+      if (existing.content !== content) throw new Error('该摘录编号已有其他内容，请使用新的摘录编号');
+      return savedNote(s, note);
+    }
     note.chat_excerpts = [...excerpts, { id: excerptId, content, created_at: nowIso() }];
     return saveNoteText(s, note);
   },

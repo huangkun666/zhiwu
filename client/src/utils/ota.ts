@@ -1,5 +1,6 @@
 export const OTA_REPO = 'huangkun666/zhiwu';
 export const OTA_REPO_URL = `https://github.com/${OTA_REPO}`;
+export const OTA_APK_URL = `${OTA_REPO_URL}/releases/download/latest-ota/zhiwu-android.apk`;
 const OTA_INDEX_URL = `https://raw.githubusercontent.com/${OTA_REPO}/ota-index/index.json`;
 
 export interface NativeOtaState {
@@ -278,7 +279,7 @@ export async function checkAllBranchesUpdate(): Promise<UpdateCheckResult> {
     currentBranchInfo,
     otherUpdatedBranches,
     bundlesBySha,
-    apkDownloadUrl: index.apkDownloadUrl || `${OTA_REPO_URL}/releases/download/latest-ota/zhiwu-android.apk`,
+    apkDownloadUrl: index.apkDownloadUrl || OTA_APK_URL,
     latestNativeVersion: Number(index.latestNativeVersion || 2),
   };
 }

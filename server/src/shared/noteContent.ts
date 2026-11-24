@@ -24,6 +24,24 @@ export function noteStudyText(note: { content: string; source_content?: string |
     .join('\n\n');
 }
 
+export function noteSearchExcerpt(note: {
+  content?: string | null; source_content?: string | null; chat_excerpts?: unknown; summary?: { abstract?: string } | null;
+}, query = ''): string {
+  const texts = [note.content, note.source_content, ...readChatExcerpts(note.chat_excerpts).map(excerpt => excerpt.content)]
+    .filter((text): text is string => typeof text === 'string' && Boolean(text.trim()));
+  if (query) {
+    const needle = query.toLowerCase();
+    for (const text of texts) {
+      const match = text.toLowerCase().indexOf(needle);
+      if (match < 0) continue;
+      const offset = Math.max(0, match - 48);
+      return (offset ? '…' : '') + text.slice(offset, offset + 240) + (text.length > offset + 240 ? '…' : '');
+    }
+  }
+  const abstract = typeof note.summary?.abstract === 'string' ? note.summary.abstract : '';
+  return (abstract || texts[0] || '').slice(0, 240);
+}
+
 export function nextNoteUpdatedAt(previous: string): string {
   const previousMs = Date.parse(previous);
   return new Date(Math.max(Date.now(), Number.isFinite(previousMs) ? previousMs + 1 : 0)).toISOString();

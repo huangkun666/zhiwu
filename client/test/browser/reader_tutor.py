@@ -140,6 +140,27 @@ class ReaderTutorTest(unittest.TestCase):
         }""", images[0])
         self.assertEqual(pixel, [255, 0, 255, 255])
 
+    def test_chat_toolbar_uses_the_system_top_inset_once(self):
+        for native in (False, True):
+            with self.subTest(android_app=native):
+                context = self.browser.new_context(viewport={"width": 360, "height": 764}, is_mobile=True, has_touch=True,
+                                                   service_workers="block")
+                self.addCleanup(context.close)
+                if native:
+                    # MainActivity has already placed the WebView below the system status bar.
+                    context.add_init_script("window.androidBridge = {}")
+                page = context.new_page()
+                cdp = context.new_cdp_session(page)
+                cdp.send("Emulation.setSafeAreaInsetsOverride", {"insets": {"top": 36}})
+                page.goto(os.environ.get("ZHIWU_TEST_ORIGIN", "http://127.0.0.1:5173"))
+                page.get_by_role("button", name="助教", exact=True).click()
+                history = page.get_by_role("button", name="历史对话", exact=True)
+                expect(history).to_be_visible()
+                toolbar = history.locator("../..")
+                self.assertAlmostEqual(toolbar.bounding_box()["y"], 0 if native else 36, delta=1)
+                page.set_viewport_size({"width": 844, "height": 390})
+                self.assertAlmostEqual(toolbar.bounding_box()["y"], 0 if native else 36, delta=1)
+
     def test_mobile_chat_content_starts_below_toolbar(self):
         self.page.get_by_role("button", name="助教", exact=True).click()
         messages = self.page.get_by_role("region", name="对话消息")

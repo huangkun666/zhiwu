@@ -27,7 +27,7 @@ import {
   summarizeNoteAI,
   synthesizeNotesAI,
 } from '../services/ai.js';
-import { editableNoteBody, nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, reviewedNoteContent, type ChatExcerpt } from '../shared/noteContent.js';
+import { editableNoteBody, nextNoteUpdatedAt, noteSearchExcerpt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, reviewedNoteContent, type ChatExcerpt } from '../shared/noteContent.js';
 import { readIds } from '../shared/libraryReferences.js';
 
 export const notesRouter = Router();
@@ -75,22 +75,9 @@ function formatNote(row: any) {
 }
 
 function formatSearchResult(row: Record<string, unknown>, query: string) {
-  const { id, title, category_id, source_filename, tags, summary, content, source_content, chat_excerpts } = formatNote(row)!;
-  const texts = [content, source_content, ...chat_excerpts.map(({ content }: ChatExcerpt) => content)]
-    .filter((text): text is string => typeof text === 'string' && Boolean(text.trim()));
-  const needle = query.toLowerCase();
-  const abstract = typeof summary?.abstract === 'string' ? summary.abstract : '';
-  let excerpt = (abstract || texts[0] || '').slice(0, 240);
-  if (needle) {
-    for (const text of texts) {
-      const match = text.toLowerCase().indexOf(needle);
-      if (match < 0) continue;
-      const offset = Math.max(0, match - 48);
-      excerpt = `${offset ? '…' : ''}${text.slice(offset, offset + 240)}${text.length > offset + 240 ? '…' : ''}`;
-      break;
-    }
-  }
-  return { id, title, category_id, source_filename, tags, excerpt };
+  const note = formatNote(row)!;
+  const { id, title, category_id, source_filename, tags } = note;
+  return { id, title, category_id, source_filename, tags, excerpt: noteSearchExcerpt(note, query) };
 }
 
 function getNoteRow(id: string) {

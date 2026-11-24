@@ -62,7 +62,7 @@ function MobileHistoryDialog({ onClose, children }: { onClose: () => void; child
       onClick={event => { if (event.target === event.currentTarget) onClose(); }}
       className="zw-modal fixed inset-y-0 left-0 m-0 h-dvh max-h-dvh w-[calc(100%_-_1rem)] max-w-sm overflow-hidden rounded-r-2xl p-0 text-[var(--text-primary)] backdrop:bg-black/45"
     >
-      <div className="flex h-full min-h-0 flex-col pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
+      <div className="flex h-full min-h-0 flex-col pt-[var(--zw-content-safe-top)] pb-[env(safe-area-inset-bottom)]">
         {children}
       </div>
     </dialog>

@@ -24,6 +24,7 @@ import {
 import { splitLegacyChatExcerpts, stripInlineImages } from '../../../server/src/shared/noteContent';
 import { sourceBlocks, unreadPdfPage, type SourceBlock } from '../../../server/src/shared/tutorSources';
 import { api } from '../api/client';
+import { isPhoneMcpAvailable } from '../api/phoneMcpBridge';
 import { MarkdownView } from '../components/MarkdownView';
 import { NoteSource } from '../components/NoteSource';
 import { TrashList } from '../components/TrashList';
@@ -31,6 +32,7 @@ import type { Note, PageId, Synthesis, TrashedNote } from '../types';
 
 interface NotesPageProps {
   categoryLabels: ReadonlyMap<string, string>;
+  externalNoteRevision: number;
   initialNoteId?: string | null;
   citation?: URLSearchParams;
   onReturnToTutor?: () => void;
@@ -43,6 +45,7 @@ const CAT_COLORS = ['#6366F1', '#0F766E', '#D97706', '#E11D48', '#8B5CF6', '#028
 
 export function NotesPage({
   categoryLabels,
+  externalNoteRevision,
   initialNoteId,
   citation,
   onReturnToTutor,
@@ -145,7 +148,17 @@ export function NotesPage({
   useEffect(() => {
     const t = setTimeout(fetchNotes, 150);
     return () => clearTimeout(t);
-  }, [search, selectedCat, selectedTag]);
+  }, [search, selectedCat, selectedTag, externalNoteRevision]);
+
+  useEffect(() => {
+    if (!externalNoteRevision || !activeNote || editing) return;
+    let cancelled = false;
+    const id = activeNote.id;
+    void api.getNote(id).then(latest => {
+      if (!cancelled) setActiveNote(current => current?.id === id ? latest : current);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [externalNoteRevision, activeNote?.id, editing]);
 
   useEffect(() => {
     fetchSyntheses();
@@ -194,6 +207,7 @@ export function NotesPage({
         content: editContent === activeNote.content ? undefined : editContent,
         categoryId: editCategoryId || null,
         tags: tagArr,
+        ...(isPhoneMcpAvailable() ? { ifUnmodifiedSince: activeNote.updated_at } : {}),
       });
       setActiveNote(updated);
       setEditing(false);
@@ -395,7 +409,7 @@ export function NotesPage({
   return (
     <div className="space-y-5">
       {(onReturnToTutor || citationError || block?.tableHeader) && (
-        <div className="sticky top-[calc(env(safe-area-inset-top)+3.5rem)] md:top-2 z-20 flex w-fit max-w-full items-center gap-2 rounded-xl zw-glass border px-2 py-1 shadow-sm">
+        <div className="sticky top-[calc(var(--zw-content-safe-top)+3.5rem)] md:top-2 z-20 flex w-fit max-w-full items-center gap-2 rounded-xl zw-glass border px-2 py-1 shadow-sm">
           {onReturnToTutor && <button type="button" onClick={onReturnToTutor}
             className="inline-flex min-h-9 shrink-0 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-[var(--bg-hover)]">
             <ArrowLeft className="size-4" /> 返回对话
@@ -405,7 +419,7 @@ export function NotesPage({
         </div>
       )}
       {toast && (
-        <div role="status" className="fixed top-[max(1rem,env(safe-area-inset-top))] right-4 z-50 flex items-center gap-3 rounded-xl zw-card border-[var(--border-strong)] px-3 py-2 text-xs font-medium shadow-lg">
+        <div role="status" className="fixed top-[max(1rem,var(--zw-content-safe-top))] right-4 z-50 flex items-center gap-3 rounded-xl zw-card border-[var(--border-strong)] px-3 py-2 text-xs font-medium shadow-lg">
           {toast.message}
           {toast.restoreId && (
             <button type="button" disabled={changingTrash} onClick={() => handleRestoreNote(toast.restoreId!)}

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { categoryPaths } from '../../server/src/shared/categoryPaths';
 import { api } from './api/client';
+import { servePhoneMcp } from './api/phoneMcpBridge';
 import { GlobalSearchModal } from './components/GlobalSearchModal';
 import { Layout } from './components/Layout';
 import { QuickImportModal } from './components/QuickImportModal';
@@ -41,6 +42,7 @@ export default function App() {
   const [badges, setBadges] = useState({ dueReviews: 0, activeMistakes: 0 });
   const [activeCapability, setActiveCapability] = useState<ActiveModelCapability | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [externalNoteRevision, setExternalNoteRevision] = useState(0);
 
   const [importOpen, setImportOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -84,6 +86,11 @@ export default function App() {
   useEffect(() => {
     refreshGlobal();
   }, [refreshGlobal]);
+
+  useEffect(() => servePhoneMcp(() => {
+    setExternalNoteRevision(value => value + 1);
+    void refreshGlobal();
+  }), [refreshGlobal]);
 
   useEffect(() => {
     const restoreRoute = () => setRoute(routeFromLocation());
@@ -156,6 +163,7 @@ export default function App() {
           <NotesPage
             key={pageContext?.citation?.toString() ?? pageContext?.noteId}
             categoryLabels={categoryLabels}
+            externalNoteRevision={externalNoteRevision}
             initialNoteId={pageContext?.noteId}
             citation={pageContext?.citation}
             onReturnToTutor={pageContext?.fromTutor ? () => window.history.back() : undefined}

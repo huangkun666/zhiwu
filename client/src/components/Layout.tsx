@@ -208,7 +208,7 @@ export function Layout({
 
       {/* Mobile Top Glass Header */}
       <header
-        className={`${chat ? 'hidden' : 'flex md:hidden'} sticky top-0 z-30 items-center justify-between px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] zw-glass border-b`}
+        className={`${chat ? 'hidden' : 'flex md:hidden'} sticky top-0 z-30 items-center justify-between px-4 pb-3 pt-[max(0.75rem,var(--zw-content-safe-top))] zw-glass border-b`}
       >
         <button onClick={() => onNavigate('home')} className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-lg zw-btn-primary flex items-center justify-center text-xs font-bold">
@@ -253,8 +253,8 @@ export function Layout({
       </header>
 
       {/* Main Content Area */}
-      <main className={`flex-1 min-w-0 md:pl-60 ${chat ? 'min-h-0 max-md:pt-[env(safe-area-inset-top)]' : `min-h-screen md:pb-10 ${keyboardOpen ? 'pb-4' : 'pb-22'}`}`}>
-        <div className={`max-w-6xl mx-auto ${chat ? 'h-full md:px-6 md:py-6 lg:px-8' : 'px-4 sm:px-6 lg:px-8 py-5 sm:py-7'}`}>{children}</div>
+      <main className={`flex-1 min-w-0 md:pl-60 ${chat ? 'min-h-0' : `min-h-screen md:pb-10 ${keyboardOpen ? 'pb-4' : 'pb-22'}`}`}>
+        <div className={`max-w-6xl mx-auto ${chat ? 'zw-chat-frame h-full md:px-6 md:pb-6 lg:px-8' : 'px-4 sm:px-6 lg:px-8 py-5 sm:py-7'}`}>{children}</div>
       </main>
 
       {/* Mobile Frosted Bottom Tab Bar (auto-hides while typing on soft keyboard) */}

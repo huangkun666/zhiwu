@@ -140,10 +140,16 @@ jobs:
           );
           const body = rel.body || '';
 
-          let builds = {};
+          let previousIndex = {};
+          try {
+            previousIndex = JSON.parse(execFileSync('git', ['show', 'refs/remotes/origin/ota-index:index.json'], {
+              encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+            }));
+          } catch {}
+          const builds = { ...previousIndex.bundlesBySha };
           const bm = body.match(/<!--ZHIWU_BUILDS:(.*?)-->/);
           if (bm && bm[1]) {
-            try { builds = JSON.parse(bm[1]) || {}; } catch {}
+            try { Object.assign(builds, JSON.parse(bm[1])); } catch {}
           }
 
           let mainMeta = null;
@@ -158,6 +164,7 @@ jobs:
             shortSha,
             branch: process.env.APP_BRANCH,
             version: process.env.APP_VER,
+            // Older OTA-capable apps can use the web UI. The phone MCP service is detected at runtime.
             nativeVersion: 2,
             message: process.env.APP_MSG,
             builtAt: new Date().toISOString(),
@@ -167,7 +174,7 @@ jobs:
           if (process.env.IS_MAIN === 'true' || !mainMeta) {
             mainMeta = {
               version: process.env.APP_VER,
-              nativeVersion: 2,
+              nativeVersion: 4,
               branch: process.env.APP_BRANCH,
               commit: shortSha,
               changelog: process.env.APP_MSG,
@@ -184,16 +191,9 @@ jobs:
             const m = asset.name.match(/^web-bundle-([0-9a-f]{7,})\.zip$/i);
             const shaKey = m ? m[1].toLowerCase().slice(0, 7) : '';
             if (idx < 25) {
-              keepSet.add(shaKey);
-              if (!builds[shaKey]) {
-                builds[shaKey] = {
-                  sha: shaKey,
-                  shortSha: shaKey,
-                  nativeVersion: 2,
-                  builtAt: asset.updatedAt || '',
-                  downloadUrl: `https://github.com/${repo}/releases/download/latest-ota/${asset.name}`,
-                };
-              } else {
+              // A ZIP alone cannot establish which native capabilities the bundle needs.
+              if (Number.isInteger(builds[shaKey]?.nativeVersion) && builds[shaKey].nativeVersion > 0) {
+                keepSet.add(shaKey);
                 builds[shaKey].downloadUrl = `https://github.com/${repo}/releases/download/latest-ota/${asset.name}`;
               }
             } else {
@@ -259,7 +259,7 @@ jobs:
 
           const indexPayload = {
             updatedAt: new Date().toISOString(),
-            latestNativeVersion: 2,
+            latestNativeVersion: mainMeta.nativeVersion || previousIndex.latestNativeVersion || 2,
             apkDownloadUrl: `https://github.com/${repo}/releases/download/latest-ota/zhiwu-android.apk`,
             bundlesBySha: builds,
             branches,
