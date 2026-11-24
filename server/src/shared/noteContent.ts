@@ -46,6 +46,29 @@ export function splitLegacyChatExcerpts(content: string) {
   };
 }
 
+type StoredNoteText = { content: string; source_filename?: string | null; source_type?: string; source_content?: string | null };
+
+export function editableNoteBody(note: StoredNoteText): string | null {
+  if (note.source_filename && note.source_type !== 'image' && note.source_content == null) return null;
+  return splitLegacyChatExcerpts(note.content).body;
+}
+
+export function reviewedNoteContent(
+  note: StoredNoteText & { updated_at: string }, requested: string | undefined, expectedUpdatedAt?: unknown,
+): { content: string } | { error: string } {
+  if (expectedUpdatedAt === undefined) return { content: requested ?? note.content };
+  if (expectedUpdatedAt !== note.updated_at) return { error: '笔记已更新，请重新读取后再确认修改' };
+  if (requested === undefined || requested === note.content) return { content: note.content };
+  const currentBody = editableNoteBody(note);
+  if (currentBody === null) return { error: '这份旧笔记的正文存放导入原文，可将新内容追加为聊天摘录' };
+  const suffix = note.content.slice(currentBody.length);
+  const replacement = splitLegacyChatExcerpts(requested);
+  if (replacement.excerpts.length && requested.slice(replacement.body.length) !== suffix) {
+    return { error: '旧版聊天摘录已单独保留，请只修改笔记正文' };
+  }
+  return { content: replacement.body + suffix };
+}
+
 export function removeLegacyChatExcerpt(
   content: string,
   offset: number,

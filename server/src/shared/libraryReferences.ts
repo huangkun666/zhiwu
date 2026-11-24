@@ -1,3 +1,5 @@
+import type { TutorMode } from './tutorMode.js';
+
 export function readIds(value: unknown): string[] {
   if (typeof value === 'string') {
     try {
@@ -12,6 +14,16 @@ export function readIds(value: unknown): string[] {
 
 export function existingIds(value: unknown, available: ReadonlySet<string>): string[] {
   return readIds(value).filter((id) => available.has(id));
+}
+
+export function tutorNoteScope(mode: TutorMode, stored: unknown, supplied: unknown) {
+  const saved = readIds(stored);
+  const requested = supplied == null ? saved : readIds(supplied);
+  if (mode === 'general' && saved.length && supplied != null) {
+    const allowed = new Set(saved);
+    return { automatic: false, ids: requested.length ? requested.filter(id => allowed.has(id)) : saved };
+  }
+  return { automatic: requested.length === 0, ids: requested };
 }
 
 export function tutorNoteSelection(stored: unknown, visible: string[], selected: string[], discard: unknown = []) {

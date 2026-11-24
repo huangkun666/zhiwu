@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import { db, existingNoteIds, inTransaction, logStudyActivity, nowIso, uid } from '../db.js';
 import { callLLM, tutorChatAI, tutorChatStreamAI } from '../services/ai.js';
-import { existingIds, readIds, tutorNoteSelection } from '../shared/libraryReferences.js';
+import { existingIds, readIds, tutorNoteScope, tutorNoteSelection } from '../shared/libraryReferences.js';
 import { nextNoteUpdatedAt } from '../shared/noteContent.js';
 import { readTutorHistoryCursor, tutorHistoryPage, tutorSessionTitle } from '../shared/tutorHistory.js';
-import { generalTutorTurn, prepareTutorTurn } from '../shared/tutorContext.js';
+import { prepareTutorTurn, runTutorChat } from '../shared/tutorContext.js';
 import { newTutorMode, requireTutorMode, tutorDefaultTitles, type TutorMode } from '../shared/tutorMode.js';
 import { ensurePdfPageIndexes, readPdfPageWithVision } from '../services/pdfPageIndex.js';
 
@@ -31,10 +31,11 @@ function updateSession(id: string, changes: Partial<Pick<StoredTutorSession, 'ti
   });
 }
 
-async function replyContext(
+async function answerTutor(
   session: StoredTutorSession,
   message: string,
   options?: { mode?: string; noteIds?: unknown; discardedNoteIds?: unknown },
+  onDelta?: (text: string) => void,
   progress?: (message: string) => void,
 ) {
   const mode = options?.mode === undefined ? session.mode : requireTutorMode(options.mode);
@@ -44,34 +45,41 @@ async function replyContext(
     `SELECT role, content FROM tutor_messages WHERE session_id = ? AND role IN ('user','assistant')
      ORDER BY created_at DESC, rowid DESC LIMIT 12`
   ).all(session.id).reverse() as { role: 'user' | 'assistant'; content: string }[];
-  if (mode === 'general') return { mode, ...generalTutorTurn(history, message), selectNoteIds: undefined };
-  const requestedIds = readIds(options?.noteIds ?? session.note_ids);
-  const noteIds = existingNoteIds(requestedIds);
-  const selectNoteIds = tutorNoteSelection(session.note_ids, existingNoteIds(session.note_ids), noteIds, options?.discardedNoteIds);
-  await ensurePdfPageIndexes(requestedIds.length ? noteIds : undefined);
-  const condition = noteIds.length ? 'WHERE id IN (SELECT value FROM json_each(?))' : '';
-  const notes = requestedIds.length && !noteIds.length ? [] : db.prepare(
-    `SELECT id, title, content, source_type, source_filename, source_content, source_pages, chat_excerpts, tags, updated_at
-     FROM active_notes ${condition} ORDER BY updated_at DESC, id`
-  ).all(...(noteIds.length ? [JSON.stringify(noteIds)] : [])) as unknown as Parameters<typeof prepareTutorTurn>[1];
-  const versions = new Map(notes.map(note => [note.id, note.updated_at]));
-  const current = () => {
-    const rows = db.prepare(`SELECT id, updated_at FROM active_notes ${condition}`).all(...(noteIds.length ? [JSON.stringify(noteIds)] : []));
-    return new Set(rows.flatMap(row => versions.get(String(row.id)) === row.updated_at ? [String(row.id)] : []));
-  };
-  const turn = await prepareTutorTurn(mode, notes, !requestedIds.length, history, message,
-    (query) => callLLM(query, { temperature: 0, maxTokens: query[0].content.startsWith('ZHIWU_SCAN') ? 1800 : 300 }),
-    async () => current(), readPdfPageWithVision, progress);
-  return { mode, messages: turn.messages, render: (reply: string) => turn.render(reply, current()), selectNoteIds };
+  async function readNotes() {
+    const { ids, automatic } = tutorNoteScope(mode, session.note_ids, options?.noteIds);
+    const noteIds = existingNoteIds(ids);
+    const selectNoteIds = mode === 'general' ? undefined
+      : tutorNoteSelection(session.note_ids, existingNoteIds(session.note_ids), noteIds, options?.discardedNoteIds);
+    await ensurePdfPageIndexes(automatic ? undefined : noteIds);
+    const condition = automatic ? '' : 'WHERE id IN (SELECT value FROM json_each(?))';
+    const params = automatic ? [] : [JSON.stringify(noteIds)];
+    const notes = db.prepare(
+      `SELECT id, title, content, source_type, source_filename, source_content, source_pages, chat_excerpts, tags, updated_at
+       FROM active_notes ${condition} ORDER BY updated_at DESC, id`
+    ).all(...params) as unknown as Parameters<typeof prepareTutorTurn>[1];
+    const versions = new Map(notes.map(note => [note.id, note.updated_at]));
+    const current = () => {
+      const rows = db.prepare(`SELECT id, updated_at FROM active_notes ${condition}`).all(...params);
+      return new Set(rows.flatMap(row => versions.get(String(row.id)) === row.updated_at ? [String(row.id)] : []));
+    };
+    const turn = await prepareTutorTurn(mode, notes, automatic, history, message,
+      (query) => callLLM(query, { temperature: 0, maxTokens: query[0].content.startsWith('ZHIWU_SCAN') ? 1800 : 300 }),
+      async () => current(), readPdfPageWithVision, progress);
+    return { messages: turn.messages, render: (reply: string) => turn.render(reply, current()), selectNoteIds };
+  }
+  const { reply, sources } = await runTutorChat(mode, history, message,
+    (messages, emit) => onDelta ? tutorChatStreamAI(mode, messages, emit ?? (() => {})) : tutorChatAI(mode, messages),
+    readNotes, onDelta);
+  return saveTutorReply(session.id, message, () => sources ? sources.render(reply) : reply, sources?.selectNoteIds);
 }
 
-function saveTutorReply(sessionId: string, message: string, reply: string, selectNoteIds?: (latest: unknown) => string[]) {
+function saveTutorReply(sessionId: string, message: string, renderReply: () => string, selectNoteIds?: (latest: unknown) => string[]) {
   return inTransaction(() => {
     const session = db.prepare(`SELECT note_ids, updated_at FROM tutor_sessions WHERE id = ?`).get(sessionId) as
       Pick<StoredTutorSession, 'note_ids' | 'updated_at'> | undefined;
     if (!session) throw new Error('会话已被删除');
     const userMessage = { id: uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
-    const assistantMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: reply, created_at: new Date(Date.now() + 10).toISOString() };
+    const assistantMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: renderReply(), created_at: new Date(Date.now() + 10).toISOString() };
     const insert = db.prepare(`INSERT INTO tutor_messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)`);
     for (const saved of [userMessage, assistantMessage]) {
       insert.run(saved.id, sessionId, saved.role, saved.content, saved.created_at);
@@ -196,9 +204,7 @@ tutorRouter.post('/sessions/:id/chat', async (req, res) => {
   if (!message) return res.status(400).json({ error: '消息内容不能为空' });
 
   try {
-    const turn = await replyContext(session, message, req.body);
-    const reply = await tutorChatAI(turn.mode, turn.messages);
-    res.json(saveTutorReply(session.id, message, turn.render(reply), turn.selectNoteIds));
+    res.json(await answerTutor(session, message, req.body));
   } catch (err: any) {
     res.status(400).json({ error: err?.message || '助教回复失败' });
   }
@@ -217,13 +223,9 @@ tutorRouter.post('/sessions/:id/chat-stream', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
 
   try {
-    const turn = await replyContext(session, message, req.body,
+    const saved = await answerTutor(session, message, req.body,
+      delta => res.write(`data: ${JSON.stringify({ delta })}\n\n`),
       status => res.write(`data: ${JSON.stringify({ status })}\n\n`));
-    const reply = await tutorChatStreamAI(turn.mode, turn.messages, (delta) => {
-      res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-    });
-
-    const saved = saveTutorReply(session.id, message, turn.render(reply), turn.selectNoteIds);
     res.write(`data: ${JSON.stringify({ done: true, ...saved })}\n\n`);
     res.end();
   } catch (err: any) {

@@ -4,12 +4,14 @@ const stamp = '2024-01-15T00:00:00.000Z';
 const privateText = '本库独有的实验记录-N72';
 const source = 'mode-live-note';
 const trash = 'mode-trash-note';
+const outside = 'mode-unselected-note';
 const older = 'mode-old-session';
 
 export async function verifyTutorModes(t, api) {
-  const note = { title: '无关资料', content: privateText.repeat(60), created_at: stamp, updated_at: stamp };
+  const note = { title: '蓝鹭方案', content: `蓝鹭方案的实验口令是${privateText}。\n\n校准完成后把温度记为 32 ℃。`, created_at: stamp, updated_at: stamp };
   await api.restore({
-    notes: [{ ...note, id: source }, { ...note, id: trash, deleted_at: stamp }],
+    notes: [{ ...note, id: source }, { ...note, id: trash, content: '已回收的密钥-J34', deleted_at: stamp },
+      { ...note, id: outside, title: '别的项目', content: '范围外的密钥-Z59' }],
     tutorSessions: [{ id: older, title: '旧答疑', note_ids: [source, trash], created_at: stamp, updated_at: stamp }],
     tutorMessages: { [older]: [
       { id: 'mode-old-question', role: 'user', content: '上次问过潮汐', created_at: stamp },
@@ -61,7 +63,7 @@ export async function verifyTutorModes(t, api) {
   await t.test('answers ordinary and streaming turns once using only real messages, with no source work or reference changes', async () => {
     const calls = [];
     api.model(body => { calls.push(body.messages); return '这是普通回答'; });
-    const question = '接着上次的话题，逐段找出背景。';
+    const question = '不用查我的笔记，接着上次的聊天解释潮汐。';
     const first = await api.send(older, { message: question, mode: 'general', noteIds: [], discardedNoteIds: [trash] });
     assert.equal(first.assistantMessage.content, '这是普通回答');
     assert.equal(calls.length, 1);
@@ -82,6 +84,146 @@ export async function verifyTutorModes(t, api) {
     assert.match(calls.at(-1)[0].content, /本库独有/);
     assert.match(learned.assistantMessage.content, /\?note=mode-live-note/);
     await assert.rejects(api.send(older, { message: '测试未知模式', mode: 'typo' }), /模式/);
+  });
+  await t.test('ordinary source requests use the saved scope, cite originals and follow a citation to the next paragraph', async () => {
+    const { id } = await api.create({ mode: 'qa', noteIds: [source] });
+    await api.mode(id, 'general');
+    const calls = [];
+    api.model(({ messages }) => { calls.push(messages); return '见原文。[S1]'; });
+    const question = '查一下我的笔记，蓝鹭方案的实验口令是什么？';
+    const first = await api.send(id, { message: question, noteIds: [], discardedNoteIds: [source] });
+    assert.equal(calls.length, 1);
+    assert.match(calls[0][0].content, /本库独有的实验记录-N72/);
+    assert.doesNotMatch(calls[0][0].content, /范围外的密钥|已回收的密钥/);
+    assert.equal(calls[0].at(-1).content, question);
+    assert.match(first.assistantMessage.content, /\?note=mode-live-note&part=body&at=1&sig=/);
+    const follow = await api.send(id, { message: '下一段呢？' });
+    assert.equal(calls.length, 2);
+    assert.match(calls[1][0].content, /校准完成后把温度记为 32 ℃/);
+    assert.match(follow.assistantMessage.content, /\?note=mode-live-note&part=body&at=2&sig=/);
+    const saved = await api.messages(id);
+    assert.equal(saved.session.mode, 'general');
+    assert.deepEqual(saved.session.selection_ids, [source]);
+    assert.deepEqual(saved.messages.slice(-4).map(message => message.id), [first.userMessage.id, first.assistantMessage.id, follow.userMessage.id, follow.assistantMessage.id]);
+    const restricted = await api.send(id, { message: '查一下我的笔记，密钥是什么？', noteIds: [outside, trash] });
+    assert.doesNotMatch(calls.at(-1)[0].content, /本库独有|范围外的密钥|已回收的密钥/);
+    assert.doesNotMatch(restricted.assistantMessage.content, /\?note=|\[S1\]/);
+    assert.deepEqual((await api.messages(id)).session.selection_ids, [source]);
+  });
+  await t.test('an ordinary model can request evidence without lookup keywords or exposing the control reply', async () => {
+    const { id } = await api.create();
+    const question = '蓝鹭方案的实验口令是什么？';
+    const calls = [];
+    api.model(({ messages }) => {
+      calls.push(messages);
+      const instruction = messages[0].content;
+      if (instruction.startsWith('ZHIWU_RETRIEVE')) return JSON.stringify(
+        JSON.parse(messages[1].content).results.length ? { action: 'finish' } : { action: 'search', query: '蓝鹭方案' });
+      if (!instruction.includes('资料覆盖')) return '[[SEARCH_NOTES]]';
+      return `口令是${instruction.includes(privateText) ? privateText : '未知'}。[S1]`;
+    });
+    const streamed = await api.stream(id, { message: question });
+    assert.match(streamed.text, /^口令是本库独有的实验记录-N72/);
+    assert.doesNotMatch(streamed.text, /SEARCH_NOTES|\[\[/);
+    assert.match(calls[0][0].content, /\[\[SEARCH_NOTES\]\]/);
+    assert.doesNotMatch(JSON.stringify(calls[0]), /本库独有|范围外的密钥|已回收的密钥/);
+    assert.doesNotMatch(JSON.stringify(calls), /已回收的密钥/);
+    assert.equal(calls[0].at(-1).content, question);
+    assert.equal(calls.at(-1).at(-1).content, question);
+    assert.match(streamed.result.assistantMessage.content, /\?note=mode-live-note&part=body&at=1&sig=/);
+    const saved = await api.messages(id);
+    assert.equal(saved.session.mode, 'general');
+    assert.deepEqual(saved.session.selection_ids, []);
+    assert.deepEqual(saved.messages.map(message => message.content), [question, streamed.result.assistantMessage.content]);
+    assert.doesNotMatch(saved.messages.at(-1).content, /SEARCH_NOTES|\[\[/);
+  });
+  await t.test('an ordinary search reads its selected note from the latest library after a restore', async () => {
+    const selected = { ...note, id: 'mode-restored-during-decision', title: '水尺记录', content: '水尺读数为 709。' };
+    await api.restore({ notes: [selected] });
+    const { id } = await api.create({ mode: 'qa', noteIds: [selected.id] });
+    await api.mode(id, 'general');
+    await api.trashNote(selected.id);
+    const started = Promise.withResolvers();
+    const finish = Promise.withResolvers();
+    let evidence;
+    api.model(({ messages }) => {
+      if (messages[0].content.includes('资料覆盖')) { evidence = messages[0].content; return '见原文。[S1]'; }
+      started.resolve();
+      return finish.promise;
+    });
+    const pending = api.send(id, { message: '水尺读数是多少？' });
+    try {
+      await started.promise;
+      await api.restore({ notes: [{ ...selected, deleted_at: null, updated_at: new Date(Date.now() + 60_000).toISOString() }] });
+      assert.equal((await api.note(selected.id)).content, selected.content);
+    } finally {
+      finish.resolve('[[SEARCH_NOTES]]');
+      await pending.catch(() => {});
+    }
+    const answer = await pending;
+    assert.match(evidence, /水尺读数为 709/);
+    assert.match(answer.assistantMessage.content, /\?note=mode-restored-during-decision/);
+  });
+  await t.test('streams a note edit preview without publishing its draft or changing the source', async () => {
+    const note = await api.note(source);
+    const { id } = await api.create({ mode: 'qa', noteIds: [source] });
+    await api.mode(id, 'general');
+    const before = '校准完成后把温度记为 32 ℃。';
+    const after = '校准完成后把温度记为 34 ℃。';
+    const draft = { source: 'N1', operation: 'replace', before, after };
+    let usedProviderStream;
+    api.model(body => {
+      usedProviderStream = Boolean(body.stream);
+      return '请核对温度。\n\n```zhiwu-edit\n' + JSON.stringify(draft) + '\n```';
+    });
+    const result = await api.stream(id, { message: '请修改我的笔记《蓝鹭方案》，把校准温度由 32 ℃ 改为 34 ℃。' });
+    assert.doesNotMatch(result.text, /zhiwu-edit|"operation"|"before"/);
+    assert.match(result.result.assistantMessage.content, /<!--zhiwu-edit:/);
+    assert.equal(usedProviderStream, api.providerStreams);
+    assert.doesNotMatch(result.result.assistantMessage.content, /```zhiwu-edit/);
+    assert.equal((await api.messages(id)).messages.at(-1).content, result.result.assistantMessage.content);
+    assert.deepEqual(await api.note(source), note);
+  });
+  await t.test('only the current active version accepts a reviewed note update', async () => {
+    const id = 'mode-note-revision';
+    await api.restore({ notes: [{ ...note, id, source_content: '导入原文永远保留。', source_filename: '蓝鹭.md',
+      chat_excerpts: [{ id: 'other-excerpt', content: '另一段对话', created_at: stamp }], tags: ['原标签'] }] });
+    const original = await api.note(id);
+    const reviewed = await api.updateNote(id, { content: '修订后的正文。', expectedUpdatedAt: original.updated_at });
+    assert.equal(reviewed.content, '修订后的正文。');
+    assert.notEqual(reviewed.updated_at, original.updated_at);
+    assert.equal(reviewed.source_content, original.source_content);
+    assert.equal(reviewed.source_filename, original.source_filename);
+    assert.deepEqual(reviewed.chat_excerpts, original.chat_excerpts);
+    const manual = await api.updateNote(id, { title: '手动更新的标题' });
+    const stale = { title: '过期标题', content: '过期内容', tags: [], isPinned: true, expectedUpdatedAt: reviewed.updated_at };
+    await api.rejectUpdate(id, stale, 409, /笔记已更新|笔记已变更/);
+    assert.deepEqual(await api.note(id), manual);
+    await api.trashNote(id);
+    await api.rejectUpdate(id, { content: '已移除', expectedUpdatedAt: manual.updated_at }, 404, /笔记不存在/);
+    await api.restoreNote(id);
+    const restored = await api.note(id);
+    assert.equal(restored.content, reviewed.content);
+    assert.equal(restored.title, manual.title);
+    assert.deepEqual(restored.chat_excerpts, original.chat_excerpts);
+  });
+  await t.test('a guarded body replacement keeps legacy excerpts and protects imported text stored in the body', async () => {
+    const suffix = '\n\n---\n\n### 费曼助教延伸笔记（旧日期）\n\n保留旧摘录。';
+    const manual = 'mode-legacy-markdown';
+    const legacyFile = 'mode-legacy-file';
+    await api.restore({ notes: [
+      { ...note, id: manual, content: '旧正文。' + suffix },
+      { ...note, id: legacyFile, content: '仅存的文件原文。' + suffix, source_type: 'text', source_filename: '旧资料.txt' },
+    ] });
+    const original = await api.note(manual);
+    const updated = await api.updateNote(manual, { expectedUpdatedAt: original.updated_at, content: '新正文。' });
+    assert.equal(updated.content, '新正文。' + suffix);
+    await api.rejectUpdate(manual, { expectedUpdatedAt: updated.updated_at, content: '新正文。' + suffix.replace('保留旧摘录', '改掉旧摘录') }, 409, /摘录/);
+    const imported = await api.note(legacyFile);
+    await api.rejectUpdate(legacyFile, { expectedUpdatedAt: imported.updated_at, content: '覆盖文件', title: '不该改名' }, 409, /原文/);
+    assert.deepEqual(await api.note(legacyFile), imported);
+    const renamed = await api.updateNote(legacyFile, { expectedUpdatedAt: imported.updated_at, title: '旧资料的新名字' });
+    assert.equal(renamed.content, imported.content);
   });
   await t.test('a late reply cannot replace a newer per-session mode, including two switches back to the original value', async () => {
     const first = await api.create({ mode: 'qa' });

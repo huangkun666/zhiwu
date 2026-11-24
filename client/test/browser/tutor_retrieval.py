@@ -31,6 +31,8 @@ PDF_PAGE = 25
 PARAGRAPH = 103
 PDF_NAME = "Optical inspection handbook"
 BODY_NAME = "Field notebook"
+BODY_ORIGINAL = "Original register for the instrument housing. Preserve this signed record."
+NEW_CODE = "NB-REVISED-72"
 
 
 def field_entry(number):
@@ -41,9 +43,14 @@ def field_entry(number):
 
 class Witness:
     """Echo a previously unseen nonce only after a search and adjacent-unit read return it."""
-    def __init__(self, key, answer):
+    require_hidden_answer = True
+
+    def __init__(self, key, answer, *, on_demand=False, previous_page=None):
         self.key = key
         self.answer = answer
+        self.on_demand = on_demand
+        self.requested = False
+        self.previous_page = previous_page
         self.steps = []
         self.errors = []
         self.hit = None
@@ -51,10 +58,24 @@ class Witness:
 
     def respond(self, body):
         prompt = "\n".join(m["content"] for m in body["messages"])
-        if "ZHIWU_RETRIEVE" in body["messages"][0]["content"]:
+        system = body["messages"][0]["content"]
+        if "[[SEARCH_NOTES]]" in system:
+            assert self.on_demand and not self.requested and not self.steps, "Unexpected search decision"
+            for material in (PDF_NAME, BODY_NAME, PDF_KEY, BODY_KEY, self.answer, field_entry(1)):
+                assert material not in prompt, "Library material reached the model before it chose to search"
+            self.requested = True
+            return "[[SEARCH_NOTES]]"
+        assert self.on_demand == self.requested, "Retrieval started without the model's search request"
+        if "ZHIWU_RETRIEVE" in system:
             state = json.loads(body["messages"][-1]["content"])
+            if self.previous_page and not self.steps:
+                assert len(state["previousSources"]) == 1, "The previous citation was not recovered"
+                source, _ = state["previousSources"][0].split()
+                self.steps.append("read")
+                return json.dumps(dict(action="read", source=source, page=self.previous_page + 1, count=2))
             if not self.steps:
-                assert self.answer not in prompt, "Answer leaked into initial planning context"
+                if self.require_hidden_answer:
+                    assert self.answer not in prompt, "Answer leaked into initial planning context"
                 self.steps.append("search")
                 return json.dumps(dict(action="search", query=self.key))
             if self.steps == ["search"]:
@@ -67,21 +88,37 @@ class Witness:
                 self.steps.append("read")
                 source, index = self.hit
                 return json.dumps(dict(action="read", source=source, start=index + 1, count=1))
-            assert self.steps == ["search", "read"], self.steps
+            assert self.steps[-1] == "read", self.steps
             assert self.answer in state["results"][-1], "Adjacent-unit read did not return the actual answer"
             self.steps.append("finish")
             return json.dumps(dict(action="finish"))
 
-        assert self.steps == ["search", "read", "finish"], self.steps
+        if self.previous_page:
+            # A cited relative position can be read directly from its saved locator.
+            assert self.steps in ([], ["read", "finish"]), self.steps
+        else:
+            assert self.steps == ["search", "read", "finish"], self.steps
         evidence = list(re.finditer(r"(?m)^\s*\[(S\d+)\]\s*N\d+\s+#\d+[^\n]*\n", prompt))
         for i, header in enumerate(evidence):
             end = evidence[i + 1].start() if i + 1 < len(evidence) else len(prompt)
-            answer = re.search(r"\b[A-Z]{2}-[A-F0-9]{12}\b", prompt[header.end():end])
-            if answer and answer.group() == self.answer:
+            if re.search(r"\b" + re.escape(self.answer) + r"\b", prompt[header.end():end]):
                 self.final_stream = bool(body.get("stream"))
                 self.steps.append("answer")
-                return f"The recorded value is {answer.group()}. [{header[1]}]"
+                return f"The recorded value is {self.answer}. [{header[1]}]"
         raise AssertionError("Final context did not associate the answer with an evidence ID")
+
+
+class EditWitness(Witness):
+    # Naming the target note and its code in the edit question can rank the right paragraph immediately.
+    require_hidden_answer = False
+
+    def respond(self, body):
+        reply = super().respond(body)
+        if self.steps[-1] != "answer":
+            return reply
+        assert "zhiwu-edit" in body["messages"][0]["content"], "No edit proposal tool was offered"
+        proposal = dict(source=self.hit[0], operation="replace", before=self.answer, after=NEW_CODE)
+        return "建议修正夜班验收码。\n\n```zhiwu-edit\n" + json.dumps(proposal) + "\n```"
 
 
 class Model(BaseHTTPRequestHandler):
@@ -181,6 +218,7 @@ class TutorRetrievalTest(TutorBrowserTest):
     def setUpClass(cls):
         super().setUpClass()
         cls.pdf_answer = "OP-" + secrets.token_hex(6).upper()
+        cls.next_page_answer = "NX-" + secrets.token_hex(6).upper()
         cls.body_answer = "NB-" + secrets.token_hex(6).upper()
         page = cls.browser.new_page()
         sheets = []
@@ -192,6 +230,8 @@ class TutorRetrievalTest(TutorBrowserTest):
                 # PDF text items can split an identifier at a font change without a word break.
                 passage = ("The calibration value recorded for the night shift is "
                            f"{cls.pdf_answer[:3]}<b>{cls.pdf_answer[3:]}</b>.")
+            elif n == PDF_PAGE + 1:
+                passage = f"The spare instrument's verification code is {cls.next_page_answer}."
             sheets.append(f"<section><p>Optical inspection handbook | Sheet {n}</p><p>{passage}</p></section>")
         page.set_content("<style>section + section { break-before: page }</style>" + "".join(sheets))
         cls.pdf = base64.b64encode(page.pdf()).decode()
@@ -214,7 +254,8 @@ class TutorRetrievalTest(TutorBrowserTest):
             settings.providers.find(p => p.id === 'local').baseUrl = args.model;
             await api.saveSettings({...settings, activeProviderId:'local'});
             const binary = Uint8Array.from(atob(args.pdf), c => c.charCodeAt(0));
-            const imported = await api.importFiles([new File([binary], args.pdfName + '.pdf', {type:'application/pdf'})]);
+            const imported = await api.importFiles([new File([binary], args.pdfName + '.pdf', {type:'application/pdf'}),
+                new File([args.original], args.bodyName + '.txt', {type:'text/plain'})]);
             if (imported.warnings.length) {
                 if (args.offline) {
                     const {loadPdf} = await import('/src/utils/pdf.ts');
@@ -228,36 +269,51 @@ class TutorRetrievalTest(TutorBrowserTest):
                 }
                 throw Error(imported.warnings.join(' '));
             }
-            const pdf = imported.imported[0];
-            const body = await api.createNote({title: args.bodyName, content: args.body});
+            const [pdf,body] = imported.imported;
             if (!pdf.source_content.includes(args.pdfAnswer)) throw Error('PDF text extraction lost the value');
             return {pdf:pdf.id, body:body.id};
         }""", dict(offline=standalone, model=self.model_origin, pdf=self.pdf, pdfName=PDF_NAME,
-                   bodyName=BODY_NAME, body=self.body, pdfAnswer=self.pdf_answer))
+                   bodyName=BODY_NAME, original=BODY_ORIGINAL, pdfAnswer=self.pdf_answer))
         self.check_answers(platform or mode, page, origin, note_ids)
 
     def check_answers(self, mode, page, origin, note_ids):
+        page.goto(origin + "/?note=" + note_ids["body"])
+        page.get_by_title("编辑", exact=True).click()
+        body_editor = page.get_by_role("textbox", name="笔记正文")
+        body_editor.fill(self.body)
+        page.get_by_role("button", name="保存", exact=True).click()
+        expect(body_editor).to_be_hidden()
         stream_responses = []
         page.on("response", lambda r: stream_responses.append(r) if "/chat-stream" in r.url else None)
         mobile = mode != "desktop"
-        for kind, title, key, answer, question in [
-            ("pdf", PDF_NAME, PDF_KEY, self.pdf_answer, "夜班的光学校准值是多少？请核对手册原文。"),
-            ("body", BODY_NAME, BODY_KEY, self.body_answer, "交接用的验收码是什么？请打开现场记录核实。"),
+        for chat_mode, kind, question in [
+            ("深度答疑", "pdf", "夜班的光学校准值是多少？请核对手册原文。"),
+            ("深度答疑", "body", "交接用的验收码是什么？请打开现场记录核实。"),
+            ("普通对话", "pdf", "请查我的笔记，核对夜班的光学校准值。"),
+            ("普通对话", "body", "夜班交接的验收码是多少？"),
         ]:
-            with self.subTest(mode=mode, source=kind):
+            with self.subTest(platform=mode, mode=chat_mode, source=kind):
+                title, key, answer = ((PDF_NAME, PDF_KEY, self.pdf_answer) if kind == "pdf"
+                                      else (BODY_NAME, BODY_KEY, self.body_answer))
+                general = chat_mode == "普通对话"
                 page.goto(origin)
                 page.get_by_role("button", name="助教", exact=True).click()
                 page.get_by_role("button", name="新建对话", exact=True).click()
                 dialog = page.get_by_role("dialog", name="新建对话", exact=True)
-                dialog.get_by_role("radio", name="深度答疑", exact=True).check()
+                if general:
+                    expect(dialog.get_by_role("radio", name=chat_mode, exact=True)).to_be_checked()
+                else:
+                    dialog.get_by_role("radio", name=chat_mode, exact=True).check()
                 dialog.get_by_role("button", name="创建对话", exact=True).click()
+                expect(dialog).to_be_hidden()
+                expect(page.get_by_role("button", name="对话设置", exact=True)).to_contain_text(chat_mode)
                 messages = page.get_by_role("region", name="对话消息")
-                if kind == "body":
+                if kind == "body" and not general:
                     picker = page.get_by_role("button", name=re.compile("参考笔记"))
                     picker.click()
                     page.get_by_role("button", name=title, exact=True).click()
                     picker.click()
-                self.model.witness = witness = Witness(key, answer)
+                self.model.witness = witness = Witness(key, answer, on_demand=general and kind == "body")
                 page.locator("textarea").fill(question)
                 sent_at = monotonic()
                 page.get_by_role("button", name="发送消息").click()
@@ -270,11 +326,13 @@ class TutorRetrievalTest(TutorBrowserTest):
                     self.fail(f"{error}\nModel errors: {witness.errors}; steps: {witness.steps}; UI: {messages.inner_text()}")
                 self.assertEqual(witness.errors, [])
                 self.assertEqual(witness.steps, ["search", "read", "finish", "answer"])
+                expect(page.get_by_role("button", name="对话设置", exact=True)).to_contain_text(chat_mode)
                 if not mobile:
                     self.assertTrue(witness.final_stream)
                     response = stream_responses[-1]
                     self.assertIn("text/event-stream", response.headers["content-type"])
                     self.assertIn('"delta"', response.text())
+                    self.assertNotIn("[[SEARCH_NOTES]]", response.text())
                 link = citation.get_attribute("href")
                 params = parse_qs(urlparse(link).query)
                 self.assertEqual(params["note"], [note_ids[kind]])
@@ -295,6 +353,7 @@ class TutorRetrievalTest(TutorBrowserTest):
                         }
                     }""", question)
                 self.assertIn(link, stored)
+                self.assertNotIn("[[SEARCH_NOTES]]", stored)
                 opened_at = monotonic()
                 citation.click()
                 if kind == "pdf":
@@ -306,8 +365,74 @@ class TutorRetrievalTest(TutorBrowserTest):
                 open_seconds = monotonic() - opened_at
                 page.get_by_role("button", name="返回对话").click()
                 expect(messages.get_by_role("link", name=re.compile(title))).to_be_visible()
-                print(f"{mode}/{kind} answer {reply_seconds:.2f}s, source opened {open_seconds:.2f}s, "
-                      f"{len(witness.steps)} model calls", flush=True)
+                print(f"{mode}/{chat_mode}/{kind} answer {reply_seconds:.2f}s, source opened {open_seconds:.2f}s, "
+                      f"{len(witness.steps) + int(witness.requested)} model calls", flush=True)
+                if general and kind == "pdf":
+                    self.check_following_page(page, messages, note_ids["pdf"])
+                elif not general and kind == "body":
+                    messages.get_by_role("button", name="追加到笔记", exact=True).click()
+                    expect(page.get_by_role("status").filter(has_text="已追加到")).to_be_visible()
+        self.check_note_edit(mode, page, origin, note_ids["body"])
+
+    def check_note_edit(self, mode, page, origin, note_id):
+        def note():
+            if mode == "apk":
+                return self.saved_android_value(page, "note", note_id)
+            return page.evaluate("""async id => (await import('/src/api/client.ts')).api.getNote(id)""", note_id)
+
+        before = note()
+        self.assertEqual(before["content"], self.body)
+        self.assertEqual(before["source_content"], BODY_ORIGINAL)
+        self.assertIn(self.body_answer, before["chat_excerpts"][0]["content"])
+        page.goto(origin)
+        page.get_by_role("button", name="助教", exact=True).click()
+        page.get_by_role("button", name="新建对话", exact=True).click()
+        dialog = page.get_by_role("dialog", name="新建对话", exact=True)
+        dialog.get_by_role("button", name="创建对话", exact=True).click()
+        expect(dialog).to_be_hidden()
+        self.model.witness = witness = EditWitness(BODY_KEY, self.body_answer)
+        page.locator("textarea").fill(f"把《{BODY_NAME}》笔记正文中的夜班验收码改成 {NEW_CODE}。")
+        page.get_by_role("button", name="发送消息").click()
+        suggestion = page.get_by_role("region", name="修改建议", exact=True)
+        apply = suggestion.get_by_role("button", name="应用修改", exact=True)
+        try:
+            expect(apply).to_be_visible(timeout=30000)
+        except AssertionError as error:
+            self.fail(f"{error}\nEdit model errors: {witness.errors}, steps: {witness.steps}")
+        self.assertEqual(witness.errors, [])
+        expect(suggestion.get_by_role("link", name=BODY_NAME, exact=True)).to_be_visible()
+        expect(suggestion.get_by_text(self.body_answer, exact=True)).to_be_visible()
+        expect(suggestion.get_by_text(NEW_CODE, exact=True)).to_be_visible()
+        self.assertEqual(note()["content"], self.body, "Generating a suggestion must preserve the note")
+        apply.click()
+        expect(suggestion.get_by_role("status")).to_have_text("已应用修改")
+        page.goto(origin + "/?note=" + note_id)
+        expect(page.get_by_text(re.compile("night shift acceptance code is " + NEW_CODE))).to_be_visible()
+        after = note()
+        self.assertEqual(after["content"], self.body.replace(self.body_answer, NEW_CODE))
+        for field in ("title", "source_filename", "source_content", "attachment_path", "chat_excerpts"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(page.evaluate("async href => (await fetch(href)).text()", after["attachment_path"]), BODY_ORIGINAL)
+
+    def check_following_page(self, page, messages, note_id):
+        self.model.witness = witness = Witness(None, self.next_page_answer, previous_page=PDF_PAGE)
+        page.locator("textarea").fill("那下一页的备用仪器验证码呢？")
+        page.get_by_role("button", name="发送消息").click()
+        try:
+            expect(messages.get_by_text(re.compile(self.next_page_answer))).to_be_visible(timeout=30000)
+        except AssertionError as error:
+            self.fail(f"{error}\nFollow-up model errors: {witness.errors}, steps: {witness.steps}")
+        self.assertEqual(witness.errors, [])
+        self.assertIn(witness.steps, (["answer"], ["read", "finish", "answer"]))
+        citation = messages.get_by_role("link", name=re.compile(rf"{PDF_NAME}.*第 {PDF_PAGE + 1} 页"))
+        expect(citation).to_be_visible()
+        params = parse_qs(urlparse(citation.get_attribute("href")).query)
+        self.assertEqual(params["note"], [note_id])
+        self.assertEqual(params["page"], [str(PDF_PAGE + 1)])
+        citation.click()
+        expect(page.get_by_role("img", name=f"PDF 第 {PDF_PAGE + 1} 页", exact=True)).to_be_visible()
+        page.get_by_role("button", name="返回对话").click()
+        expect(messages.get_by_text(re.compile(self.next_page_answer))).to_be_visible()
 
     def test_desktop_sqlite(self):
         with self.browser.new_context(viewport={"width": 1440, "height": 960}, service_workers="block") as context:
@@ -347,6 +472,7 @@ class TutorRetrievalTest(TutorBrowserTest):
                     read.onsuccess = () => resolve(read.result); read.onerror = () => reject(read.error);
                 });
                 if (kind === 'notes') return (state?.notes || []).map(({id,title}) => ({id,title}));
+                if (kind === 'note') return state.notes.find(note => note.id === question);
                 return Object.values(state.tutorMessages).find(messages => messages.some(m =>
                     m.role === 'user' && m.content === question)).filter(m => m.role === 'assistant').at(-1).content;
             } finally { db.close(); }
@@ -371,16 +497,12 @@ class TutorRetrievalTest(TutorBrowserTest):
         expect(page.get_by_text("已保存", exact=True)).to_be_visible()
         submit = page.get_by_role("button", name="确认导入", exact=True)
         page.get_by_role("button", name="导入", exact=True).click()
-        page.locator('input[type=file][accept*=".pdf"]').set_input_files(dict(
-            name=PDF_NAME + ".pdf", mimeType="application/pdf", buffer=base64.b64decode(self.pdf)))
+        page.locator('input[type=file][accept*=".pdf"]').set_input_files([
+            dict(name=PDF_NAME + ".pdf", mimeType="application/pdf", buffer=base64.b64decode(self.pdf)),
+            dict(name=BODY_NAME + ".txt", mimeType="text/plain", buffer=BODY_ORIGINAL.encode()),
+        ])
         submit.click()
-        expect(submit).to_be_hidden(timeout=30000)
-        page.get_by_role("button", name="导入", exact=True).click()
-        page.get_by_role("button", name="粘贴 / 随手记").click()
-        page.get_by_placeholder("例如：操作系统进程调度笔记").fill(BODY_NAME)
-        page.get_by_placeholder("粘贴学习笔记或记录你的思考...").fill(self.body)
-        submit.click()
-        expect(submit).to_be_hidden()
+        expect(page.get_by_role("heading", name=PDF_NAME, exact=True)).to_be_visible(timeout=30000)
         notes = {n["title"]: n["id"] for n in self.saved_android_value(page, "notes")}
         self.check_answers("apk", page, origin, {"pdf": notes[PDF_NAME], "body": notes[BODY_NAME]})
 

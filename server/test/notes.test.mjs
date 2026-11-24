@@ -51,7 +51,11 @@ before(async () => {
     const reply = await modelReply?.(req.body, res);
     if (res.headersSent) return;
     if (req.body.stream) {
-      res.type('text/event-stream').end(`data: ${JSON.stringify({ choices: [{ delta: { content: reply } }] })}\n\n`);
+      res.type('text/event-stream');
+      for (const content of (reply || '').match(/.{1,5}/gs) || []) {
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`);
+      }
+      res.end();
       return;
     }
     res.json({ choices: [{ message: { content: reply || '测试回复' } }] });
@@ -640,6 +644,25 @@ test('the MCP tool saves Markdown in the configured library and returns its note
   }
 });
 
+test('MCP keeps existing read access separate from note editing', async () => {
+  for (const [read, edit] of [['1', '0'], ['0', '1']]) {
+    const client = new Client({ name: 'zhiwu-permissions-test', version: '1.0.0' });
+    const transport = new StdioClientTransport({ command: process.execPath, args: [mcpScript], env: {
+      ZHIWU_URL: origin, ZHIWU_ALLOW_READ: read, ZHIWU_ALLOW_EDIT: edit,
+    } });
+    try {
+      await client.connect(transport);
+      const names = (await client.listTools()).tools.map(tool => tool.name);
+      assert.equal(names.includes('update_zhiwu_note'), false);
+      assert.equal(names.includes('read_zhiwu_note'), read === '1');
+      assert.equal(names.includes('search_zhiwu_notes'), read === '1');
+      assert.ok(names.includes('append_to_zhiwu_note') && names.includes('save_to_zhiwu'));
+    } finally {
+      await client.close();
+    }
+  }
+});
+
 test('MCP tools can organize selected sources and read back the collected knowledge', { timeout: 15000 }, async () => {
   const importRoot = mkdtempSync(join(fixture, 'mcp-originals-'));
   const filename = 'résumé.md';
@@ -649,7 +672,7 @@ test('MCP tools can organize selected sources and read back the collected knowle
   writeFileSync(join(importRoot, '资料图片.png'), imageBytes);
   const client = new Client({ name: 'zhiwu-workflow-test', version: '1.0.0' });
   const transport = new StdioClientTransport({ command: process.execPath, args: [mcpScript], env: {
-    ZHIWU_URL: origin, ZHIWU_ALLOW_READ: '1', ZHIWU_IMPORT_DIR: importRoot,
+    ZHIWU_URL: origin, ZHIWU_ALLOW_READ: '1', ZHIWU_ALLOW_EDIT: '1', ZHIWU_IMPORT_DIR: importRoot,
   } });
   const call = async (name, args) => {
     const result = await client.callTool({ name, arguments: args });
@@ -658,6 +681,7 @@ test('MCP tools can organize selected sources and read back the collected knowle
   };
   try {
     await client.connect(transport);
+    assert.ok((await client.listTools()).tools.some(({ name }) => name === 'update_zhiwu_note'));
     const categoryPath = ['外部知识', '记账小程序', '设计'];
     const [category, repeated] = await Promise.all([
       call('ensure_zhiwu_category', { categoryPath }), call('ensure_zhiwu_category', { categoryPath }),
@@ -689,6 +713,28 @@ test('MCP tools can organize selected sources and read back the collected knowle
     assert.equal(read.content, '这是保留的方案原文。');
     assert.deepEqual(read.tags, ['设计记录']);
     assert.deepEqual(read.chatExcerpts.map(({ content }) => content), [excerpt]);
+    assert.equal(read.updatedAt, (await request(`notes/${saved.id}`)).updated_at);
+    const revision = { noteId: saved.id, expectedUpdatedAt: read.updatedAt, content: '第二版记账原则。' };
+    const [updated, concurrentRetry] = await Promise.all([call('update_zhiwu_note', revision), call('update_zhiwu_note', revision)]);
+    assert.deepEqual(concurrentRetry, updated);
+    assert.deepEqual(Object.keys(updated).sort(), ['categoryId', 'id', 'title', 'updatedAt', 'url']);
+    assert.equal(updated.title, saved.title);
+    assert.notEqual(updated.updatedAt, read.updatedAt);
+    assert.deepEqual(await call('update_zhiwu_note', revision), updated);
+    const denied = (args) => client.callTool({ name: 'update_zhiwu_note', arguments: args });
+    assert.equal((await denied({ ...revision, content: '错误覆盖' })).isError, true);
+    assert.equal((await denied({ noteId: saved.id, expectedUpdatedAt: updated.updatedAt })).isError, true);
+    const renamed = await call('update_zhiwu_note', { noteId: saved.id, expectedUpdatedAt: updated.updatedAt, title: '记账设计定稿' });
+    const readAgain = await call('read_zhiwu_note', { noteId: saved.id });
+    assert.equal(readAgain.title, '记账设计定稿');
+    assert.equal(readAgain.content, revision.content);
+    assert.equal(readAgain.updatedAt, renamed.updatedAt);
+    assert.deepEqual(readAgain.chatExcerpts, read.chatExcerpts);
+    assert.deepEqual((await call('search_zhiwu_notes', { query: revision.content })).notes.map(note => note.id), [saved.id]);
+    await request(`notes/${saved.id}`, { method: 'DELETE' });
+    assert.equal((await denied({ ...revision, expectedUpdatedAt: renamed.updatedAt })).isError, true);
+    await request(`notes/trash/${saved.id}/restore`, { method: 'POST' });
+    assert.equal((await call('read_zhiwu_note', { noteId: saved.id })).content, revision.content);
 
     const sourcePath = [...categoryPath.slice(0, -1), '参考资料'];
     const originals = await call('import_zhiwu_files', { paths: [filename, '资料图片.png'], categoryPath: sourcePath });
@@ -696,6 +742,11 @@ test('MCP tools can organize selected sources and read back the collected knowle
     assert.equal(originals.notes.length, 2);
     const original = await call('read_zhiwu_note', { noteId: originals.notes[0].id });
     assert.equal(original.sourceFilename, filename);
+    assert.equal(original.editableContent, '');
+    await call('update_zhiwu_note', { noteId: original.id, expectedUpdatedAt: original.updatedAt, content: '对照原件后的备注。' });
+    const annotated = await call('read_zhiwu_note', { noteId: original.id });
+    assert.equal(annotated.sourceContent, original.sourceContent);
+    assert.equal(annotated.editableContent, '对照原件后的备注。');
     const downloaded = await fetch(original.attachmentUrl);
     assert.equal(downloaded.status, 200);
     assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), bytes);
@@ -717,6 +768,35 @@ test('MCP tools can organize selected sources and read back the collected knowle
     const count = (await request('categories')).length;
     await request('categories', { method: 'POST', body: { path: ['不会部分保存', ' '] }, status: 400 });
     assert.equal((await request('categories')).length, count);
+  } finally {
+    await client.close();
+  }
+});
+
+test('MCP update leaves a service with no version guard untouched', async (t) => {
+  const oldService = express();
+  const oldNote = { id: 'legacy', title: '旧库', content: '原始正文', updated_at: '2024-01-01T00:00:00.000Z' };
+  let writes = 0;
+  oldService.get('/api/health', (_req, res) => res.json({ status: 'ok', app: '知悟 (Zhiwu)' }));
+  oldService.get('/api/notes/legacy', (_req, res) => res.json(oldNote));
+  oldService.put('/api/notes/legacy', (_req, res) => { writes++; res.json(oldNote); });
+  const listener = oldService.listen(0, '127.0.0.1');
+  await once(listener, 'listening');
+  t.after(() => new Promise(resolve => listener.close(resolve)));
+  const client = new Client({ name: 'old-zhiwu-service', version: '1.0.0' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [mcpScript], env: {
+    ZHIWU_URL: `http://127.0.0.1:${listener.address().port}`, ZHIWU_ALLOW_READ: '1', ZHIWU_ALLOW_EDIT: '1',
+  } });
+  try {
+    await client.connect(transport);
+    const read = await client.callTool({ name: 'read_zhiwu_note', arguments: { noteId: oldNote.id } });
+    assert.equal(read.structuredContent.content, oldNote.content);
+    const result = await client.callTool({ name: 'update_zhiwu_note', arguments: {
+      noteId: oldNote.id, expectedUpdatedAt: oldNote.updated_at, content: '新正文',
+    } });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /升级|更新.*知悟服务/);
+    assert.equal(writes, 0);
   } finally {
     await client.close();
   }
@@ -790,9 +870,15 @@ test('desktop tutor modes and ordinary conversation', { timeout: 15000 }, async 
   t.after(() => { modelReply = undefined; });
   await verifyTutorModes(t, {
     ...historyApi(),
+    providerStreams: true,
     create: (body) => request('tutor/sessions', { method: 'POST', body, status: 201 }),
     mode: (id, mode) => request(`tutor/sessions/${id}`, { method: 'PATCH', body: { mode } }),
     export: () => request('settings/export-json'),
+    note: (id) => request(`notes/${id}`),
+    updateNote: (id, body) => request(`notes/${id}`, { method: 'PUT', body }),
+    rejectUpdate: async (id, body, status, pattern) => assert.match((await request(`notes/${id}`, { method: 'PUT', body, status })).error, pattern),
+    trashNote: (id) => request(`notes/${id}`, { method: 'DELETE' }),
+    restoreNote: (id) => request(`notes/trash/${id}/restore`, { method: 'POST' }),
     model: (handler) => { modelReply = handler; },
     send: (id, body) => request(`tutor/sessions/${id}/chat`, { method: 'POST', body }),
     async stream(id, body) {

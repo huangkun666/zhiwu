@@ -24,6 +24,7 @@ PLAIN, QA, FEYNMAN = "普通对话", "深度答疑", "费曼考官"
 NOTE_ID, EXPIRED = "mode-study-file", "mode-recycled-file"
 TITLE, SECRET = "密封的校准记录", "MODE-PRIVATE-91B3"
 TOKEN = "CHAT-MEMO-763"
+NO_LOOKUP = "不用查我的笔记，只凭常识说说光学校准的目的。"
 BOOK = "\n\n".join([f"日常记录 {n}，按顺序完成普通检查并登记。" * 8 for n in range(85)] +
                     [f"lumenscope optical calibration reference: {SECRET}"])
 DATE = "2025-02-15T12:00:00.000Z"
@@ -65,6 +66,8 @@ class RecordingModel:
             assert TITLE not in system
             if not self.previous_citation:
                 assert TITLE not in text
+            if self.question == NO_LOOKUP:
+                assert "[[SEARCH_NOTES]]" not in system, "Model was offered a search the user declined"
         else:
             assert self.calls == ["search", "finish"], self.calls
             assert SECRET in system and TITLE in system, "Learning mode did not receive the original"
@@ -252,6 +255,7 @@ class TutorModesTest(TutorBrowserTest):
         first = "请给我一张便签，聊聊光学校准的一般原理。"
         send(PLAIN, first, [], TOKEN)
         send(PLAIN, "接着聊，刚才的便签号是什么？", [("user", first), ("assistant", TOKEN)], "刚才的便签为 " + TOKEN)
+        send(PLAIN, NO_LOOKUP, [("assistant", TOKEN)], "校准能减少系统误差。")
         change(QA, save=False)
         check_mode(PLAIN)
         prior = next(s for s in self.snapshot(page, mobile) if s["id"] == plain_id)

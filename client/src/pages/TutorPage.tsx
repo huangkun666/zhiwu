@@ -14,9 +14,12 @@ import {
 import { api } from '../api/client';
 import { existingIds } from '../../../server/src/shared/libraryReferences';
 import { tutorModeLabels, tutorOpeningMode } from '../../../server/src/shared/tutorMode';
+import { readTutorNoteEdit } from '../../../server/src/shared/tutorNoteEdit';
+import { cleanHistory } from '../../../server/src/shared/tutorScan';
 import { MarkdownView } from '../components/MarkdownView';
 import { TutorHistory } from '../components/TutorHistory';
 import { TutorModeDialog } from '../components/TutorModeDialog';
+import { TutorNoteEditCard } from '../components/TutorNoteEditCard';
 import { useTutorHistory } from './useTutorHistory';
 import type { Note, TutorMessage, TutorMode, TutorSession } from '../types';
 
@@ -47,13 +50,25 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
   const [activeSession, setActiveSession] = useState<TutorSession | null>(null);
   const [messages, setMessages] = useState<TutorMessage[]>([]);
   const mode = activeSession?.mode ?? 'general';
-  const openingMode = messages[0]?.role === 'assistant' && tutorOpeningMode(messages[0].content);
-  const visibleMessages = openingMode && openingMode !== mode ? messages.slice(1) : messages;
+  const visibleMessages = useMemo(() => {
+    const openingMode = messages[0]?.role === 'assistant' && tutorOpeningMode(messages[0].content);
+    const visible = openingMode && openingMode !== mode ? messages.slice(1) : messages;
+    return visible.map(message => {
+      const assistant = message.role === 'assistant';
+      const text = assistant ? cleanHistory(message.content) : message.content;
+      return {
+        ...message,
+        edit: assistant ? readTutorNoteEdit(message.content) : undefined,
+        content: text === message.content ? text : text.trimEnd(),
+      };
+    });
+  }, [messages, mode]);
   const [selectedNoteIds, setSelectedNoteIds] = useState<string[]>([]);
   const [discardedNoteIds, setDiscardedNoteIds] = useState<string[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [streamingText, setStreamingText] = useState('');
+  const visibleStream = cleanHistory(streamingText);
   const [retrievalStatus, setRetrievalStatus] = useState('');
   const [showContextPicker, setShowContextPicker] = useState(false);
   const [toast, setToast] = useState<{ message: string; append?: NoteAppend } | null>(null);
@@ -370,7 +385,7 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
         mobileOpen={historyOpen} onClose={() => setHistoryOpen(false)}
         onSelect={selectSession} onRename={renameSession} onDelete={deleteSession} />
       {modeDialog && (
-        <TutorModeDialog kind={modeDialog} initialMode={modeDialog === 'create' ? 'general' : mode}
+        <TutorModeDialog kind={modeDialog} initialMode={modeDialog === 'create' ? 'general' : mode} referenceCount={selectedNoteIds.length}
           onConfirm={confirmMode} onClose={() => setModeDialog(null)} />
       )}
 
@@ -459,7 +474,7 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
 
         <div ref={conversationRef} role="region" aria-label="对话消息" className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-3 sm:p-5 space-y-4">
           {visibleMessages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-2.5 py-8">
+            <div className="mx-auto flex max-w-md flex-col items-center space-y-2.5 text-center lg:h-full lg:justify-center lg:py-8">
               <Sparkles className="w-7 h-7 text-[var(--text-muted)]" />
               <h3 className="font-semibold text-sm">
                 {mode === 'general' ? '有什么想了解的？' : mode === 'feynman' ? '试着用自己的话解释一个概念' : '想讨论笔记里的哪个问题？'}
@@ -469,7 +484,7 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
             visibleMessages.map((m, idx) => (
               <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`min-w-0 ${m.role === 'assistant' ? 'max-w-full' : 'max-w-[90%]'} sm:max-w-[78%] space-y-1.5`}>
-                  <div
+                  {(!m.edit || m.content) && <div
                     className={`rounded-2xl px-3 sm:px-4 py-3 text-sm break-words ${
                       m.role === 'user' ? 'zw-btn-primary rounded-br-md' : 'border rounded-bl-md'
                     }`}
@@ -485,9 +500,17 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
                       <MarkdownView content={m.content} className="text-sm"
                         onOpenNote={(href) => onOpenCitation(href, m.session_id, conversationRef.current?.scrollTop ?? 0)} />
                     )}
-                  </div>
+                  </div>}
+                  {m.edit && (
+                    <TutorNoteEditCard proposal={m.edit} messageId={m.id}
+                      onOpenNote={href => onOpenCitation(href, m.session_id, conversationRef.current?.scrollTop ?? 0)}
+                      onApplied={note => {
+                        setNotes(previous => previous.map(item => item.id === note.id ? note : item));
+                        onRefreshGlobal?.();
+                      }} />
+                  )}
                   {/* Closed-loop沉淀 actions on AI messages */}
-                  {m.role === 'assistant' && idx > 0 && (
+                  {m.role === 'assistant' && m.content && idx > 0 && (
                     <div className="flex items-center gap-2 pl-1 text-[11px] text-[var(--text-muted)]">
                       <button
                         onClick={() => handleSaveAsFlashcard(idx)}
@@ -517,8 +540,8 @@ export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onS
                 className="min-w-0 max-w-full sm:max-w-[78%] rounded-2xl rounded-bl-md px-3 sm:px-4 py-3 border text-sm"
                 style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
               >
-                {streamingText ? (
-                  <MarkdownView content={streamingText} className="text-sm" />
+                {visibleStream.trim() ? (
+                  <MarkdownView content={visibleStream} className="text-sm" />
                 ) : (
                   <span className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />

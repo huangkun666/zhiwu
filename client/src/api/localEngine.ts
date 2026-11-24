@@ -1,8 +1,9 @@
-import { generalTutorTurn, prepareTutorTurn } from '../../../server/src/shared/tutorContext';
+import { prepareTutorTurn, runTutorChat } from '../../../server/src/shared/tutorContext';
+import { stripTutorNoteEdit } from '../../../server/src/shared/tutorNoteEdit';
 import { compareTutorHistory, readTutorHistoryCursor, tutorHistoryPage, tutorSessionTitle } from '../../../server/src/shared/tutorHistory';
 import { isTutorMode, newTutorMode, requireTutorMode, tutorDefaultTitles, type TutorMode } from '../../../server/src/shared/tutorMode';
-import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, stripInlineImages } from '../../../server/src/shared/noteContent';
-import { existingIds, questionSourceId, readIds, tutorNoteSelection } from '../../../server/src/shared/libraryReferences';
+import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, reviewedNoteContent, stripInlineImages } from '../../../server/src/shared/noteContent';
+import { existingIds, questionSourceId, readIds, tutorNoteScope, tutorNoteSelection } from '../../../server/src/shared/libraryReferences';
 import { buildGraphLinks } from '../../../server/src/shared/graphLinks';
 import { isWeakConcept, rankWeakConcepts, recordMasteryChange, splitStudyConcepts, type MasteryChange } from '../../../server/src/shared/todayLearning';
 import { describeBackup, mergeBackupSnapshots, normalizeBackupSnapshot, type BackupSnapshot } from '../../../server/src/shared/libraryBackup';
@@ -930,26 +931,31 @@ async function editTutorSession(id: string, changes: TutorSettings): Promise<Tut
   return { ...result, note_ids: noteIdsIn(state, result.note_ids) };
 }
 
-async function localTutorTurn(
+async function localTutorReply(
   initial: LocalDBState, session: TutorSession, mode: TutorMode, payload: TutorChatPayload,
   provider: AIProviderConfig, progress?: (message: string) => void,
 ) {
-  const history = initial.tutorMessages[session.id] || [];
-  if (mode === 'general') return { ...generalTutorTurn(history, payload.message), selectNoteIds: undefined };
-  const requested = readIds(payload.noteIds ?? session.note_ids);
-  const noteIds = noteIdsIn(initial, requested);
-  const selectNoteIds = tutorNoteSelection(session.note_ids, noteIdsIn(initial, session.note_ids), noteIds, payload.discardedNoteIds);
-  const selected = new Set(noteIds);
-  await ensureLocalPdfPageIndexes(requested.length ? noteIds : undefined);
-  const notes = activeNotes(await loadState()).filter((note) => !requested.length || selected.has(note.id))
-    .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id));
-  const versions = new Map(notes.map(note => [note.id, note.updated_at]));
-  const current = (state: LocalDBState) => new Set(activeNotes(state)
-    .filter(note => versions.get(note.id) === note.updated_at).map(note => note.id));
-  const turn = await prepareTutorTurn(mode, notes, !requested.length, history, payload.message,
-    query => callLLMDirect(provider, query, { temperature: 0, maxTokens: query[0].content.startsWith('ZHIWU_SCAN') ? 1800 : 300 }),
-    async () => current(await loadState()), readLocalPdfPageWithVision, progress);
-  return { messages: turn.messages, render: (reply: string, state: LocalDBState) => turn.render(reply, current(state)), selectNoteIds };
+  const history = (initial.tutorMessages[session.id] || []).slice(-12);
+  const savedIds = session.note_ids;
+  async function readNotes() {
+    const { ids, automatic } = tutorNoteScope(mode, savedIds, payload.noteIds);
+    const state = await loadState();
+    const noteIds = noteIdsIn(state, ids);
+    const selectNoteIds = mode === 'general' ? undefined
+      : tutorNoteSelection(savedIds, noteIdsIn(state, savedIds), noteIds, payload.discardedNoteIds);
+    const selected = new Set(noteIds);
+    await ensureLocalPdfPageIndexes(automatic ? undefined : noteIds);
+    const notes = activeNotes(await loadState()).filter((note) => automatic || selected.has(note.id))
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id));
+    const versions = new Map(notes.map(note => [note.id, note.updated_at]));
+    const current = (state: LocalDBState) => new Set(activeNotes(state)
+      .filter(note => versions.get(note.id) === note.updated_at).map(note => note.id));
+    const turn = await prepareTutorTurn(mode, notes, automatic, history, payload.message,
+      query => callLLMDirect(provider, query, { temperature: 0, maxTokens: query[0].content.startsWith('ZHIWU_SCAN') ? 1800 : 300 }),
+      async () => current(await loadState()), readLocalPdfPageWithVision, progress);
+    return { messages: turn.messages, render: (reply: string, state: LocalDBState) => turn.render(reply, current(state)), selectNoteIds };
+  }
+  return runTutorChat(mode, history, payload.message, messages => callLLMDirect(provider, messages), readNotes);
 }
 
 // --- Complete Local API Implementation (100% parity with Express server) ---
@@ -1274,12 +1280,14 @@ export const localApi = {
     return enrichNote(s, note);
   },
 
-  async updateNote(id: string, payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean }): Promise<Note> {
+  async updateNote(id: string, payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean; expectedUpdatedAt?: string }): Promise<Note> {
     const s = await loadState();
     const n = requireNote(s, id);
+    const checked = reviewedNoteContent(n, payload.content, payload.expectedUpdatedAt);
+    if ('error' in checked) throw new Error(checked.error);
     if (payload.categoryId !== undefined) n.category_id = requireCategory(s, payload.categoryId);
     if (payload.title !== undefined) n.title = payload.title.trim() || n.title;
-    if (payload.content !== undefined) n.content = payload.content;
+    n.content = checked.content;
     if (payload.tags !== undefined) n.tags = payload.tags;
     if (payload.isPinned !== undefined) n.is_pinned = payload.isPinned;
     return saveNoteText(s, n);
@@ -2150,15 +2158,14 @@ export const localApi = {
     const mode = payload.mode === undefined ? source.mode : requireTutorMode(payload.mode);
     const provider = requireActiveProvider(initial.settings);
     if (mode !== source.mode) await updateLocalTutorSession(initial, source, { mode });
-    const turn = await localTutorTurn(initial, source, mode, { ...payload, message }, provider, progress);
-    const reply = await callLLMDirect(provider, turn.messages);
+    const { reply, sources } = await localTutorReply(initial, source, mode, { ...payload, message }, provider, progress);
     const s = await loadState();
     const session = s.tutorSessions.find((item) => item.id === sessionId);
     if (!session) throw new Error('会话已被删除');
     const userMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
-    const assistantMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: turn.render(reply, s), created_at: nowIso() };
+    const assistantMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: sources ? sources.render(reply, s) : reply, created_at: nowIso() };
     (s.tutorMessages[sessionId] ||= []).push(userMessage, assistantMessage);
-    if (turn.selectNoteIds) session.note_ids = noteIdsIn(s, turn.selectNoteIds(session.note_ids), true);
+    if (sources?.selectNoteIds) session.note_ids = noteIdsIn(s, sources.selectNoteIds(session.note_ids), true);
     session.updated_at = nextNoteUpdatedAt(session.updated_at);
     logStudy(s, 'tutor_chat', sessionId);
     await saveState(s);
@@ -2173,7 +2180,7 @@ export const localApi = {
   ) {
     // On Android CapacitorHttp (native bridge), stream chunks or fall back cleanly with smooth reveal
     const res = await localApi.sendTutorMessage(sessionId, payload, progress);
-    const text = res.assistantMessage.content;
+    const text = stripTutorNoteEdit(res.assistantMessage.content);
     // Progressive chunk emit so UI renders fluidly
     const step = Math.max(8, Math.ceil(text.length / 28));
     for (let i = 0; i < text.length; i += step) {

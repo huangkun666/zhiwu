@@ -6,17 +6,18 @@ import type { TutorMode } from '../types';
 interface TutorModeDialogProps {
   kind: 'create' | 'settings';
   initialMode: TutorMode;
+  referenceCount?: number;
   onConfirm: (mode: TutorMode) => Promise<void>;
   onClose: () => void;
 }
 
 const choices = [
-  { mode: 'general', description: '日常提问，自由讨论想法。' },
+  { mode: 'general', description: '直接问知识，需要时查笔记原文。' },
   { mode: 'qa', description: '结合笔记原文，解答学习疑问。' },
   { mode: 'feynman', description: '试着讲解概念，再回答助教的追问。' },
 ] as const;
 
-export function TutorModeDialog({ kind, initialMode, onConfirm, onClose }: TutorModeDialogProps) {
+export function TutorModeDialog({ kind, initialMode, referenceCount = 0, onConfirm, onClose }: TutorModeDialogProps) {
   const [mode, setMode] = useState(initialMode);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -93,6 +94,9 @@ export function TutorModeDialog({ kind, initialMode, onConfirm, onClose }: Tutor
             );
           })}
         </fieldset>
+        {!creating && mode === 'general' && referenceCount > 0 && <p className="text-xs text-[var(--text-secondary)]">
+          查资料时沿用本对话所选的 {referenceCount} 篇笔记。可在学习模式中调整参考范围。
+        </p>}
         {error && <p role="alert" className="break-words text-xs text-[var(--danger-fg)]">{error}</p>}
         <div className="flex justify-end gap-2">
           <button type="button" onClick={dismiss} disabled={saving}

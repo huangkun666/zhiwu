@@ -37,6 +37,11 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return data as T;
 }
 
+export async function getMcpAdapterPath(): Promise<string | null> {
+  if (IS_STANDALONE_MODE) return null;
+  return (await request<{ adapterPath: string | null }>('/api/settings/mcp')).adapterPath;
+}
+
 const serverApi = {
   getDashboard: () => request<DashboardData>('/api/dashboard'),
   seedSampleData: () => request<{ ok: boolean; notesCreated: number }>('/api/dashboard/seed', { method: 'POST' }),
@@ -62,7 +67,7 @@ const serverApi = {
     request<Note>('/api/notes', { method: 'POST', body: JSON.stringify(payload) }),
   updateNote: (
     id: string,
-    payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean }
+    payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[]; isPinned?: boolean; expectedUpdatedAt?: string }
   ) => request<Note>(`/api/notes/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
   appendNoteChat: (id: string, excerptId: string, content: string) =>
     request<Note>(`/api/notes/${id}/chat-excerpts/${encodeURIComponent(excerptId)}`, {

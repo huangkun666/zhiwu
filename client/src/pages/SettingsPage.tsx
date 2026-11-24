@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { api, IS_STANDALONE_MODE } from '../api/client';
 import { LibraryBackupPanel } from '../components/LibraryBackupPanel';
+import { McpConfigPanel } from '../components/McpConfigPanel';
 import { QrScannerModal } from '../components/QrScannerModal';
 import { QrSendModal } from '../components/QrSendModal';
 import type { AIProviderConfig, AISettings } from '../types';
@@ -215,9 +216,11 @@ export function SettingsPage({ theme, onSelectTheme, onSettingsChanged }: Settin
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
         <p className="text-xs text-[var(--text-muted)] mt-1">
-          深浅主题、AI 模型与跨端通用备份。
+          外观、AI 模型、MCP 接入与跨端备份。
         </p>
       </div>
+
+      <McpConfigPanel />
 
       {/* Dual Minimal Theme Switcher */}
       <div className="rounded-2xl zw-card p-5 sm:p-6 space-y-3.5">

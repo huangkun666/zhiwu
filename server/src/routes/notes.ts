@@ -27,7 +27,7 @@ import {
   summarizeNoteAI,
   synthesizeNotesAI,
 } from '../services/ai.js';
-import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, type ChatExcerpt } from '../shared/noteContent.js';
+import { editableNoteBody, nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, reviewedNoteContent, type ChatExcerpt } from '../shared/noteContent.js';
 import { readIds } from '../shared/libraryReferences.js';
 
 export const notesRouter = Router();
@@ -254,7 +254,8 @@ notesRouter.get('/:id', async (req, res) => {
   await ensurePdfPageIndexes([req.params.id]);
   const row = getNoteRow(req.params.id);
   if (!row) return res.status(404).json({ error: '笔记不存在' });
-  res.json(formatNote(row));
+  const note = formatNote(row)!;
+  res.json(req.query.view === 'editable' ? { ...note, editable_content: editableNoteBody(note) } : note);
 });
 
 // Create note (paste / manual)
@@ -475,8 +476,10 @@ notesRouter.put('/:id', (req, res) => {
     const existing = db.prepare(`SELECT * FROM active_notes WHERE id = ?`).get(id) as any;
     if (!existing) return { status: 404, data: { error: '笔记不存在' } };
 
+    const checked = reviewedNoteContent(existing, body.content === undefined ? undefined : String(body.content), body.expectedUpdatedAt);
+    if ('error' in checked) return { status: 409, data: checked };
     const title = body.title !== undefined ? String(body.title).trim() || existing.title : existing.title;
-    const content = body.content !== undefined ? String(body.content) : existing.content;
+    const { content } = checked;
     const categoryId = body.categoryId !== undefined ? existingCategoryId(body.categoryId) : existing.category_id;
     if (body.categoryId && !categoryId) return { status: 400, data: { error: '分类已不存在，请重新选择' } };
     const tags: string[] = body.tags === undefined

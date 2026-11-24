@@ -140,6 +140,40 @@ class ReaderTutorTest(unittest.TestCase):
         }""", images[0])
         self.assertEqual(pixel, [255, 0, 255, 255])
 
+    def test_mobile_chat_content_starts_below_toolbar(self):
+        self.page.get_by_role("button", name="助教", exact=True).click()
+        messages = self.page.get_by_role("region", name="对话消息")
+        welcome = messages.get_by_role("heading")
+        new_chat = self.page.get_by_role("button", name="新建对话", exact=True)
+
+        def check_position(content, max_gap, state):
+            expect(content).to_be_visible()
+            for width, height in [(320, 568), (390, 844), (844, 390)]:
+                with self.subTest(state=state, width=width):
+                    self.page.set_viewport_size({"width": width, "height": height})
+                    panel_top = messages.bounding_box()["y"]
+                    button = new_chat.bounding_box()
+                    self.assertLessEqual(button["y"], 40 if width >= 768 else 16)
+                    self.assertLessEqual(panel_top - (button["y"] + button["height"]), 16)
+                    gap = content.bounding_box()["y"] - panel_top
+                    self.assertGreaterEqual(gap, 0)
+                    self.assertLessEqual(gap, max_gap)
+
+        check_position(welcome, 64, "empty library")
+        new_chat.click()
+        dialog = self.page.get_by_role("dialog", name="新建对话", exact=True)
+        dialog.get_by_role("button", name="创建对话", exact=True).click()
+        expect(dialog).to_be_hidden()
+        check_position(welcome, 64, "new general chat")
+
+        self.configure_model("布局测试回答")
+        self.page.locator("textarea").fill("布局测试问题")
+        self.page.get_by_role("button", name="发送消息").click()
+        expect(messages.get_by_text("布局测试回答", exact=True)).to_be_visible()
+        self.page.reload()
+        question = messages.get_by_text("布局测试问题", exact=True)
+        check_position(question, 32, "saved chat")
+
     def test_mobile_chat_space(self):
         self.page.get_by_role("button", name="助教", exact=True).click()
         self.page.get_by_role("button", name="新建对话", exact=True).click()

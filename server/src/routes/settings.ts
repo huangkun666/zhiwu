@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import os from 'node:os';
+import path from 'node:path';
 import QRCode from 'qrcode';
-import { type AISettings, DB_PATH, getAISettings, nowIso, saveAISettings } from '../db.js';
+import { type AISettings, DB_PATH, PROJECT_ROOT, getAISettings, nowIso, saveAISettings } from '../db.js';
 import { fetchProviderModels, getActiveModelCapability, testProviderConnection } from '../services/ai.js';
 import { restoreLegacyBackup } from '../services/backupArchive.js';
 import { readBackupSnapshot } from '../services/backupSnapshot.js';
@@ -51,6 +52,12 @@ settingsRouter.get('/', (_req, res) => {
     ...getAISettings(),
     activeCapability: getActiveModelCapability(),
   });
+});
+
+settingsRouter.get('/mcp', (req, res) => {
+  const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+  const sameMachine = loopback.includes(req.socket.remoteAddress || '') && [...loopback, '[::1]', 'localhost'].includes(req.hostname || '');
+  res.json({ adapterPath: sameMachine ? path.join(PROJECT_ROOT, 'server', 'mcp.mjs') : null });
 });
 
 settingsRouter.put('/', (req, res) => {

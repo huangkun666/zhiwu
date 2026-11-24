@@ -8,7 +8,8 @@ import { verifyTutorModes } from '../../server/test/fixtures/tutor-modes.mjs';
 async function openLibrary(t) {
   const vite = await createServer({
     root: fileURLToPath(new URL('../', import.meta.url)),
-    server: { middlewareMode: true, ws: false },
+    configFile: false,
+    server: { middlewareMode: true, ws: false, watch: null },
     optimizeDeps: { noDiscovery: true, include: [] },
   });
   t.after(() => vite.close());
@@ -115,12 +116,18 @@ test('portable tutor modes and ordinary conversation', { timeout: 20000 }, async
     choices: [{ message: { content: await model(JSON.parse(options.body)) } }],
   }));
   await verifyTutorModes(t, {
+    providerStreams: false,
     create: (payload) => engine.createTutorSession(payload),
     mode: (id, mode) => engine.setTutorSessionMode(id, mode),
     list: (q) => engine.listTutorHistory(q),
     messages: (id) => engine.getTutorMessages(id),
     restore: (snapshot) => engine.importJsonBackup(JSON.stringify(snapshot)),
     export: async () => JSON.parse(await engine.exportJsonBackup()),
+    note: (id) => engine.getNote(id),
+    updateNote: (id, payload) => engine.updateNote(id, payload),
+    rejectUpdate: (id, payload, _status, pattern) => assert.rejects(engine.updateNote(id, payload), pattern),
+    trashNote: (id) => engine.deleteNote(id),
+    restoreNote: (id) => engine.restoreNote(id),
     model: (handler) => { model = handler; },
     send: (id, payload) => engine.sendTutorMessage(id, payload),
     async stream(id, payload) {

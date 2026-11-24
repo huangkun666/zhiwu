@@ -32,7 +32,7 @@ try {
       signal: options?.signal ?? AbortSignal.timeout(10_000),
     });
     const data = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(data?.error || `知悟请求失败（HTTP ${response.status}）`);
+    if (!response.ok) throw Object.assign(new Error(data?.error || `知悟请求失败（HTTP ${response.status}）`), { status: response.status });
     if (data === null) throw new Error('知悟服务未返回可读取的数据');
     return data;
   }
@@ -166,7 +166,9 @@ try {
     ].join('\n'));
   });
 
-  if (process.env.ZHIWU_ALLOW_READ === '1') {
+  const allowRead = process.env.ZHIWU_ALLOW_READ === '1';
+  const readForEdit = noteId => request(`api/notes/${encodeURIComponent(noteId)}?view=editable`);
+  if (allowRead) {
     server.registerTool('search_zhiwu_notes', {
       title: '搜索知悟笔记',
       description: '按关键词、分类编号或标签查找笔记，返回标题、片段和链接。',
@@ -189,17 +191,49 @@ try {
 
     server.registerTool('read_zhiwu_note', {
       title: '读取知悟笔记',
-      description: '按笔记编号读取正文、文档文字、聊天摘录和原文件地址。',
+      description: '按笔记编号读取正文、文档文字、聊天摘录和原文件地址。编辑前读取 editableContent 和版本 updatedAt。',
       inputSchema: z.object({ noteId: noteIdSchema }),
     }, async ({ noteId }) => {
       await verifyLibrary();
-      const note = await request(`api/notes/${encodeURIComponent(noteId)}`);
+      const note = await readForEdit(noteId);
       const attachmentUrl = /^\/uploads\/[a-z0-9][\w.-]*$/i.test(note.attachment_path)
         ? new URL(note.attachment_path.slice(1), base).href : null;
       return result({
-        ...noteReceipt(note), tags: note.tags, content: note.content, sourceContent: note.source_content,
+        ...noteReceipt(note), updatedAt: note.updated_at, tags: note.tags, content: note.content, editableContent: note.editable_content, sourceContent: note.source_content,
         chatExcerpts: note.chat_excerpts, sourceFilename: note.source_filename, attachmentUrl,
       });
+    });
+
+  }
+
+  if (allowRead && process.env.ZHIWU_ALLOW_EDIT === '1') {
+    server.registerTool('update_zhiwu_note', {
+      title: '修改知悟笔记',
+      description: '修改指定笔记的标题或可编辑正文。先读取笔记，以 read_zhiwu_note 的 updatedAt 作为 expectedUpdatedAt。正文替换保留原件及聊天摘录。',
+      inputSchema: z.object({
+        noteId: noteIdSchema, expectedUpdatedAt: label.describe('读取笔记时取得的 updatedAt'),
+        title: label.optional(), content: z.string().optional().describe('替换 editableContent 的完整 Markdown 正文。如仅改名，请省略此项'),
+      }),
+    }, async ({ noteId, expectedUpdatedAt, title, content }) => {
+      if (title === undefined && content === undefined) throw new Error('请填写要修改的标题或正文');
+      await verifyLibrary();
+      let note = await readForEdit(noteId);
+      if (!Object.hasOwn(note, 'editable_content')) throw new Error('请先升级知悟服务以支持按版本修改笔记');
+      if (content !== undefined && note.editable_content === null) throw new Error('这份旧笔记的正文存放导入原文，可改名或追加聊天摘录');
+      const matches = (current) => (title === undefined || title === current.title)
+        && (content === undefined || content === current.editable_content || content === current.content);
+      if (!matches(note)) {
+        if (note.updated_at !== expectedUpdatedAt) throw new Error('笔记已更新，请重新读取后再确认修改');
+        try {
+          note = await sendJson(`api/notes/${encodeURIComponent(noteId)}`, { expectedUpdatedAt, title, content }, 'PUT');
+        } catch (err) {
+          if (err.status !== 409) throw err;
+          note = await readForEdit(noteId);
+          if (!matches(note)) throw err;
+        }
+      }
+      const receipt = { ...noteReceipt(note), updatedAt: note.updated_at };
+      return result(receipt, `已核对《${receipt.title}》的修改\n${receipt.url}`);
     });
   }
 

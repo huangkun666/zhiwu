@@ -1,5 +1,6 @@
 import type { Document, Unit } from './tutorSearch.js';
 import { sourceFingerprint } from './tutorSources.js';
+import { stripTutorNoteEdit } from './tutorNoteEdit.js';
 
 export type TutorMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 export type RetrievalModel = (messages: TutorMessage[]) => Promise<string>;
@@ -27,7 +28,7 @@ export function lastScan(history: TutorMessage[], question: string) {
   }
 }
 
-export function cleanHistory(content: string) { return content.replace(/<!--zhiwu-scan:[^\s<>]+-->/g, ''); }
+export function cleanHistory(content: string) { return stripTutorNoteEdit(content).replace(/<!--zhiwu-scan:[^\s<>]+-->/g, ''); }
 
 export function stripTutorMetadata(content: string) {
   return cleanHistory(content).replace(/\[([^[\]\n]*)\]\(\?note=[^)\n]*\)/g, '$1');

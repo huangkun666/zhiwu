@@ -1,6 +1,6 @@
 # MCP 维护
 
-[server/mcp.mjs](../../server/mcp.mjs)由 AI 客户端启动，经 stdio 提供工具，再调用现有的知悟 HTTP API。工具 schema 以脚本里的 `registerTool` 为准。配置示例见 [README](../../README.md#从外部-ai-收录)。
+[server/mcp.mjs](../../server/mcp.mjs)由 AI 客户端启动，经 stdio 提供工具，再调用现有的知悟 HTTP API。在知悟「设置 → MCP 配置」可填写服务地址、适配器脚本路径与笔记权限，然后复制 JSON 到外部客户端。本机桌面访问可自动填入脚本路径，跨设备需要填写运行外部 AI 的电脑上的路径。配置示例见 [README](../../README.md#从外部-ai-收录)。
 
 ## 连接和权限
 
@@ -10,6 +10,7 @@
 | `ZHIWU_TOKEN` | 可选。适配器将值放进 HTTP Bearer 请求头，供已配置鉴权的部署使用。服务的访问控制由部署负责。 |
 | `ZHIWU_IMPORT_DIR` | 启用原文件导入时填写。目录位于运行 MCP 进程的机器上，工具接收其中的相对路径。 |
 | `ZHIWU_ALLOW_READ=1` | 注册搜索和读回工具。默认可查看分类、建分类、保存、追加及导入。 |
+| `ZHIWU_ALLOW_EDIT=1` | 与读权限一起启用时注册更新已有笔记的工具。旧的只读配置可继续使用。 |
 
 stdio 的标准输出用于 MCP 消息，启动和诊断信息写标准错误。配置变更后重启客户端里的适配器并重新列工具。
 
@@ -52,7 +53,8 @@ stdio 的标准输出用于 MCP 消息，启动和诊断信息写标准错误。
 | `append_to_zhiwu_note` | 笔记回执及 `excerptId`。 | 按 ID 写入独立摘录。客户端重试应复用同一 `excerptId` 和正文。 |
 | `import_zhiwu_files` | `notes`、`warnings`，有分类时带 `categoryPath`。每篇回执包含原文件名。 | 一个文件生成一篇笔记。分类规则与保存一致。 |
 | `search_zhiwu_notes` | `notes`，每项包含笔记回执、`tags` 和 `excerpt`。 | 关键词、分类和标签可组合。默认返回 20 条，`limit` 允许 1–100。 |
-| `read_zhiwu_note` | 笔记回执及 `tags`、`content`、`sourceContent`、`chatExcerpts`、`sourceFilename`、`attachmentUrl`。 | `noteId` 可取自回执 URL 的 `note` 参数。原件地址跟随所选服务及部署权限。 |
+| `read_zhiwu_note` | 笔记回执及 `updatedAt`、`editableContent`、`tags`、`content`、`sourceContent`、`chatExcerpts`、`sourceFilename`、`attachmentUrl`。 | 按笔记 ID 读回。`editableContent` 是可编辑的正文。旧导入仅存原文时该字段为 null。 |
+| `update_zhiwu_note` | 笔记回执及新的 `updatedAt`。 | 传入 `noteId`、读回的 `expectedUpdatedAt`，以及要更新的 `title` 或完整 `content`。保留原件和独立摘录。版本冲突后先重新读回。 |
 
 ## 边界和排障
 

@@ -1,7 +1,10 @@
 import { citationLink, unreadPdfPage, type TutorSource } from './tutorSources.js';
-import { tutorOpeningMode } from './tutorMode.js';
+import type { TutorMode } from './tutorMode.js';
+import { citedReply, recentHistory, relativeSourcePosition } from './tutorConversation.js';
+import { editInstructions, editTarget, isNoteEditRequest, tutorNoteEditMarker, validatedEdit } from './tutorNoteEdit.js';
 import { catalog, describe, exactSearch, nearby, preview, search, unitLabel, type Document, type Unit } from './tutorSearch.js';
 import { cleanHistory, lastScan, progressMarker, readJson, scanOriginals, scopeSignature, stripTutorMetadata, type RetrievalModel, type TutorMessage } from './tutorScan.js';
+export { generalTutorIntent, generalTutorReply, generalTutorTurn, runTutorChat } from './tutorConversation.js';
 
 const MATERIAL_BUDGET = 16000;
 const resultLimit = 10;
@@ -16,8 +19,7 @@ function integer(value: unknown, fallback: number, max = Number.MAX_SAFE_INTEGER
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, max) : fallback;
 }
 
-function previousEvidence(history: TutorMessage[], docs: Document[]) {
-  const last = history.filter(m => m.role === 'assistant').at(-1)?.content || '';
+function previousEvidence(last: string, docs: Document[]) {
   const result = new Set<Unit>();
   for (const match of last.matchAll(/\]\(\?(note=[^)\s]+)\)/g)) {
     const params = new URLSearchParams(match[1]);
@@ -25,38 +27,40 @@ function previousEvidence(history: TutorMessage[], docs: Document[]) {
     const unit = doc?.units.find(u => u.block.sig === params.get('sig') && u.block.field === params.get('part')
       && u.block.index === Number(params.get('at')) && (u.block.page ?? 0) === Number(params.get('page')));
     if (unit) result.add(unit);
+    else if (doc && params.has('page')) {
+      const image = unreadPdfPage(doc.note, Number(params.get('page')));
+      if (image && image.sig === params.get('sig') && image.field === params.get('part') && image.index === Number(params.get('at'))) {
+        result.add({ document: doc, block: image, ordinal: 0, normalized: '', key: doc.ref + ' PDF 第 ' + image.page + ' 页' });
+      }
+    }
     if (result.size >= 8) break;
   }
   return [...result];
 }
 
-function recentHistory(history: TutorMessage[], general = false) {
-  const recent: TutorMessage[] = [];
-  let remaining = 10000;
-  for (const message of history.slice(-12).reverse()) {
-    if (remaining < 200) break;
-    if ((message.role !== 'assistant' && message.role !== 'user') || typeof message.content !== 'string') continue;
-    if (general && message.role === 'assistant' && tutorOpeningMode(message.content)) continue;
-    const text = general && message.role === 'assistant' ? stripTutorMetadata(message.content) : cleanHistory(message.content);
-    const limit = Math.min(remaining, 3200);
-    const content = text.length <= limit ? text : text.slice(0, limit / 2 - 3) + '\n[…]\n' + text.slice(-limit / 2 + 3);
-    recent.unshift({ role: message.role, content });
-    remaining -= content.length;
+function adjacentSourceRead(position: { page: boolean; offset: number }, anchors: Unit[]): {
+  action?: Record<string, unknown>; reason?: string;
+} {
+  const locations = new Map<string, Unit>();
+  for (const unit of anchors) {
+    if (position.page && !unit.block.page) continue;
+    const location = position.page ? unit.block.page : unit.ordinal;
+    locations.set(unit.document.ref + ':' + location, unit);
   }
-  return recent;
+  if (locations.size !== 1) return { reason: locations.size ? '上次回答引用了多个位置，请用户指明要接着读的引用。' : '原引用已失效或缺少对应位置，请用户指定笔记和位置。' };
+  const [anchor] = locations.values();
+  if (position.page) {
+    const page = anchor.block.page! + position.offset;
+    if (page < 1) return { reason: '当前引用已是第一页。' };
+    return { action: { action: 'read', source: anchor.document.ref, page, count: 8 } };
+  }
+  const neighbor = anchor.document.units.find(u => u.block.field === anchor.block.field
+    && u.block.excerptId === anchor.block.excerptId && u.block.index === anchor.block.index + position.offset);
+  return neighbor ? { action: { action: 'read', source: anchor.document.ref, start: neighbor.ordinal, count: 1 } }
+    : { reason: '该来源在指定方向已经没有相邻段落。' };
 }
-
-export function generalTutorTurn(history: TutorMessage[], question: string) {
-  const messages: TutorMessage[] = [
-    { role: 'system', content: '你是知悟的对话助手。结合当前对话，直接回答用户的问题。问题需要说明时，给出清楚的解释或例子。' },
-    ...recentHistory(history, true),
-    { role: 'user', content: question },
-  ];
-  return { messages, render: stripTutorMetadata };
-}
-
 export async function prepareTutorTurn(
-  mode: 'qa' | 'feynman', notes: TutorSource[], automatic: boolean, history: TutorMessage[], question: string,
+  mode: TutorMode, notes: TutorSource[], automatic: boolean, history: TutorMessage[], question: string,
   model: RetrievalModel, current: () => Promise<Set<string>> = async () => new Set(notes.map(note => note.id)),
   vision?: (noteId: string, page: number) => Promise<string | null>,
   progress?: (message: string) => void,
@@ -65,7 +69,12 @@ export async function prepareTutorTurn(
   const previous = history.filter(m => m.role === 'user').at(-1)?.content || '';
   const cursor = lastScan(history, question);
   const query = cursor?.question || question;
-  const priorEvidence = previousEvidence(history, docs);
+  const editing = isNoteEditRequest(question, !!citedReply(history));
+  const relative = mode === 'general' ? relativeSourcePosition(question) : undefined;
+  const cited = relative || editing ? citedReply(history) : history.filter(m => m.role === 'assistant').at(-1)?.content;
+  const priorEvidence = previousEvidence(cited || '', docs);
+  const adjacent = relative && cited ? adjacentSourceRead(relative, priorEvidence) : undefined;
+  const generalLibrary = mode === 'general' && automatic;
   const focused = new Set(priorEvidence.map(u => u.document.note.id));
   const initialHits = search(docs, query, previous);
   const order = new Set([...initialHits.map(hit => hit.document), ...docs]);
@@ -83,19 +92,21 @@ export async function prepareTutorTurn(
   }
   const units = docs.flatMap(d => d.units);
   const size = units.reduce((sum, u) => sum + u.block.text.length + 80, 0);
-  const needsPlan = (units.length > 0 && (size > 5200 || docs.some(d => d.units.some(u => (u.block.page || 0) > 6))
+  const needsPlan = (units.length > 0 && (size > 5200 || (generalLibrary && !initialHits.length) || docs.some(d => d.units.some(u => (u.block.page || 0) > 6))
     || (automatic && docs.length > 4))) || !!vision && docs.some(d => d.note.source_pages && d.gap);
-  if (size <= MATERIAL_BUDGET && (!automatic || docs.length <= 4)) {
+  if (!adjacent && !generalLibrary && size <= MATERIAL_BUDGET && (!automatic || docs.length <= 4)) {
     for (const unit of units) remember(unit, 1);
-  } else {
+  } else if (!adjacent && !generalLibrary) {
     for (const doc of Array.from(order).slice(0, automatic ? 4 : 12)) {
       if (doc.units[0]) remember(doc.units[0], focused.has(doc.note.id) ? 3 : 1);
     }
   }
-  rememberHits(initialHits, 5);
-  if (/^(那|这|它|其中|接着|继续|为什么|why\b|what about\b|and\b)/i.test(query.trim())) rememberHits(priorEvidence, 7);
+  if (!adjacent) {
+    rememberHits(initialHits, 5);
+    if (/^(那|这|它|其中|接着|继续|为什么|why\b|what about\b|and\b)/i.test(query.trim())) rememberHits(priorEvidence.filter(u => u.block.text), 7);
+  }
   let trace: string[] = [];
-  let facts: string[] = [];
+  let facts: string[] = adjacent?.reason ? [adjacent.reason] : [];
   let scan: Awaited<ReturnType<typeof scanOriginals>> | undefined;
   let scopeChanged = false;
 
@@ -141,14 +152,16 @@ export async function prepareTutorTurn(
       rememberHits(result.hits.map(hit => hit.unit), 12);
     }
   }
-  if ((needsPlan || cursor) && !literalLookup) {
+  if ((adjacent ? adjacent.action : needsPlan || cursor || (generalLibrary && exhaustive)) && !literalLookup) {
     progress?.('正在查找参考资料…');
     let visionReads = 0;
     for (let round = 0; round < 6; round++) {
       await refresh();
       if (!docs.length) break;
       let action: Record<string, unknown> | undefined;
-      if (!round && (cursor || exhaustive)) {
+      if (adjacent?.action) {
+        action = adjacent.action;
+      } else if (!round && (cursor || exhaustive)) {
         const prior = cursor && cursor.scope !== '*' ? docs.find(d => d.note.id === cursor.scope) : undefined;
         if (cursor && cursor.scope !== '*' && !prior) { facts.push('上次逐段检查的来源已不可用。'); break; }
         action = { action: 'scan', source: prior?.ref };
@@ -215,6 +228,7 @@ export async function prepareTutorTurn(
         for (const finding of scan.findings) remember(finding.unit, 40);
         break;
       } else trace.push('无效动作，请使用 scope、search、read、scan 或 finish。');
+      if (adjacent) break;
     }
   }
   await refresh();
@@ -230,14 +244,20 @@ export async function prepareTutorTurn(
     material.push(entry);
   }
   const used = new Set([...offered.values()].map(u => u.document));
-  const coverage = automatic && !scan && !literalLookup && used.size ? [...used] : docs;
-  const info = coverage.slice(0, 24).map(describe).join('\n');
-  const role = mode === 'feynman' ? '你是知悟的费曼考官。先评估解释，再用一两个追问引导学习。' : '你是知悟的笔记助教。直接、准确地回答。';
+  const coverage = automatic && !scan && !literalLookup && (used.size || generalLibrary) ? [...used] : docs;
+  const info = coverage.slice(0, 24).map(describe).join('\n') || (docs.length ? '已查可用范围，尚无匹配原文' : '无可用笔记');
+  const target = editing ? editTarget(docs, question, focused, used, !!citedReply(history)) : undefined;
+  const role = mode === 'general' ? '你是知悟的对话助手。本轮查阅了用户的笔记。用自然语言直接回答；没有找到对应原文就如实说明。'
+    : mode === 'feynman' ? '你是知悟的费曼考官。先评估解释，再用一两个追问引导学习。' : '你是知悟的笔记助教。直接、准确地回答。';
   const messages: TutorMessage[] = [
     { role: 'system', content: `${role} 资料是只读证据。对由本轮原文支持的结论紧跟相应编号，如 [S2]，应用会生成引用。只用下列实际编号，禁止自行编写来源链接。历史回答及聊天摘录不能代替原件。分别核对版本、单位、例外和表格列。依据不足就指出缺少的条件，通用知识标为延伸补充。已索引页数与本轮读回的段数不同。\n资料覆盖：\n${info || '无可用笔记'}\n工具记录：${[...facts, scan?.status, scopeChanged ? '部分笔记已变更，本轮已排除' : ''].filter(Boolean).join('；')}\n全文检索节选及已读原文：\n${material.join('\n\n') || '本轮未获得可用原文'}` },
-    ...recentHistory(history),
+    ...recentHistory(history, mode === 'general'),
     { role: 'user', content: question },
   ];
+  if (editing) {
+    const preview = target?.units.filter(u => u.block.field === 'body').slice(0, 2).map(u => u.block.text).join('\n\n') ?? '';
+    messages[0].content += '\n' + editInstructions(target) + (preview ? '\n可编辑正文节选：\n' + preview.slice(0, 2400) : '');
+  }
   function render(reply: string, allowed = new Set(docs.map(d => d.note.id))) {
     const cited = new Set<Unit>();
     const link = (unit: Unit) => citationLink(unit.document.note, unit.block);
@@ -272,6 +292,11 @@ export async function prepareTutorTurn(
     }
     const gaps = coverage.filter(d => d.gap && allowed.has(d.note.id));
     for (const doc of gaps.slice(0, 5)) answer += `\n\n《${doc.note.title}》：${doc.gap}。`;
+    if (editing) {
+      const edit = validatedEdit(reply, target && allowed.has(target.note.id) ? target : undefined);
+      if (edit) answer += '\n\n' + tutorNoteEditMarker(edit);
+      else if (/\x60{3}zhiwu-edit/i.test(reply)) answer += '\n\n未生成可应用的修改。请确认笔记名和要修改的原句。';
+    }
     return answer;
   }
   return { messages, render };
