@@ -15,7 +15,9 @@ import type {
   Quiz,
   ReviewQueueItem,
   Synthesis,
+  TutorHistoryPage,
   TutorMessage,
+  TutorMode,
   TutorSession,
   TrashedNote,
 } from '../types';
@@ -165,21 +167,32 @@ const serverApi = {
   getGraph: () => request<{ nodes: GraphNode[]; links: GraphLink[]; weakConcepts: GraphNode[] }>('/api/graph'),
 
   getTutorSessions: () => request<TutorSession[]>('/api/tutor/sessions'),
-  createTutorSession: (payload: { title?: string; mode: 'qa' | 'feynman'; noteIds?: string[]; initialPrompt?: string }) =>
+  listTutorHistory: (query = '', cursor?: string) => {
+    const params = new URLSearchParams();
+    if (query) params.set('q', query);
+    if (cursor) params.set('cursor', cursor);
+    return request<TutorHistoryPage>(`/api/tutor/history${params.size ? '?' + params : ''}`);
+  },
+  renameTutorSession: (id: string, title: string) =>
+    request<TutorSession>(`/api/tutor/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+  setTutorSessionMode: (id: string, mode: TutorMode) =>
+    request<TutorSession>(`/api/tutor/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ mode }) }),
+  createTutorSession: (payload: { title?: string; mode?: TutorMode; noteIds?: string[]; initialPrompt?: string } = {}) =>
     request<TutorSession>('/api/tutor/sessions', { method: 'POST', body: JSON.stringify(payload) }),
   getTutorMessages: (sessionId: string) =>
-    request<{ session: TutorSession; messages: TutorMessage[] }>(`/api/tutor/sessions/${sessionId}/messages`),
-  sendTutorMessage: (sessionId: string, payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' }) =>
-    request<{ userMessage: TutorMessage; assistantMessage: TutorMessage }>(`/api/tutor/sessions/${sessionId}/chat`, {
+    request<{ session: TutorSession; messages: TutorMessage[] }>(`/api/tutor/sessions/${encodeURIComponent(sessionId)}/messages`),
+  sendTutorMessage: (sessionId: string, payload: { message: string; noteIds?: string[]; discardedNoteIds?: string[]; mode?: TutorMode }) =>
+    request<{ userMessage: TutorMessage; assistantMessage: TutorMessage }>(`/api/tutor/sessions/${encodeURIComponent(sessionId)}/chat`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   sendTutorMessageStream: async (
     sessionId: string,
-    payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' },
-    onDelta: (delta: string) => void
+    payload: { message: string; noteIds?: string[]; discardedNoteIds?: string[]; mode?: TutorMode },
+    onDelta: (delta: string) => void,
+    progress?: (message: string) => void,
   ): Promise<{ userMessage: TutorMessage; assistantMessage: TutorMessage }> => {
-    const res = await fetch(`/api/tutor/sessions/${sessionId}/chat-stream`, {
+    const res = await fetch(`/api/tutor/sessions/${encodeURIComponent(sessionId)}/chat-stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -204,6 +217,7 @@ const serverApi = {
         try {
           const evt = JSON.parse(line.slice(5).trim());
           if (evt.error) throw new Error(evt.error);
+          if (typeof evt.status === 'string') progress?.(evt.status);
           if (evt.delta) onDelta(evt.delta);
           if (evt.done && evt.userMessage && evt.assistantMessage) {
             finalResult = { userMessage: evt.userMessage, assistantMessage: evt.assistantMessage };
@@ -217,7 +231,7 @@ const serverApi = {
     return finalResult;
   },
   deleteTutorSession: (sessionId: string) =>
-    request<{ ok: boolean }>(`/api/tutor/sessions/${sessionId}`, { method: 'DELETE' }),
+    request<{ ok: boolean }>(`/api/tutor/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
 
   getSettings: () => request<AISettings>('/api/settings'),
   saveSettings: (settings: AISettings) =>

@@ -14,13 +14,15 @@ export function existingIds(value: unknown, available: ReadonlySet<string>): str
   return readIds(value).filter((id) => available.has(id));
 }
 
-export function tutorNoteSelection(stored: unknown, visible: string[], selected: string[]) {
+export function tutorNoteSelection(stored: unknown, visible: string[], selected: string[], discard: unknown = []) {
   const unchanged = selected.length === visible.length && selected.every((id, index) => id === visible[index]);
   const visibleIds = new Set(visible);
   const hiddenIds = new Set(readIds(stored).filter((id) => !visibleIds.has(id)));
+  const removed = new Set(readIds(discard).filter(id => hiddenIds.has(id)));
   return (latest: unknown) => {
     const current = readIds(latest);
-    return unchanged ? current : [...current.filter((id) => hiddenIds.has(id)), ...selected];
+    const saved = unchanged ? current : [...current.filter((id) => hiddenIds.has(id)), ...selected];
+    return saved.filter(id => !removed.has(id));
   };
 }
 

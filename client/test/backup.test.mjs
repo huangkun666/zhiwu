@@ -42,7 +42,7 @@ test('offline archives keep the originals and study history, and a failed restor
     mistakes: [{ id: 'mistake', note_id: 'docx', question_id: 'question', status: 'reviewing', stem: '错题',
       wrong_count: 4, repetitions: 2, next_review_at: '2099-02-01T08:00:00.000Z', user_reflection: '复习心得',
       created_at: stamp, updated_at: stamp }],
-    tutorSessions: [{ id: 'chat', title: '历史对话', mode: 'qa', note_ids: ['pdf', 'docx'], created_at: stamp, updated_at: stamp }],
+    tutorSessions: [{ id: 'chat', title: '历史对话', mode: 'general', note_ids: ['pdf', 'docx'], created_at: stamp, updated_at: stamp }],
     tutorMessages: { chat: [{ id: 'reply', role: 'assistant', content: '保存的对话', created_at: stamp }] },
     studyLogs: [{ id: 'activity', activity_type: 'quiz_complete', entity_id: 'quiz', duration_seconds: 78,
       score: 0.75, date_key: '2026-11-20', created_at: stamp }],
@@ -100,6 +100,7 @@ test('offline archives keep the originals and study history, and a failed restor
     assert.equal((await target.restoreBackup(file)).notesCount, 0);
     assert.deepEqual((await target.getTrashedNotes()).map(({ id }) => id), ['docx']);
     assert.deepEqual((await target.getTutorMessages('chat')).session.note_ids, ['pdf']);
+    assert.equal((await target.getTutorMessages('chat')).session.mode, 'general');
     assert.equal((await target.getTutorMessages('chat')).messages[0].content, '保存的对话');
     assert.equal((await target.getQuiz('quiz')).score, 0.75);
     assert.equal((await target.getQuiz('quiz')).questions[0].user_answer, 'A');

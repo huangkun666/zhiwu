@@ -1,7 +1,8 @@
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 
 export async function loadPdf(source: string | Uint8Array) {
-  const { GlobalWorkerOptions, getDocument } = await import('pdfjs-dist');
+  // Both contexts need PDF.js's compatibility polyfills on older Android WebViews.
+  const { GlobalWorkerOptions, getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
   if (!GlobalWorkerOptions.workerSrc) GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
   const assetPath = import.meta.env.DEV ? 'node_modules/pdfjs-dist/' : 'pdf-assets/';
   const assetBase = new URL(`${import.meta.env.BASE_URL}${assetPath}`, window.location.href);

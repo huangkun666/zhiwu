@@ -18,6 +18,8 @@ import {
   upsertConcept,
 } from '../db.js';
 import { parseUploadedFile } from '../services/parser.js';
+import { ensurePdfPageIndexes } from '../services/pdfPageIndex.js';
+import { readPdfPages } from '../shared/pdfPages.js';
 import {
   callVisionOCR,
   cleanOcrMarkdown,
@@ -67,6 +69,7 @@ function formatNote(row: any) {
     tags,
     summary,
     chat_excerpts: readChatExcerpts(row.chat_excerpts),
+    source_pages: row.source_type === 'pdf' ? readPdfPages(row.source_pages, row.source_content ?? '') : null,
     is_pinned: Boolean(row.is_pinned),
   };
 }
@@ -247,7 +250,8 @@ notesRouter.delete('/trash/:id', async (req, res) => {
 });
 
 // Get single note
-notesRouter.get('/:id', (req, res) => {
+notesRouter.get('/:id', async (req, res) => {
+  await ensurePdfPageIndexes([req.params.id]);
   const row = getNoteRow(req.params.id);
   if (!row) return res.status(404).json({ error: '笔记不存在' });
   res.json(formatNote(row));
@@ -323,14 +327,15 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
         if (categoryId && !category) throw new Error('分类已不存在，请重新选择');
         db.prepare(
           `INSERT INTO notes (
-            id, title, content, source_content, category_id, tags, source_type, source_filename,
+            id, title, content, source_content, source_pages, category_id, tags, source_type, source_filename,
             attachment_path, word_count, is_pinned, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
         ).run(
           id,
           parsed.title,
           isImage ? parsed.content : '',
           isImage ? null : parsed.content,
+          parsed.sourcePages ? JSON.stringify(parsed.sourcePages) : null,
           category,
           JSON.stringify(extraTags),
           parsed.sourceType,

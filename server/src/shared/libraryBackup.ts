@@ -1,5 +1,7 @@
 import { readIds } from './libraryReferences.js';
 import { readChatExcerpts } from './noteContent.js';
+import { readPdfPages } from './pdfPages.js';
+import { isTutorMode } from './tutorMode.js';
 
 export type BackupRecord = { id: string } & Record<string, unknown>;
 
@@ -142,6 +144,7 @@ function normalizeNote(record: BackupRecord): BackupRecord {
   const deletedAt = note.deleted_at;
   return {
     ...note,
+    source_pages: note.source_type === 'pdf' ? readPdfPages(note.source_pages, String(note.source_content ?? '')) : null,
     title: typeof note.title === 'string' ? note.title : '未命名笔记',
     content: typeof note.content === 'string' ? note.content : '',
     summary: normalizeSummary(note.summary ?? summary_json),
@@ -183,7 +186,9 @@ export function normalizeBackupSnapshot(value: unknown): BackupSnapshot {
     })),
     flashcards: records(data.flashcards),
     mistakes: records(data.mistakes).map(({ options_json, ...item }) => ({ ...item, options: strings(item.options ?? options_json) })),
-    tutorSessions: records(data.tutorSessions).map((item) => ({ ...item, note_ids: readIds(item.note_ids) })),
+    tutorSessions: records(data.tutorSessions).map((item) => ({
+      ...item, mode: isTutorMode(item.mode) ? item.mode : 'qa', note_ids: readIds(item.note_ids),
+    })),
     tutorMessages: messages,
     studyLogs: records(data.studyLogs),
   };
@@ -264,6 +269,12 @@ function mergeNotes(current: BackupRecord, incoming: BackupRecord): BackupRecord
   const missing: Record<string, unknown> = {};
   for (const field of ['attachment_path', 'source_content', 'source_filename', 'source_type']) {
     if (primary[field] == null && fallback[field] != null) missing[field] = fallback[field];
+  }
+  if (primary.source_pages == null && fallback.source_pages != null &&
+      (primary.source_type ?? missing.source_type) === 'pdf' &&
+      (!primary.attachment_path || primary.attachment_path === fallback.attachment_path) &&
+      (primary.source_content ?? missing.source_content) === fallback.source_content) {
+    missing.source_pages = fallback.source_pages;
   }
   if (primary === incoming && incoming.deleted_at === undefined && current.deleted_at !== undefined) {
     missing.deleted_at = current.deleted_at;

@@ -12,6 +12,7 @@ const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 const fixtures = [];
 const at = '2026-11-23T08:00:00.000Z';
 const original = Buffer.from('%PDF-1.4\n原始文件\n');
+const sourcePages = [{ start: 0, end: 0, status: 'empty' }, { start: 0, end: 4, status: 'text' }, { start: 4, end: 4, status: 'failed' }];
 
 async function openLibrary() {
   const folder = mkdtempSync(join(dist, 'notes-test-backup-'));
@@ -65,6 +66,7 @@ function seedLibrary({ db, uploads }) {
     VALUES (?, ?, '最新笔记', '原文文本', ?, 'cat', 'pdf', ?, ?, ?, ?, ?)`);
   insertNote.run('pdf', '带图表的资料', JSON.stringify([{ id: 'clip', content: '助教摘录', created_at: at }]), '图表.pdf', '/uploads/original.pdf', null, at, at);
   insertNote.run('trashed', '在回收站的资料', '[]', '找不到.pdf', '/uploads/missing.pdf', at, at, at);
+  db.prepare("UPDATE notes SET source_pages = ? WHERE id = 'pdf'").run(JSON.stringify(sourcePages));
   writeFileSync(join(uploads, 'original.pdf'), original);
   db.prepare(`INSERT INTO concepts (id, name, mastery_score, quiz_attempts, quiz_correct, created_at)
     VALUES ('concept', '重力', 0.75, 4, 3, ?)`).run(at);
@@ -83,7 +85,7 @@ function seedLibrary({ db, uploads }) {
   db.prepare(`INSERT INTO mistakes (id, question_id, note_id, type, stem, correct_answer, user_reflection, wrong_count, next_review_at, created_at, updated_at)
     VALUES ('mistake', 'question', 'trashed', 'single', '曾错的题', 'A', '我的反思', 5, ?, ?, ?)`).run(at, at, at);
   db.prepare(`INSERT INTO tutor_sessions (id, title, mode, note_ids, created_at, updated_at)
-    VALUES ('chat', '辅导', 'qa', '["pdf","trashed"]', ?, ?)`).run(at, at);
+    VALUES ('chat', '对话', 'general', '["pdf","trashed"]', ?, ?)`).run(at, at);
   db.prepare(`INSERT INTO tutor_messages (id, session_id, role, content, created_at)
     VALUES ('reply', 'chat', 'assistant', '保留的回答', ?)`).run(at);
   db.prepare(`INSERT INTO study_logs (id, activity_type, entity_id, duration_seconds, score, created_at, date_key)
@@ -102,6 +104,7 @@ test('an archive preserves original files, the recycle bin, and study records ac
   const manifest = JSON.parse(manifestText);
   assert.equal(manifest.format, 'zhiwu-backup');
   assert.equal(manifest.version, 2);
+  assert.deepEqual(manifest.snapshot.notes.find(({ id }) => id === 'pdf').source_pages, sourcePages);
   const attachment = manifest.attachments.find(({ noteId }) => noteId === 'pdf');
   assert.equal(attachment.mime, 'application/pdf');
   assert.deepEqual(await zip.file(attachment.path).async('nodebuffer'), original);
@@ -122,6 +125,7 @@ test('an archive preserves original files, the recycle bin, and study records ac
   const opened = await fetch(`${target.origin}${pdfPath}`);
   assert.equal(opened.status, 200);
   assert.deepEqual(Buffer.from(await opened.arrayBuffer()), original);
+  assert.deepEqual(JSON.parse(target.db.prepare("SELECT source_pages FROM notes WHERE id = 'pdf'").get().source_pages), sourcePages);
   assert.equal(target.db.prepare(`SELECT deleted_at FROM notes WHERE id = 'trashed'`).get().deleted_at, at);
   assert.equal(target.db.prepare(`SELECT quiz_correct FROM concepts WHERE id = 'concept'`).get().quiz_correct, 3);
   assert.equal(target.db.prepare(`SELECT concept_id FROM note_concepts WHERE note_id = 'trashed'`).get().concept_id, 'concept');
@@ -129,12 +133,32 @@ test('an archive preserves original files, the recycle bin, and study records ac
   assert.equal(target.db.prepare(`SELECT repetitions FROM flashcards WHERE id = 'card'`).get().repetitions, 3);
   assert.equal(target.db.prepare(`SELECT user_reflection FROM mistakes WHERE id = 'mistake'`).get().user_reflection, '我的反思');
   assert.equal(target.db.prepare(`SELECT content FROM tutor_messages WHERE id = 'reply'`).get().content, '保留的回答');
+  assert.equal(target.db.prepare(`SELECT mode FROM tutor_sessions WHERE id = 'chat'`).get().mode, 'general');
   assert.equal(target.db.prepare(`SELECT duration_seconds FROM study_logs WHERE id = 'activity'`).get().duration_seconds, 60);
 
   const repeat = await upload(target.origin, 'restore', zipBytes);
   assert.equal(repeat.status, 200);
   assert.equal((await repeat.json()).notesCount, 0);
   assert.deepEqual(readdirSync(target.uploads), [basename(pdfPath)]);
+});
+
+test('legacy merges borrow PDF offsets only for matching original text and discard malformed positions', async () => {
+  const { mergeBackupSnapshots, normalizeBackupSnapshot } = await import('../dist/shared/libraryBackup.js');
+  function snapshot(source_content, updated_at, source_pages) {
+    return normalizeBackupSnapshot({ notes: [{ id: 'pdf', source_type: 'pdf', source_content, source_pages, updated_at }] });
+  }
+  const indexed = snapshot('原文文本', at, JSON.stringify(sourcePages));
+  const same = snapshot('原文文本', '2026-11-24T08:00:00Z');
+  const changed = snapshot('其他文字', '2026-11-24T08:00:00Z');
+  assert.deepEqual(mergeBackupSnapshots(same, indexed).snapshot.notes[0].source_pages, sourcePages);
+  assert.equal(mergeBackupSnapshots(changed, indexed).snapshot.notes[0].source_pages, null);
+  same.notes[0].attachment_path = '/uploads/current.pdf';
+  indexed.notes[0].attachment_path = '/uploads/other.pdf';
+  assert.equal(mergeBackupSnapshots(same, indexed).snapshot.notes[0].source_pages, null);
+  for (const malformed of [
+    'not json', [{ start: 0, end: 5, status: 'text' }], [{ start: 0, end: 4, status: 'empty' }],
+    [{ start: 1, end: 4, status: 'text' }], [{ start: 0, end: 2, status: 'text' }, { start: 1, end: 4, status: 'text' }],
+  ]) assert.equal(snapshot('原文文本', at, malformed).notes[0].source_pages, null);
 });
 
 test('restore fills an unavailable file while retaining more recent note and card changes', async () => {

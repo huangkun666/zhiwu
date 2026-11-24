@@ -1,5 +1,9 @@
 import type { ChatExcerpt } from '../../server/src/shared/noteContent';
+import type { PdfPage } from '../../server/src/shared/pdfPages';
 import type { MasteryChange, StudyConcept, TodayProgress } from '../../server/src/shared/todayLearning';
+import type { TutorMode } from '../../server/src/shared/tutorMode';
+
+export type { TutorMode } from '../../server/src/shared/tutorMode';
 
 export type PageId =
   | 'home'
@@ -45,6 +49,7 @@ export interface Note {
   title: string;
   content: string;
   source_content?: string | null;
+  source_pages?: PdfPage[] | null;
   chat_excerpts?: ChatExcerpt[];
   summary: NoteSummary | null;
   category_id: string | null;
@@ -197,12 +202,22 @@ export interface GraphLink {
 }
 
 export interface TutorSession {
+  selection_ids?: string[];
   id: string;
   title: string;
-  mode: 'qa' | 'feynman';
+  mode: TutorMode;
   note_ids: string[];
   created_at: string;
   updated_at: string;
+}
+
+export interface TutorHistoryItem extends TutorSession {
+  matchSnippet?: string;
+}
+
+export interface TutorHistoryPage {
+  items: TutorHistoryItem[];
+  nextCursor: string | null;
 }
 
 export interface TutorMessage {

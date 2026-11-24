@@ -1,4 +1,7 @@
-import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt } from '../../../server/src/shared/noteContent';
+import { generalTutorTurn, prepareTutorTurn } from '../../../server/src/shared/tutorContext';
+import { compareTutorHistory, readTutorHistoryCursor, tutorHistoryPage, tutorSessionTitle } from '../../../server/src/shared/tutorHistory';
+import { isTutorMode, newTutorMode, requireTutorMode, tutorDefaultTitles, type TutorMode } from '../../../server/src/shared/tutorMode';
+import { nextNoteUpdatedAt, noteStudyText, readChatExcerpts, removeLegacyChatExcerpt, stripInlineImages } from '../../../server/src/shared/noteContent';
 import { existingIds, questionSourceId, readIds, tutorNoteSelection } from '../../../server/src/shared/libraryReferences';
 import { buildGraphLinks } from '../../../server/src/shared/graphLinks';
 import { isWeakConcept, rankWeakConcepts, recordMasteryChange, splitStudyConcepts, type MasteryChange } from '../../../server/src/shared/todayLearning';
@@ -6,6 +9,8 @@ import { describeBackup, mergeBackupSnapshots, normalizeBackupSnapshot, type Bac
 import { createOfflineBackup, offlineSnapshot, readOfflineBackup } from './backupArchive';
 import { compressImageIfNeeded } from '../utils/imageCompress';
 import { loadPdf } from '../utils/pdf';
+import { canReplacePdfText, extractPdfPages, needsVisualRead, pdfVisualScale, pdfVisionPrompt, readPdfPages, readPdfTextPage, readPdfTranscription, type PdfPage } from '../../../server/src/shared/pdfPages';
+import { extractDocxText } from '../../../server/src/shared/docxText';
 import type {
   ActiveModelCapability,
   AIProviderConfig,
@@ -23,6 +28,7 @@ import type {
   ReviewQueueItem,
   Synthesis,
   TrashedNote,
+  TutorHistoryPage,
   TutorMessage,
   TutorSession,
 } from '../types';
@@ -108,6 +114,12 @@ function reconcileLibraryReferences(state: LocalDBState) {
   const categories = new Set(state.categories.map(({ id }) => id));
   const questions = new Set<string>();
 
+  for (const session of state.tutorSessions) {
+    session.updated_at ||= session.created_at || '';
+    session.created_at ||= session.updated_at;
+    session.title ??= '学习对话';
+    if (!isTutorMode(session.mode)) session.mode = 'qa';
+  }
   for (const category of state.categories) {
     if (category.parent_id && !categories.has(category.parent_id)) category.parent_id = null;
   }
@@ -306,6 +318,10 @@ async function readState(): Promise<LocalDBState> {
     }
   }
   cachedState = { ...createEmptyState(), ...saved };
+  cachedState.tutorMessages = Object.assign(Object.create(null), cachedState.tutorMessages);
+  for (const note of cachedState.notes) {
+    if (note.source_type === 'pdf') note.source_pages = readPdfPages(note.source_pages, note.source_content ?? '');
+  }
   cachedState.settings = normalizeLocalSettings(cachedState.settings);
   reconcileLibraryReferences(cachedState);
   restoreReviewedConceptLinks(cachedState);
@@ -600,13 +616,6 @@ async function callLLMDirect(
   return String(content).trim();
 }
 
-function stripInlineImages(content: string): string {
-  return (content || '')
-    .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
-    .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
-    .trim();
-}
-
 function cleanOcrMarkdown(raw: string): string {
   return (raw || '')
     .replace(/<br\s*\/?>/gi, '\n')
@@ -625,11 +634,11 @@ function extractSmartTitle(markdown: string, fallbackName: string): string {
   return firstLine ? firstLine.slice(0, 42) : fallbackName;
 }
 
-async function callVisionDirect(provider: AIProviderConfig, base64: string, mimeType: string): Promise<string> {
+async function callVisionDirect(provider: AIProviderConfig, base64: string, mimeType: string, customPrompt?: string): Promise<string> {
   if (!provider.supportsVision) {
     throw new Error(`当前模型「${provider.name} (${provider.model})」不支持视觉/图片输入，无法上传图片笔记。请在「设置」中切换支持多模态视觉的模型。`);
   }
-  const prompt = `你是严谨的学术笔记整理助手。请精准识别这张图片中的所有文字、标题、列表、表格和数学公式，整理为清晰结构化的纯 Markdown 笔记。
+  const prompt = customPrompt ?? `你是严谨的学术笔记整理助手。请精准识别这张图片中的所有文字、标题、列表、表格和数学公式，整理为清晰结构化的纯 Markdown 笔记。
 要求：
 1. 第一行用一级标题 # 概括核心主题；
 2. 忠实还原原图文字与表格，数学公式用 $...$ 或 $$...$$；
@@ -694,10 +703,102 @@ async function fileToBase64(file: File): Promise<string> {
   });
 }
 
+async function extractLocalPdf(source: Uint8Array | string) {
+  const loading = await loadPdf(source);
+  try {
+    const pdf = await loading.promise;
+    return await extractPdfPages(pdf.numPages, async (number) => readPdfTextPage(await pdf.getPage(number)));
+  } finally { await loading.destroy().catch(() => {}); }
+}
+
+async function renderLocalPdfPage(source: string, number: number) {
+  const loading = await loadPdf(source);
+  try {
+    const pdf = await loading.promise;
+    if (number > pdf.numPages) return null;
+    const page = await pdf.getPage(number);
+    const viewport = page.getViewport({ scale: pdfVisualScale(page.getViewport({ scale: 1 })) });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    try {
+      await page.render({ canvas, viewport }).promise;
+      return canvas.toDataURL('image/png').split(',')[1];
+    } finally {
+      canvas.width = canvas.height = 0;
+      page.cleanup();
+    }
+  } finally { await loading.destroy().catch(() => {}); }
+}
+
+async function readLocalPdfPageWithVision(id: string, number: number): Promise<string | null> {
+  const state = await loadState();
+  const capability = getActiveCapability(state.settings);
+  if (!capability.supportsVision || !capability.configured) return null;
+  const note = getActiveNote(state, id);
+  const attachment = note?.attachment_path;
+  if (note?.source_type !== 'pdf' || !attachment?.startsWith('data:') || !needsVisualRead(note.source_pages, number)) return null;
+  const stillAvailable = async () => {
+    const current = getActiveNote(await loadState(), id);
+    return current === note && current.attachment_path === attachment && needsVisualRead(current.source_pages, number);
+  };
+  try {
+    const image = await renderLocalPdfPage(attachment, number);
+    if (!image || !await stillAvailable()) return null;
+    const provider = requireActiveProvider((await loadState()).settings);
+    const reply = await callVisionDirect(provider, image, 'image/png', pdfVisionPrompt);
+    return await stillAvailable() ? readPdfTranscription(reply) : null;
+  } catch { return null; }
+}
+
+const indexingPdfs = new WeakMap<Note, Promise<void>>();
+const retryPdfAfter = new WeakMap<Note, number>();
+
+async function rebuildLocalPdf(note: Note, attachment: string) {
+  if ((retryPdfAfter.get(note) ?? 0) > Date.now()) return;
+  const previousText = note.source_content;
+  let rebuilt: Awaited<ReturnType<typeof extractLocalPdf>>;
+  try {
+    rebuilt = await extractLocalPdf(attachment);
+  } catch {
+    retryPdfAfter.set(note, Date.now() + 60_000);
+    return;
+  }
+  if (!canReplacePdfText(previousText, rebuilt)) {
+    retryPdfAfter.set(note, Date.now() + 60_000);
+    return;
+  }
+  const state = await loadState();
+  const current = getActiveNote(state, note.id);
+  if (!current || current.source_type !== 'pdf' || current.attachment_path !== attachment ||
+      current.source_content !== previousText || current.source_pages) return;
+  current.source_content = rebuilt.content;
+  current.source_pages = rebuilt.sourcePages;
+  current.word_count = countWords(noteStudyText(current));
+  await saveState(state);
+}
+
+async function ensureLocalPdfPageIndexes(ids?: readonly string[]) {
+  if (ids && !ids.length) return;
+  const state = await loadState();
+  const selected = ids && new Set(ids);
+  for (const note of activeNotes(state)) {
+    if ((selected && !selected.has(note.id)) || note.source_type !== 'pdf' || note.source_pages ||
+        !note.attachment_path?.startsWith('data:')) continue;
+    let pending = indexingPdfs.get(note);
+    if (!pending) {
+      pending = rebuildLocalPdf(note, note.attachment_path).finally(() => indexingPdfs.delete(note));
+      indexingPdfs.set(note, pending);
+    }
+    await pending;
+  }
+}
+
 async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
   title: string;
   content: string;
   sourceType: Note['source_type'];
+  sourcePages?: PdfPage[];
   attachmentDataUrl?: string;
   warning?: string;
 }> {
@@ -723,10 +824,9 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
     const mammothMod = await import('mammoth');
     const mammoth = mammothMod.default || mammothMod;
     const arrayBuffer = await file.arrayBuffer();
-    const res = await mammoth.extractRawText({ arrayBuffer });
     return {
       title: baseTitle,
-      content: res.value.trim(),
+      content: await extractDocxText(mammoth, { arrayBuffer }),
       sourceType: 'docx',
       attachmentDataUrl: `data:${wordMime};base64,${await fileToBase64(file)}`,
     };
@@ -737,32 +837,17 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
     if (!new TextDecoder().decode(bytes.subarray(0, 1024)).includes('%PDF-')) {
       throw new Error('文件内容不是有效的 PDF');
     }
-    let loadingTask: Awaited<ReturnType<typeof loadPdf>> | undefined;
-    let text = '';
-    let warning: string | undefined;
+    let result: { content: string; sourcePages?: PdfPage[]; warning?: string };
     try {
-      loadingTask = await loadPdf(bytes);
-      const pdf = await loadingTask.promise;
-      const pages: string[] = [];
-      for (let i = 1; i <= Math.min(pdf.numPages, 80); i++) {
-        const page = await pdf.getPage(i);
-        const { items } = await page.getTextContent();
-        const pageText = items.map((item) => 'str' in item ? `${item.str}${item.hasEOL ? '\n' : ' '}` : '').join('').trim();
-        if (pageText) pages.push(pageText);
-      }
-      text = pages.join('\n\n');
-      if (!text) warning = 'PDF 没有可提取的文本，可以预览原始页面';
+      result = await extractLocalPdf(bytes);
     } catch {
-      warning = 'PDF 文本提取失败，仍可尝试预览或下载原文件';
-    } finally {
-      await loadingTask?.destroy().catch(() => {});
+      result = { content: '', warning: 'PDF 文本提取失败，仍可尝试预览或下载原文件' };
     }
     return {
       title: baseTitle,
-      content: text,
+      ...result,
       sourceType: 'pdf',
       attachmentDataUrl: `data:application/pdf;base64,${await fileToBase64(file)}`,
-      warning,
     };
   }
 
@@ -818,6 +903,53 @@ async function saveNoteText(state: LocalDBState, note: Note): Promise<Note> {
 
 function normalizeChoiceAnswer(ans: string): string {
   return ans.toUpperCase().replace(/[^A-Z]/g, '').split('').sort().join(',');
+}
+
+type TutorSettings = Partial<Pick<TutorSession, 'title' | 'mode'>>;
+type TutorChatPayload = { message: string; noteIds?: string[]; discardedNoteIds?: string[]; mode?: TutorMode };
+
+async function updateLocalTutorSession(state: LocalDBState, session: TutorSession, changes: TutorSettings) {
+  let saved = writes;
+  const { title, mode } = { ...session, ...changes };
+  if (title !== session.title || mode !== session.mode) {
+    Object.assign(session, { title, mode, updated_at: nextNoteUpdatedAt(session.updated_at) });
+    saved = saveState(state);
+  }
+  const result = { ...session };
+  await saved;
+  // A retry can observe a pending write before that write fails.
+  if (cachedState !== state) throw new Error('资料库已更新，请重试刚才的操作');
+  return result;
+}
+
+async function editTutorSession(id: string, changes: TutorSettings): Promise<TutorSession> {
+  const state = await loadState();
+  const session = state.tutorSessions.find((item) => item.id === id);
+  if (!session) throw new Error('会话不存在');
+  const result = await updateLocalTutorSession(state, session, changes);
+  return { ...result, note_ids: noteIdsIn(state, result.note_ids) };
+}
+
+async function localTutorTurn(
+  initial: LocalDBState, session: TutorSession, mode: TutorMode, payload: TutorChatPayload,
+  provider: AIProviderConfig, progress?: (message: string) => void,
+) {
+  const history = initial.tutorMessages[session.id] || [];
+  if (mode === 'general') return { ...generalTutorTurn(history, payload.message), selectNoteIds: undefined };
+  const requested = readIds(payload.noteIds ?? session.note_ids);
+  const noteIds = noteIdsIn(initial, requested);
+  const selectNoteIds = tutorNoteSelection(session.note_ids, noteIdsIn(initial, session.note_ids), noteIds, payload.discardedNoteIds);
+  const selected = new Set(noteIds);
+  await ensureLocalPdfPageIndexes(requested.length ? noteIds : undefined);
+  const notes = activeNotes(await loadState()).filter((note) => !requested.length || selected.has(note.id))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id));
+  const versions = new Map(notes.map(note => [note.id, note.updated_at]));
+  const current = (state: LocalDBState) => new Set(activeNotes(state)
+    .filter(note => versions.get(note.id) === note.updated_at).map(note => note.id));
+  const turn = await prepareTutorTurn(mode, notes, !requested.length, history, payload.message,
+    query => callLLMDirect(provider, query, { temperature: 0, maxTokens: query[0].content.startsWith('ZHIWU_SCAN') ? 1800 : 300 }),
+    async () => current(await loadState()), readLocalPdfPageWithVision, progress);
+  return { messages: turn.messages, render: (reply: string, state: LocalDBState) => turn.render(reply, current(state)), selectNoteIds };
 }
 
 // --- Complete Local API Implementation (100% parity with Express server) ---
@@ -1106,6 +1238,7 @@ export const localApi = {
   },
 
   async getNote(id: string): Promise<Note> {
+    await ensureLocalPdfPageIndexes([id]);
     const s = await loadState();
     return enrichNote(s, requireNote(s, id));
   },
@@ -1243,6 +1376,7 @@ export const localApi = {
           title: parsed.title,
           content: isImage ? parsed.content : '',
           source_content: isImage ? null : parsed.content,
+          source_pages: parsed.sourcePages ?? null,
           summary: null,
           category_id: null,
           tags: tags || [],
@@ -1951,25 +2085,44 @@ export const localApi = {
     return s.tutorSessions.map((session) => ({ ...session, note_ids: noteIdsIn(s, session.note_ids) }));
   },
 
-  async createTutorSession(payload: { title?: string; mode: 'qa' | 'feynman'; noteIds?: string[]; initialPrompt?: string }): Promise<TutorSession> {
+  async listTutorHistory(query = '', cursor?: string): Promise<TutorHistoryPage> {
+    const after = readTutorHistoryCursor(cursor);
+    const state = await loadState();
+    const sessions = state.tutorSessions.filter((session) => !after || compareTutorHistory(session, after) > 0);
+    sessions.sort(compareTutorHistory);
+    const page = tutorHistoryPage(sessions, query, (id) => (state.tutorMessages[id] || []).slice().reverse());
+    const visible = new Set(activeNotes(state).map(({ id }) => id));
+    return { ...page, items: page.items.map((item) => ({ ...item, note_ids: existingIds(item.note_ids, visible) })) };
+  },
+
+  async renameTutorSession(id: string, value: string): Promise<TutorSession> {
+    return editTutorSession(id, { title: tutorSessionTitle(value) });
+  },
+
+  async setTutorSessionMode(id: string, mode: TutorMode): Promise<TutorSession> {
+    return editTutorSession(id, { mode: requireTutorMode(mode) });
+  },
+
+  async createTutorSession(payload: { title?: string; mode?: TutorMode; noteIds?: string[]; initialPrompt?: string } = {}): Promise<TutorSession> {
+    const mode = newTutorMode(payload.mode, payload.noteIds);
     const s = await loadState();
     const now = nowIso();
     const sess: TutorSession = {
       id: uid(),
-      title: payload.title?.trim() || (payload.mode === 'feynman' ? '费曼考官演练' : '笔记深度答疑'),
-      mode: payload.mode,
-      note_ids: noteIdsIn(s, payload.noteIds),
+      title: payload.title?.trim() || tutorDefaultTitles[mode],
+      mode,
+      note_ids: mode === 'general' ? [] : noteIdsIn(s, payload.noteIds),
       created_at: now,
       updated_at: now,
     };
     s.tutorSessions.unshift(sess);
-    s.tutorMessages[sess.id] = [
+    s.tutorMessages[sess.id] = mode === 'general' ? [] : [
       {
         id: uid(),
         session_id: sess.id,
         role: 'assistant',
         content:
-          payload.mode === 'feynman'
+          mode === 'feynman'
             ? `你好！我是你的**费曼学习法考官**。试着用大白话把一个概念讲给我听，我会帮你找出盲区并逐步追问！`
             : `你好！我是你的**知悟学习助教**，随时基于你的笔记为你答疑解惑！`,
         created_at: now,
@@ -1983,38 +2136,30 @@ export const localApi = {
     const s = await loadState();
     const session = s.tutorSessions.find((x) => x.id === sessionId);
     if (!session) throw new Error('会话不存在');
-    return { session: { ...session, note_ids: noteIdsIn(s, session.note_ids) }, messages: s.tutorMessages[sessionId] || [] };
+    return { session: { ...session, note_ids: noteIdsIn(s, session.note_ids), selection_ids: noteIdsIn(s, session.note_ids, true) },
+      messages: s.tutorMessages[sessionId] || [] };
   },
 
-  async sendTutorMessage(sessionId: string, payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' }) {
+  async sendTutorMessage(sessionId: string, payload: TutorChatPayload,
+    progress?: (message: string) => void) {
     const initial = await loadState();
     const source = initial.tutorSessions.find((x) => x.id === sessionId);
     if (!source) throw new Error('会话不存在');
+    const message = String(payload.message || '').trim();
+    if (!message) throw new Error('消息内容不能为空');
+    const mode = payload.mode === undefined ? source.mode : requireTutorMode(payload.mode);
     const provider = requireActiveProvider(initial.settings);
-    const requested = readIds(payload.noteIds ?? source.note_ids);
-    const noteIds = noteIdsIn(initial, requested);
-    const selectNoteIds = tutorNoteSelection(source.note_ids, noteIdsIn(initial, source.note_ids), noteIds);
-    const mode = payload.mode || source.mode;
-    const available = activeNotes(initial);
-    const notes = requested.length
-      ? available.filter((n) => noteIds.includes(n.id))
-      : available.sort((a, b) => b.updated_at.localeCompare(a.updated_at)).slice(0, 4);
-    const ctx = notes.map((n, i) => `【笔记${i + 1}：${n.title}】\n${stripInlineImages(noteStudyText(n)).slice(0, 3500)}`).join('\n\n');
-    const sys =
-      mode === 'feynman'
-        ? `你是费曼学习法考官。先肯定准确部分并给出理解度评分，再指出逻辑漏洞并提出1-2个直击要害的苏格拉底式追问。\n\n参考材料：\n${ctx}`
-        : `你是知悟学习助教。结合参考笔记清晰深入地解答问题。\n\n参考材料：\n${ctx}`;
-    const hist = (initial.tutorMessages[sessionId] || []).slice(-10).map((m) => ({ role: m.role, content: m.content }));
-    const reply = await callLLMDirect(provider, [{ role: 'system', content: sys }, ...hist, { role: 'user', content: payload.message }]);
+    if (mode !== source.mode) await updateLocalTutorSession(initial, source, { mode });
+    const turn = await localTutorTurn(initial, source, mode, { ...payload, message }, provider, progress);
+    const reply = await callLLMDirect(provider, turn.messages);
     const s = await loadState();
     const session = s.tutorSessions.find((item) => item.id === sessionId);
     if (!session) throw new Error('会话已被删除');
-    const userMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'user', content: payload.message, created_at: nowIso() };
-    const assistantMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: reply, created_at: nowIso() };
+    const userMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'user', content: message, created_at: nowIso() };
+    const assistantMessage: TutorMessage = { id: uid(), session_id: sessionId, role: 'assistant', content: turn.render(reply, s), created_at: nowIso() };
     (s.tutorMessages[sessionId] ||= []).push(userMessage, assistantMessage);
-    session.note_ids = noteIdsIn(s, selectNoteIds(session.note_ids), true);
-    session.mode = mode;
-    session.updated_at = nowIso();
+    if (turn.selectNoteIds) session.note_ids = noteIdsIn(s, turn.selectNoteIds(session.note_ids), true);
+    session.updated_at = nextNoteUpdatedAt(session.updated_at);
     logStudy(s, 'tutor_chat', sessionId);
     await saveState(s);
     return { userMessage, assistantMessage };
@@ -2022,11 +2167,12 @@ export const localApi = {
 
   async sendTutorMessageStream(
     sessionId: string,
-    payload: { message: string; noteIds?: string[]; mode?: 'qa' | 'feynman' },
-    onDelta: (delta: string) => void
+    payload: TutorChatPayload,
+    onDelta: (delta: string) => void,
+    progress?: (message: string) => void,
   ) {
     // On Android CapacitorHttp (native bridge), stream chunks or fall back cleanly with smooth reveal
-    const res = await localApi.sendTutorMessage(sessionId, payload);
+    const res = await localApi.sendTutorMessage(sessionId, payload, progress);
     const text = res.assistantMessage.content;
     // Progressive chunk emit so UI renders fluidly
     const step = Math.max(8, Math.ceil(text.length / 28));

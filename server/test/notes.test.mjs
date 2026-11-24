@@ -7,8 +7,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { after, before, test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import express from 'express';
+import JSZip from 'jszip';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { verifyPendingTutorHistoryChanges, verifyTutorHistory } from './fixtures/tutor-history.mjs';
+import { verifyTutorModes } from './fixtures/tutor-modes.mjs';
 
 const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 let fixture;
@@ -44,8 +47,13 @@ before(async () => {
   const app = express();
   app.use(express.json());
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', app: '知悟 (Zhiwu)' }));
-  app.post('/test-model/chat/completions', async (_req, res) => {
-    const reply = await modelReply?.();
+  app.post('/test-model/chat/completions', async (req, res) => {
+    const reply = await modelReply?.(req.body, res);
+    if (res.headersSent) return;
+    if (req.body.stream) {
+      res.type('text/event-stream').end(`data: ${JSON.stringify({ choices: [{ delta: { content: reply } }] })}\n\n`);
+      return;
+    }
     res.json({ choices: [{ message: { content: reply || '测试回复' } }] });
   });
   for (const name of ['notes', 'settings', 'categories', 'dashboard', 'graph', 'tutor', 'quizzes', 'mistakes', 'flashcards']) {
@@ -76,9 +84,9 @@ async function request(path, { method = 'GET', body, status = 200 } = {}) {
     body: body instanceof FormData ? body : JSON.stringify(body),
     headers: body && !(body instanceof FormData) ? { 'Content-Type': 'application/json' } : undefined,
   });
-  const result = await response.json();
-  assert.equal(response.status, status, JSON.stringify(result));
-  return result;
+  const text = await response.text();
+  assert.equal(response.status, status, text);
+  return JSON.parse(text);
 }
 
 function pauseModel(t) {
@@ -94,6 +102,17 @@ function pauseModel(t) {
     modelReply = undefined;
   });
   return { started: start.promise, reply: finish.resolve };
+}
+
+function historyApi() {
+  return {
+    restore: (body) => request('settings/import-json', { method: 'POST', body }),
+    list: (q = '', cursor) => request('tutor/history?' + new URLSearchParams({ q, ...(cursor ? { cursor } : {}) })),
+    messages: (id) => request(`tutor/sessions/${id}/messages`),
+    rename: (id, title) => request(`tutor/sessions/${id}`, { method: 'PATCH', body: { title } }),
+    remove: (id) => request(`tutor/sessions/${id}`, { method: 'DELETE' }),
+    create: () => request('tutor/sessions', { method: 'POST', body: {}, status: 201 }),
+  };
 }
 
 test('imported source stays searchable without filling the editable body', async () => {
@@ -170,6 +189,113 @@ test('JSON backups keep imported source and individual chat excerpts', async () 
   assert.equal(restored.source_content, note.source_content);
   assert.deepEqual(restored.chat_excerpts, note.chat_excerpts);
   assert.equal((await request(`notes?q=${encodeURIComponent('原文查找词')}`))[0].id, note.id);
+});
+
+function makePagedPdf(texts) {
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    `<< /Type /Pages /Kids [${texts.map((_, i) => `${4 + i * 2} 0 R`).join(' ')}] /Count ${texts.length} >>`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  for (const text of texts) {
+    const stream = typeof text === 'object' ? text.stream : text ? `BT /F1 12 Tf 50 100 Td (${text}) Tj ET` : '';
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> >> /Contents ${objects.length + 2} 0 R >>`);
+    objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
+  }
+  let document = '%PDF-1.4\n';
+  const offsets = [0];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(document.length);
+    document += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xref = document.length;
+  document += `xref\n0 ${offsets.length}\n0000000000 65535 f \n`;
+  for (const offset of offsets.slice(1)) document += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  return Buffer.from(`${document}trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+}
+
+test('PDF import and legacy detail reads keep physical page numbers and preserve editable text', async () => {
+  const body = new FormData();
+  body.append('files', new File([makePagedPdf(['First', '', 'Third'])], 'pages.pdf', { type: 'application/pdf' }));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body, status: 201 });
+  const pages = [
+    { start: 0, end: 5, status: 'text' }, { start: 5, end: 5, status: 'empty' },
+    { start: 7, end: 12, status: 'text' },
+  ];
+  assert.deepEqual(note.source_pages, pages);
+  assert.equal(note.source_content, 'First\n\nThird');
+  const excerpts = [{ id: 'legacy-pdf-clip', content: 'Saved excerpt', created_at: note.updated_at }];
+  db.prepare(`UPDATE notes SET source_content = 'First', source_pages = NULL, content = 'My edits', chat_excerpts = ? WHERE id = ?`)
+    .run(JSON.stringify(excerpts), note.id);
+  const legacy = await request(`notes/${note.id}`);
+  assert.deepEqual(legacy.source_pages, pages);
+  assert.equal(legacy.source_content, note.source_content);
+  assert.equal(legacy.content, 'My edits');
+  assert.deepEqual(legacy.chat_excerpts, excerpts);
+  assert.equal(legacy.updated_at, note.updated_at);
+  const stored = db.prepare('SELECT source_pages FROM notes WHERE id = ?').get(note.id);
+  assert.deepEqual(JSON.parse(stored.source_pages), pages);
+
+  db.prepare(`UPDATE notes SET source_pages = NULL, attachment_path = '/uploads/unavailable.pdf' WHERE id = ?`).run(note.id);
+  const unavailable = await request(`notes/${note.id}`);
+  assert.equal(unavailable.source_pages, null);
+  assert.equal(unavailable.source_content, legacy.source_content);
+});
+
+test('PDF text preserves a continuous model code across font runs and a gap between table cells', async () => {
+  const body = new FormData();
+  const file = makePagedPdf([{ stream: 'BT /F1 12 Tf 10 40 Td (CX-) Tj /F2 12 Tf (789) Tj 100 0 Td (12.5%) Tj ET' }]);
+  body.append('files', new File([file], 'code.pdf', { type: 'application/pdf' }));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body, status: 201 });
+  assert.equal(note.source_content, 'CX-789 12.5%');
+});
+
+test('Word import keeps table headings and values together in source order', async () => {
+  const zip = new JSZip();
+  const paragraph = (value) => `<w:p><w:r><w:t>${value}</w:t></w:r></w:p>`;
+  const row = (values) => `<w:tr>${values.map((v) => `<w:tc>${paragraph(v)}</w:tc>`).join('')}</w:tr>`;
+  zip.file('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+  zip.file('word/document.xml', `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${paragraph('Schedule')}<w:tbl>${row(['Year', 'Rate'])}${row(['2026', '18.5%'])}</w:tbl>${paragraph('After the table')}</w:body></w:document>`);
+  const body = new FormData();
+  body.append('files', new File([await zip.generateAsync({ type: 'nodebuffer' })], 'rates.docx'));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body, status: 201 });
+  assert.equal(note.source_content, 'Schedule\n\nYear | Rate\n2026 | 18.5%\n\nAfter the table');
+});
+
+test('vision reads render only the requested active physical PDF page and leave source fields unchanged', async (t) => {
+  const { readPdfPageWithVision } = await import(pathToFileURL(join(fixture, 'server', 'dist', 'services', 'pdfPageIndex.js')));
+  assert.equal(typeof readPdfPageWithVision, 'function');
+  const settings = await request('settings');
+  configureTestModel();
+  const configured = await request('settings');
+  configured.providers.find(p => p.id === 'local').supportsVision = true;
+  await request('settings', { method: 'PUT', body: configured });
+  t.after(async () => { modelReply = undefined; await request('settings', { method: 'PUT', body: settings }); });
+  const form = new FormData();
+  form.append('files', new File([makePagedPdf(['Searchable', ''])], 'visual.pdf', { type: 'application/pdf' }));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body: form, status: 201 });
+  let calls = 0;
+  let reply = '{"text":"模拟转写的图表"}';
+  modelReply = (payload) => {
+    calls++;
+    const [instruction, picture] = payload.messages[0].content;
+    assert.match(instruction.text, /逐字/);
+    assert.equal(picture.type, 'image_url');
+    const png = Buffer.from(picture.image_url.url.split(',')[1], 'base64');
+    assert.equal(png.toString('ascii', 1, 4), 'PNG');
+    assert.ok(png.readUInt32BE(16) > 0 && png.readUInt32BE(20) > 0);
+    return reply;
+  };
+  for (const number of [0, 1, 2.5, 3]) assert.equal(await readPdfPageWithVision(note.id, number), null);
+  assert.equal(calls, 0);
+  assert.equal(await readPdfPageWithVision(note.id, 2), '模拟转写的图表');
+  assert.equal(calls, 1);
+  assert.deepEqual(await request(`notes/${note.id}`), note);
+  reply = '{"text":""}';
+  assert.equal(await readPdfPageWithVision(note.id, 2), null);
+  await request(`notes/${note.id}`, { method: 'DELETE' });
+  assert.equal(await readPdfPageWithVision(note.id, 2), null);
+  assert.equal(calls, 2);
 });
 
 test('trashing a source note hides its live references and restoration brings them back', async () => {
@@ -323,6 +449,43 @@ test('removing the note that asserted a graph relation leaves only the surviving
   assert.deepEqual(relevant(await request('graph')).map(({ relation }) => relation), ['同篇共现']);
 });
 
+test('tutor retrieves a late English clause for a Chinese question across selected and automatic references', async (t) => {
+  const clause = 'Measure full-field white and black in fixture PQ-47.';
+  const source = ['# Wimberley ERD', 'Contents: Contrast Test .... 38', 'Component specifications. '.repeat(2800),
+    '3. Picture Quality Specification: Contrast ratio test', clause, 'Packaging dimensions. '.repeat(2400)].join('\n');
+  const form = new FormData();
+  form.append('files', new File([source], 'erd.md', { type: 'text/markdown' }));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body: form, status: 201 });
+  for (let i = 0; i < 5; i++) {
+    await request('notes', { method: 'POST', body: { title: `园艺摘记 ${i}`, content: '栽培方法' }, status: 201 });
+  }
+  const session = await request('tutor/sessions', { method: 'POST', body: { mode: 'feynman', noteIds: [note.id] }, status: 201 });
+  configureTestModel();
+  let materials = '';
+  modelReply = ({ messages }) => {
+    if (messages[0].content.startsWith('ZHIWU_RETRIEVE')) return JSON.stringify(
+      JSON.parse(messages[1].content).results.length ? { action: 'finish' } : { action: 'search', query: 'contrast ratio, contrast test, measurement' });
+    materials = messages[0].content;
+    return '测试回答';
+  };
+  t.after(() => { modelReply = undefined; });
+  const body = { message: '对比度怎么测？', mode: 'qa' };
+  await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body });
+  assert.ok(materials.includes(clause), 'selected note must supply the actual clause beyond its contents page');
+  assert.equal((await request(`tutor/sessions/${session.id}/messages`)).session.mode, 'qa');
+  assert.ok(!materials.includes('园艺摘记'));
+  assert.ok(materials.length < 18000);
+  materials = '';
+  const response = await fetch(`${origin}/api/tutor/sessions/${session.id}/chat-stream`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, noteIds: [] }),
+  });
+  assert.match(await response.text(), /"done":true/);
+  assert.ok(materials.includes(clause), 'automatic streaming chat must find the older document');
+  await request(`notes/${note.id}`, { method: 'DELETE' });
+  await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: { ...body, noteIds: [note.id] } });
+  assert.ok(!materials.includes(clause) && !materials.includes('园艺摘记'));
+});
+
 test('trashing a note during a tutor reply hides its reference until restoration', { timeout: 5000 }, async (t) => {
   const note = await request('notes', { method: 'POST', body: { title: '聊天时删除测试' }, status: 201 });
   const session = await request('tutor/sessions', { method: 'POST', body: { noteIds: [note.id] }, status: 201 });
@@ -334,6 +497,7 @@ test('trashing a note during a tutor reply hides its reference until restoration
   await reply;
   const chat = await request(`tutor/sessions/${session.id}/messages`);
   assert.deepEqual(chat.session.note_ids, []);
+  assert.deepEqual(chat.session.selection_ids, [note.id]);
   assert.equal(chat.messages.at(-1).content, '保存这次回答');
   // The picker sends only visible references when chatting while this note is in the trash.
   await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: { message: '继续对话', noteIds: [] } });
@@ -342,6 +506,12 @@ test('trashing a note during a tutor reply hides its reference until restoration
   assert.deepEqual((await request(`tutor/sessions/${session.id}/messages`)).session.note_ids, [other.id]);
   await request(`notes/trash/${note.id}/restore`, { method: 'POST' });
   assert.deepEqual((await request(`tutor/sessions/${session.id}/messages`)).session.note_ids, [note.id, other.id]);
+  await request(`notes/${note.id}`, { method: 'DELETE' });
+  await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: {
+    message: '移除之前不可用的参考', noteIds: [other.id], discardedNoteIds: [note.id],
+  } });
+  await request(`notes/trash/${note.id}/restore`, { method: 'POST' });
+  assert.deepEqual((await request(`tutor/sessions/${session.id}/messages`)).session.selection_ids, [other.id]);
 });
 
 test('a tutor reply with unchanged selections preserves a newer selection', { timeout: 5000 }, async (t) => {
@@ -590,4 +760,80 @@ test('today learning separates untested concepts and shows review and quiz progr
   assert.equal(after.reviewedCards, baseline.todayProgress.reviewedCards + 1);
   assert.equal(after.quizzesCompleted, baseline.todayProgress.quizzesCompleted + 1);
   assert(after.nextReviewAt > now);
+});
+
+test('desktop tutor history pages, search, validation and rename', async (t) => {
+  await verifyTutorHistory(t, historyApi());
+});
+
+test('desktop tutor history survives concurrent rename and deletion during replies', { timeout: 10000 }, async (t) => {
+  const api = historyApi();
+  await verifyPendingTutorHistoryChanges({
+    ...api,
+    async whileReplyPending(id, change) {
+      const model = pauseModel(t);
+      const reply = request(`tutor/sessions/${id}/chat`, { method: 'POST', body: { message: '并发问题' } });
+      try {
+        await model.started;
+        await change();
+      } finally {
+        model.reply('完成并发回复');
+        await reply.catch(() => {});
+      }
+      return reply;
+    },
+  });
+});
+
+test('desktop tutor modes and ordinary conversation', { timeout: 15000 }, async (t) => {
+  configureTestModel();
+  t.after(() => { modelReply = undefined; });
+  await verifyTutorModes(t, {
+    ...historyApi(),
+    create: (body) => request('tutor/sessions', { method: 'POST', body, status: 201 }),
+    mode: (id, mode) => request(`tutor/sessions/${id}`, { method: 'PATCH', body: { mode } }),
+    export: () => request('settings/export-json'),
+    model: (handler) => { modelReply = handler; },
+    send: (id, body) => request(`tutor/sessions/${id}/chat`, { method: 'POST', body }),
+    async stream(id, body) {
+      const response = await fetch(`${origin}/api/tutor/sessions/${id}/chat-stream`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const events = (await response.text()).split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)));
+      assert.ok(!events.some(event => event.error));
+      return { statuses: events.flatMap(event => event.status || []), text: events.map(event => event.delta || '').join(''),
+        result: events.find(event => event.done) };
+    },
+  });
+});
+
+test('ordinary streaming reports provider failures once, accepts JSON and retries explicitly unsupported streams', async (t) => {
+  configureTestModel();
+  t.after(() => { modelReply = undefined; });
+  const { id } = await historyApi().create();
+  const stream = async () => (await fetch(`${origin}/api/tutor/sessions/${id}/chat-stream`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: '你好' }),
+  })).text();
+  let calls = 0;
+  for (const status of [401, 429, 500, 400]) {
+    calls = 0;
+    modelReply = (_body, res) => { calls++; res.status(status).json({ error: '模型请求失败' }); };
+    assert.match(await stream(), new RegExp(String(status)));
+    assert.equal(calls, 1);
+  }
+  assert.deepEqual((await historyApi().messages(id)).messages, []);
+  modelReply = (_body, res) => { calls++; res.json({ choices: [{ message: { content: '完整普通回复' } }] }); };
+  const success = await stream();
+  assert.match(success, /"delta":"完整普通回复"/);
+  assert.match(success, /"done":true/);
+  assert.equal(calls, 2);
+  assert.equal((await historyApi().messages(id)).messages.at(-1).content, '完整普通回复');
+  calls = 0;
+  modelReply = (body, res) => {
+    calls++;
+    if (body.stream) res.status(422).json({ error: { message: 'Streaming is not supported by this model' } });
+    else return '兼容的非流式回复';
+  };
+  assert.match(await stream(), /"delta":"兼容的非流式回复"/);
+  assert.equal(calls, 2);
 });

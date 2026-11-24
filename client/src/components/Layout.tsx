@@ -35,7 +35,7 @@ const CORE_NAV_ITEMS: {
   { id: 'notes', label: '笔记库', shortLabel: '笔记', icon: BookOpen },
   { id: 'practice', label: '出题与错题', shortLabel: '刷题', icon: FileCheck2 },
   { id: 'review', label: '复习与闪卡', shortLabel: '复习', icon: Flame },
-  { id: 'tutor', label: '费曼助教', shortLabel: '助教', icon: MessageSquareText },
+  { id: 'tutor', label: '助教', shortLabel: '助教', icon: MessageSquareText },
 ];
 
 export function Layout({
@@ -49,7 +49,9 @@ export function Layout({
   children,
 }: LayoutProps) {
   // Automatically hide mobile bottom tab bar when soft keyboard is open (native app feel)
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [keyboardHeight, setKeyboardHeight] = useState<number>();
+  const keyboardOpen = keyboardHeight !== undefined;
+  const chat = page === 'tutor';
 
   useEffect(() => {
     const checkViewport = () => {
@@ -58,7 +60,8 @@ export function Layout({
       // When keyboard pops up on mobile, visualViewport height shrinks noticeably
       const activeTag = document.activeElement?.tagName;
       const isTextFocused = activeTag === 'INPUT' || activeTag === 'TEXTAREA';
-      setKeyboardOpen(isTextFocused && vv.height < window.screen.height * 0.72);
+      const open = isTextFocused && vv.height < window.screen.height * 0.72;
+      setKeyboardHeight(open ? vv.height : undefined);
     };
     const onFocusIn = (e: FocusEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
@@ -66,7 +69,7 @@ export function Layout({
         setTimeout(checkViewport, 120);
       }
     };
-    const onFocusOut = () => setTimeout(() => setKeyboardOpen(false), 120);
+    const onFocusOut = () => setTimeout(checkViewport, 120);
 
     window.visualViewport?.addEventListener('resize', checkViewport);
     document.addEventListener('focusin', onFocusIn);
@@ -85,7 +88,8 @@ export function Layout({
   };
 
   return (
-    <div className="min-h-screen flex flex-col md:flex-row text-[var(--text-primary)]">
+    <div className={`flex flex-col md:flex-row text-[var(--text-primary)] ${chat ? 'h-dvh overflow-hidden' : 'min-h-screen'}`}
+      style={chat && keyboardOpen ? { height: keyboardHeight } : undefined}>
       {/* Desktop Frosted Minimal Sidebar */}
       <aside
         className="hidden md:flex md:w-60 md:flex-col md:fixed md:inset-y-0 z-30 border-r"
@@ -204,7 +208,7 @@ export function Layout({
 
       {/* Mobile Top Glass Header */}
       <header
-        className="md:hidden sticky top-0 z-30 flex items-center justify-between px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] zw-glass border-b"
+        className={`${chat ? 'hidden' : 'flex md:hidden'} sticky top-0 z-30 items-center justify-between px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))] zw-glass border-b`}
       >
         <button onClick={() => onNavigate('home')} className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-lg zw-btn-primary flex items-center justify-center text-xs font-bold">
@@ -249,13 +253,13 @@ export function Layout({
       </header>
 
       {/* Main Content Area */}
-      <main className={`flex-1 md:pl-60 ${keyboardOpen ? 'pb-4' : 'pb-22'} md:pb-10 min-h-screen`}>
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-7">{children}</div>
+      <main className={`flex-1 min-w-0 md:pl-60 ${chat ? 'min-h-0 max-md:pt-[env(safe-area-inset-top)]' : `min-h-screen md:pb-10 ${keyboardOpen ? 'pb-4' : 'pb-22'}`}`}>
+        <div className={`max-w-6xl mx-auto ${chat ? 'h-full md:px-6 md:py-6 lg:px-8' : 'px-4 sm:px-6 lg:px-8 py-5 sm:py-7'}`}>{children}</div>
       </main>
 
       {/* Mobile Frosted Bottom Tab Bar (auto-hides while typing on soft keyboard) */}
       {!keyboardOpen && (
-      <nav className="md:hidden fixed bottom-0 inset-x-0 z-30 zw-glass border-t px-1 pt-1.5 pb-safe">
+      <nav className={`md:hidden z-30 zw-glass border-t px-1 pt-1.5 pb-safe ${chat ? 'shrink-0' : 'fixed bottom-0 inset-x-0'}`}>
         <div className="grid grid-cols-5">
           {CORE_NAV_ITEMS.map((item) => {
             const Icon = item.icon;

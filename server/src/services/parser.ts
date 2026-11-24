@@ -1,17 +1,36 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import mammoth from 'mammoth';
 import { callVisionOCR, cleanOcrMarkdown, extractSmartTitle } from './ai.js';
+import { extractPdfPages, readPdfTextPage, type PdfPage } from '../shared/pdfPages.js';
+import { extractDocxText } from '../shared/docxText.js';
 
-const require = createRequire(import.meta.url);
-// Import internal pdf-parse implementation directly to avoid its known test-file loading quirk
-const pdfParse: (buffer: Buffer) => Promise<{ text: string; numpages: number }> = require('pdf-parse/lib/pdf-parse.js');
+export async function loadDesktopPdf(bytes: Buffer) {
+  const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const assets = path.dirname(fileURLToPath(import.meta.resolve('pdfjs-dist/package.json')));
+  return getDocument({
+    data: new Uint8Array(bytes),
+    cMapUrl: path.join(assets, 'cmaps') + '/',
+    standardFontDataUrl: path.join(assets, 'standard_fonts') + '/',
+    wasmUrl: path.join(assets, 'wasm') + '/',
+    iccUrl: path.join(assets, 'iccs') + '/',
+  });
+}
+
+export async function extractDesktopPdf(bytes: Buffer) {
+  const loading = await loadDesktopPdf(bytes);
+  try {
+    const pdf = await loading.promise;
+    return await extractPdfPages(pdf.numPages, async (number) => readPdfTextPage(await pdf.getPage(number)));
+  } finally { await loading.destroy(); }
+}
 
 export interface ParsedFileResult {
   title: string;
   content: string;
   sourceType: 'markdown' | 'text' | 'pdf' | 'docx' | 'image';
+  sourcePages?: PdfPage[];
   ocrPending?: boolean;
   warning?: string;
 }
@@ -43,14 +62,7 @@ export async function parseUploadedFile(
     const buf = fs.readFileSync(filePath);
     if (!buf.subarray(0, 1024).includes('%PDF-')) throw new Error('文件内容不是有效的 PDF');
     try {
-      const parsed = await pdfParse(buf);
-      const content = (parsed.text || '').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-      return {
-        title: baseTitle,
-        content,
-        sourceType: 'pdf',
-        warning: content ? undefined : 'PDF 没有可提取的文本，可以预览原始页面',
-      };
+      return { title: baseTitle, sourceType: 'pdf', ...await extractDesktopPdf(buf) };
     } catch {
       return { title: baseTitle, content: '', sourceType: 'pdf', warning: 'PDF 文本提取失败，仍可尝试预览或下载原文件' };
     }
@@ -59,15 +71,9 @@ export async function parseUploadedFile(
   // 3. Word (.docx)
   if (ext === '.docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
     const buf = fs.readFileSync(filePath);
-    const result = await mammoth.extractRawText({ buffer: buf });
-    const cleaned = (result.value || '')
-      .replace(/\r\n/g, '\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-
     return {
       title: baseTitle,
-      content: cleaned,
+      content: await extractDocxText(mammoth, { buffer: buf }),
       sourceType: 'docx',
     };
   }

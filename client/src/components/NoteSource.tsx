@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronDown, Download, FileText } from 'lucide-react';
 import type { PDFDocumentLoadingTask, PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 import type { Note } from '../types';
 import { loadPdf } from '../utils/pdf';
 import { MarkdownView } from './MarkdownView';
+import type { SourceBlock } from '../../../server/src/shared/tutorSources';
 
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const controlClass = 'px-2.5 py-1.5 rounded-lg zw-btn-secondary text-xs cursor-pointer disabled:opacity-50';
@@ -33,12 +34,21 @@ interface PreviewProps {
   onError: (failed: boolean) => void;
 }
 
-function PdfPreview({ url, onError }: PreviewProps) {
+function PdfPreview({ url, onError, citedPage }: PreviewProps & { citedPage?: number }) {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
-  const [page, setPage] = useState(1);
+  const [page, setPage] = useState(citedPage ?? 1);
   const [renderedPage, setRenderedPage] = useState(0);
   const [zoomed, setZoomed] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const readerRef = useRef<HTMLDivElement>(null);
+  const located = useRef(false);
+
+  useLayoutEffect(() => {
+    if (citedPage && renderedPage === citedPage && !located.current) {
+      readerRef.current?.scrollIntoView({ block: 'start' });
+      located.current = true;
+    }
+  }, [renderedPage, citedPage]);
 
   useEffect(() => {
     let disposed = false;
@@ -84,7 +94,7 @@ function PdfPreview({ url, onError }: PreviewProps) {
   }, [pdf, page, onError]);
 
   return (
-    <div className="space-y-2">
+    <div ref={readerRef} className="space-y-2 citation-scroll-target">
       {pdf && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-secondary)]">
           <button type="button" className={controlClass} disabled={page <= 1 || renderedPage !== page} onClick={() => setPage(page - 1)}>上一页</button>
@@ -93,15 +103,17 @@ function PdfPreview({ url, onError }: PreviewProps) {
           <button type="button" className={controlClass} onClick={() => setZoomed(!zoomed)}>{zoomed ? '适应宽度' : '放大'}</button>
         </div>
       )}
-      {renderedPage !== page && <p role="status" className="text-xs text-[var(--text-muted)]">正在加载 PDF 页面…</p>}
-      <div className="max-h-[65dvh] overflow-auto rounded-lg" key={page}>
-        <canvas
-          ref={canvasRef}
-          role="img"
-          aria-label={`PDF 第 ${page} 页`}
-          hidden={renderedPage !== page}
-          className={zoomed ? 'h-auto w-[58rem] max-w-none' : 'mx-auto h-auto max-w-full shadow-sm'}
-        />
+      <div className="relative">
+        {renderedPage !== page && <p role="status" className="absolute inset-x-0 top-3 text-center text-xs text-[var(--text-muted)]">正在加载 PDF 页面…</p>}
+        <div className="h-[65dvh] overflow-auto rounded-lg" aria-busy={renderedPage !== page}>
+          <canvas
+            ref={canvasRef}
+            role="img"
+            aria-label={`PDF 第 ${page} 页`}
+            style={{ visibility: renderedPage === page ? 'visible' : 'hidden' }}
+            className={zoomed ? 'h-auto w-[58rem] max-w-none' : 'mx-auto h-auto max-w-full shadow-sm'}
+          />
+        </div>
       </div>
     </div>
   );
@@ -191,18 +203,23 @@ function WordPreview({ url, onError }: PreviewProps) {
   );
 }
 
-export function NoteSource({ note, content }: { note: Note; content: string }) {
-  const [open, setOpen] = useState(false);
-  const [textOnly, setTextOnly] = useState(false);
+export function NoteSource({ note, content, highlight }: { note: Note; content: string; highlight?: SourceBlock }) {
+  const [open, setOpen] = useState(Boolean(highlight));
+  const [textOnly, setTextOnly] = useState(Boolean(highlight && !highlight.page));
   const [previewFailed, setPreviewFailed] = useState(false);
+  const passageRef = useRef<HTMLElement>(null);
   const originalUrl = getOriginalUrl(note);
   const documentNote = note.source_type === 'pdf' || note.source_type === 'docx';
   const documentUrl = documentNote ? originalUrl : null;
   const extension = note.source_type === 'markdown' ? 'md' : note.source_type === 'text' ? 'txt' : note.source_type;
   const downloadName = note.source_filename || `${note.title}.${extension}`;
+  useLayoutEffect(() => {
+    passageRef.current?.scrollIntoView({ block: 'start' });
+  }, [highlight, open, textOnly, previewFailed]);
 
   return (
     <details
+      open={open}
       onToggle={(event) => setOpen(event.currentTarget.open)}
       className="group rounded-xl border overflow-hidden bg-[var(--bg-subtle)] border-[var(--border-hairline)]"
     >
@@ -236,13 +253,17 @@ export function NoteSource({ note, content }: { note: Note; content: string }) {
           )}
           {documentUrl && !textOnly && !previewFailed ? (
             note.source_type === 'pdf'
-              ? <PdfPreview url={documentUrl} onError={setPreviewFailed} />
+              ? <PdfPreview url={documentUrl} onError={setPreviewFailed} citedPage={highlight?.page} />
               : <WordPreview url={documentUrl} onError={setPreviewFailed} />
           ) : content.trim() ? (
             <div className="max-h-[65dvh] overflow-auto p-2.5">
               {note.source_type === 'markdown'
-                ? <MarkdownView content={content} />
-                : <div className="whitespace-pre-wrap break-words text-sm leading-relaxed">{content}</div>}
+                ? <MarkdownView content={content} highlight={highlight} />
+                : <div className="whitespace-pre-wrap break-words text-sm leading-relaxed">
+                    {highlight ? <>{content.slice(0, highlight.start)}<mark ref={passageRef} data-source-target>
+                      {content.slice(highlight.start, highlight.end)}
+                    </mark>{content.slice(highlight.end)}</> : content}
+                  </div>}
             </div>
           ) : (
             <p className="text-xs text-[var(--text-muted)]">未提取到可阅读的文本。</p>

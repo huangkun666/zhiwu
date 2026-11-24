@@ -2,53 +2,75 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookMarked,
   BookOpen,
+  ChevronDown,
   FilePlus2,
-  GraduationCap,
+  History,
   Loader2,
-  MessageSquareText,
   Plus,
   Send,
   Sparkles,
-  Trash2,
   Undo2,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { existingIds } from '../../../server/src/shared/libraryReferences';
+import { tutorModeLabels, tutorOpeningMode } from '../../../server/src/shared/tutorMode';
 import { MarkdownView } from '../components/MarkdownView';
-import type { Note, TutorMessage, TutorSession } from '../types';
+import { TutorHistory } from '../components/TutorHistory';
+import { TutorModeDialog } from '../components/TutorModeDialog';
+import { useTutorHistory } from './useTutorHistory';
+import type { Note, TutorMessage, TutorMode, TutorSession } from '../types';
+
+interface NewSessionOptions {
+  mode?: TutorMode;
+  noteIds?: string[];
+  title?: string;
+  initialPrompt?: string;
+}
 
 interface TutorPageProps {
-  initialContext?: {
-    mode?: 'qa' | 'feynman';
-    noteIds?: string[];
-    title?: string;
-    initialPrompt?: string;
+  initialContext?: NewSessionOptions & {
+    sessionId?: string;
+    scrollTop?: number;
   } | null;
   onRefreshGlobal?: () => void;
+  onOpenCitation: (href: string, sessionId: string, chatScrollTop: number) => void;
+  onSessionChange: (id: string | null) => void;
 }
 
 type NoteAppend = { noteId: string; excerptId: string };
 
-export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
-  const [sessions, setSessions] = useState<TutorSession[]>([]);
+export function TutorPage({ initialContext, onRefreshGlobal, onOpenCitation, onSessionChange }: TutorPageProps) {
+  const history = useTutorHistory();
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [modeDialog, setModeDialog] = useState<'create' | 'settings' | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   const [activeSession, setActiveSession] = useState<TutorSession | null>(null);
   const [messages, setMessages] = useState<TutorMessage[]>([]);
-  const [mode, setMode] = useState<'qa' | 'feynman'>('feynman');
+  const mode = activeSession?.mode ?? 'general';
+  const openingMode = messages[0]?.role === 'assistant' && tutorOpeningMode(messages[0].content);
+  const visibleMessages = openingMode && openingMode !== mode ? messages.slice(1) : messages;
   const [selectedNoteIds, setSelectedNoteIds] = useState<string[]>([]);
+  const [discardedNoteIds, setDiscardedNoteIds] = useState<string[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [streamingText, setStreamingText] = useState('');
+  const [retrievalStatus, setRetrievalStatus] = useState('');
   const [showContextPicker, setShowContextPicker] = useState(false);
   const [toast, setToast] = useState<{ message: string; append?: NoteAppend } | null>(null);
   const [noteActionBusy, setNoteActionBusy] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const conversationRef = useRef<HTMLDivElement>(null);
+  const restoreScrollTop = useRef(initialContext?.scrollTop);
+  const sessionRequest = useRef(0);
+  const activeId = useRef<string | null>(null);
+  const openingId = useRef<string | null>(null);
+  const pendingSend = useRef<symbol | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
   const noteRequest = useRef(0);
   const availableSelection = useMemo(
-    () => existingIds(selectedNoteIds, new Set(notes.map(({ id }) => id))),
-    [selectedNoteIds, notes]
+    () => mode === 'general' ? [] : existingIds(selectedNoteIds, new Set(notes.map(({ id }) => id))),
+    [mode, selectedNoteIds, notes]
   );
+  const referenceCount = selectedNoteIds.length ? availableSelection.length : notes.length ? '自动' : 0;
 
   const showToast = (message: string, append?: NoteAppend) => {
     window.clearTimeout(toastTimer.current);
@@ -57,12 +79,6 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
   };
 
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
-
-  const loadSessions = async () => {
-    const [sessList] = await Promise.all([api.getTutorSessions(), refreshContextNotes()]);
-    setSessions(sessList);
-    return sessList;
-  };
 
   const refreshContextNotes = async () => {
     const request = ++noteRequest.current;
@@ -74,79 +90,180 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
     }
   };
 
-  const openSession = async (id: string) => {
-    const res = await api.getTutorMessages(id);
-    setActiveSession(res.session);
-    setMessages(res.messages);
-    setMode(res.session.mode);
-    setSelectedNoteIds(res.session.note_ids || []);
+  const resetReply = () => {
+    pendingSend.current = null;
+    setSending(false);
+    setStreamingText('');
+    setRetrievalStatus('');
   };
 
-  const startNewSession = async (opts?: {
-    mode?: 'qa' | 'feynman';
-    noteIds?: string[];
-    title?: string;
-    initialPrompt?: string;
-  }) => {
-    const targetMode = opts?.mode || mode;
+  const displaySession = (session: TutorSession, savedMessages: TutorMessage[]) => {
+    resetReply();
+    activeId.current = session.id;
+    setActiveSession(session);
+    onSessionChange(session.id);
+    setMessages(savedMessages);
+    setSelectedNoteIds(session.selection_ids ?? session.note_ids ?? []);
+    setDiscardedNoteIds([]);
+    setInput('');
+    setShowContextPicker(false);
+  };
+
+  const openSession = async (id: string, request = ++sessionRequest.current) => {
+    openingId.current = id;
+    if (activeId.current === id) return;
+    const res = await api.getTutorMessages(id);
+    if (request === sessionRequest.current) displaySession(res.session, res.messages);
+  };
+
+  const selectSession = async (id: string) => {
+    const request = ++sessionRequest.current;
+    await openSession(id, request);
+    if (request === sessionRequest.current) setHistoryOpen(false);
+  };
+
+  const startNewSession = async (opts: NewSessionOptions) => {
+    const request = ++sessionRequest.current;
+    openingId.current = null;
     const sess = await api.createTutorSession({
-      mode: targetMode,
-      noteIds: opts?.noteIds || availableSelection,
-      title: opts?.title,
-      initialPrompt: opts?.initialPrompt,
+      ...opts,
+      mode: opts.mode ?? 'general',
     });
-    setSessions((p) => [sess, ...p]);
-    await openSession(sess.id);
-    if (opts?.initialPrompt) setInput(opts.initialPrompt);
+    void history.refresh();
+    if (request !== sessionRequest.current) return;
+    if (sess.mode === 'general') {
+      displaySession(sess, []);
+    } else {
+      try {
+        await openSession(sess.id, request);
+      } catch {
+        if (request !== sessionRequest.current) return;
+        // Creation already succeeded. Keep this session if reading the opening message fails.
+        displaySession(sess, []);
+        showToast('对话已创建，暂时无法加载开场消息');
+      }
+    }
+    if (request === sessionRequest.current) {
+      setHistoryOpen(false);
+      if (opts.initialPrompt) setInput(opts.initialPrompt);
+    }
+  };
+
+  const confirmMode = async (next: TutorMode) => {
+    if (modeDialog === 'create') {
+      await startNewSession({ mode: next });
+    } else if (activeSession && next !== mode) {
+      const updated = await api.setTutorSessionMode(activeSession.id, next);
+      if (activeId.current === updated.id) {
+        setActiveSession(s => s?.id === updated.id ? { ...s, mode: updated.mode, updated_at: updated.updated_at } : s);
+        setShowContextPicker(false);
+      }
+      void history.refreshAfterEdit(updated.id, updated);
+    }
+    setModeDialog(null);
+  };
+
+  const renameSession = async (id: string, title: string) => {
+    const updated = await api.renameTutorSession(id, title);
+    setActiveSession(session => session?.id === id ? { ...session, title: updated.title, updated_at: updated.updated_at } : session);
+    await history.refreshAfterEdit(id, updated);
+  };
+
+  const deleteSession = async (id: string) => {
+    await api.deleteTutorSession(id);
+    if (openingId.current === id) {
+      ++sessionRequest.current;
+      openingId.current = null;
+    }
+    if (activeId.current === id) {
+      activeId.current = null;
+      resetReply();
+      setActiveSession(null);
+      onSessionChange(null);
+      setMessages([]);
+      setInput('');
+      setSelectedNoteIds([]);
+      setDiscardedNoteIds([]);
+      setShowContextPicker(false);
+    }
+    await history.refreshAfterEdit(id);
   };
 
   useEffect(() => {
-    let cancelled = false;
-    loadSessions().then((sessList) => {
-      if (cancelled) return;
-      if (initialContext) startNewSession(initialContext);
-      else if (sessList.length > 0) openSession(sessList[0].id);
-    });
-    return () => { cancelled = true; };
+    const request = sessionRequest.current;
+    const firstPage = history.refresh();
+    void Promise.resolve().then(async () => {
+      if (request !== sessionRequest.current) return;
+      if (initialContext?.sessionId) await openSession(initialContext.sessionId);
+      else if (initialContext) await startNewSession(initialContext);
+      else {
+        const rows = await firstPage;
+        if (request === sessionRequest.current && rows?.length) await openSession(rows[0].id);
+      }
+    }).catch(e => showToast(e.message || '无法打开对话'));
+    return () => {
+      ++sessionRequest.current;
+      activeId.current = null;
+      openingId.current = null;
+      pendingSend.current = null;
+    };
   }, []);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (mode !== 'general') void refreshContextNotes();
+  }, [mode, activeSession?.id]);
+
+  useEffect(() => {
+    const panel = conversationRef.current;
+    if (!panel || !messages.length) return;
+    panel.scrollTop = restoreScrollTop.current ?? panel.scrollHeight;
+    restoreScrollTop.current = undefined;
   }, [messages, streamingText, sending]);
 
   const handleSend = async (customText?: string) => {
     const text = (customText ?? input).trim();
-    if (!text || sending) return;
-
-    let session = activeSession;
-    if (!session) {
-      session = await api.createTutorSession({ mode, noteIds: availableSelection, title: text.slice(0, 22) });
-      setSessions((p) => [session!, ...p]);
-      setActiveSession(session);
-    }
-
-    setInput('');
+    if (!text || pendingSend.current) return;
+    const request = Symbol();
+    pendingSend.current = request;
     setSending(true);
+    setRetrievalStatus('');
     setStreamingText('');
-
-    const optimisticUser: TutorMessage = {
-      id: `temp-${Date.now()}`,
-      session_id: session.id,
-      role: 'user',
-      content: text,
-      created_at: new Date().toISOString(),
-    };
-    setMessages((prev) => [...prev, optimisticUser]);
-
+    let session = activeSession;
     try {
+      if (!session) {
+        const opening = ++sessionRequest.current;
+        openingId.current = null;
+        const created = await api.createTutorSession({ mode, title: text.slice(0, 22) });
+        void history.refresh();
+        if (pendingSend.current !== request || opening !== sessionRequest.current) return;
+        activeId.current = created.id;
+        setActiveSession(created);
+        onSessionChange(created.id);
+        session = created;
+      }
+      const optimisticUser: TutorMessage = {
+        id: `temp-${Date.now()}`, session_id: session.id,
+        role: 'user', content: text, created_at: new Date().toISOString(),
+      };
+      setInput('');
+      setMessages((prev) => [...prev, optimisticUser]);
       const res = await api.sendTutorMessageStream(
         session.id,
-        { message: text, noteIds: availableSelection, mode },
-        (delta) => setStreamingText((prev) => prev + delta)
+        mode === 'general' ? { message: text, mode } : { message: text, mode, noteIds: selectedNoteIds, discardedNoteIds },
+        (delta) => { if (pendingSend.current === request) setStreamingText((prev) => prev + delta); },
+        (status) => { if (pendingSend.current === request) setRetrievalStatus(status); },
       );
-      setStreamingText('');
-      setMessages((prev) => [...prev.filter((m) => m.id !== optimisticUser.id), res.userMessage, res.assistantMessage]);
+      void history.refresh();
+      if (activeId.current !== session.id) return;
+      if (pendingSend.current === request) {
+        if (mode !== 'general') setDiscardedNoteIds(prev => prev.filter(id => !discardedNoteIds.includes(id)));
+        setStreamingText('');
+      }
+      setMessages(prev => prev.some(m => m.id === res.assistantMessage.id) ? prev
+        : [...prev.filter(m => m.id !== optimisticUser.id), res.userMessage, res.assistantMessage]);
     } catch (e: any) {
+      if (pendingSend.current !== request) return;
+      if (!session) { showToast(e.message || '无法新建对话'); return; }
       setStreamingText('');
       setMessages((prev) => [
         ...prev,
@@ -159,15 +276,18 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
         },
       ]);
     } finally {
-      setSending(false);
+      if (pendingSend.current === request) {
+        pendingSend.current = null;
+        setSending(false);
+      }
     }
   };
 
   // Closed-loop沉淀: Save an AI reply directly as a Flashcard
   const handleSaveAsFlashcard = async (msgIndex: number) => {
-    const aiMsg = messages[msgIndex];
-    const prevUser = [...messages.slice(0, msgIndex)].reverse().find((m) => m.role === 'user');
-    const front = prevUser?.content?.slice(0, 140) || activeSession?.title || '费曼对话要点';
+    const aiMsg = visibleMessages[msgIndex];
+    const prevUser = [...visibleMessages.slice(0, msgIndex)].reverse().find((m) => m.role === 'user');
+    const front = prevUser?.content?.slice(0, 140) || activeSession?.title || '对话要点';
     try {
       await api.createFlashcard({
         front,
@@ -196,7 +316,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
         await api.createNote({
           title: `助教沉淀：${activeSession?.title || '学习思考'}`,
           content: message.content,
-          tags: ['费曼沉淀'],
+          tags: [mode === 'feynman' ? '费曼沉淀' : '对话摘录'],
         });
         showToast('已保存为新笔记');
       }
@@ -229,7 +349,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
       : ['用生活类比帮我讲透核心原理', '提炼这份笔记最易混淆的 3 个考点', '这些知识实际怎么用？'];
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 h-[calc(100dvh-8.2rem)] md:h-[calc(100vh-4.5rem)]">
+    <div className="grid h-full min-h-0 grid-cols-1 grid-rows-[minmax(0,1fr)] lg:grid-cols-12 lg:gap-4">
       {toast && (
         <div className="fixed top-4 right-4 z-50 flex items-center gap-3 max-w-[calc(100vw-2rem)] px-4 py-2.5 rounded-xl zw-btn-primary text-xs font-medium shadow-lg">
           <span role="status" className="break-words min-w-0">{toast.message}</span>
@@ -246,123 +366,73 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
         </div>
       )}
 
-      {/* Sessions Sidebar */}
-      <div className="hidden lg:flex lg:col-span-3 flex-col rounded-2xl zw-card overflow-hidden">
-        <div
-          className="p-3 border-b space-y-2"
-          style={{ borderColor: 'var(--border-hairline)' }}
-        >
-          <button
-            onClick={() => startNewSession({ mode: 'feynman' })}
-            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl zw-btn-primary text-xs font-semibold cursor-pointer"
-          >
-            <GraduationCap className="w-3.5 h-3.5" />
-            新建费曼考官
-          </button>
-          <button
-            onClick={() => startNewSession({ mode: 'qa' })}
-            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl zw-btn-secondary text-xs font-medium cursor-pointer"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            新建笔记答疑
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          {sessions.map((s) => (
-            <div
-              key={s.id}
-              onClick={() => openSession(s.id)}
-              className="group flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-xs cursor-pointer transition"
-              style={{
-                background: activeSession?.id === s.id ? 'var(--bg-active)' : 'transparent',
-                color: activeSession?.id === s.id ? 'var(--text-primary)' : 'var(--text-secondary)',
-              }}
-            >
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-medium">{s.title}</div>
-                <div className="text-[10px] text-[var(--text-muted)]">
-                  {s.mode === 'feynman' ? '费曼考官' : '深度答疑'}
-                </div>
-              </div>
-              <button
-                onClick={async (e) => {
-                  e.stopPropagation();
-                  await api.deleteTutorSession(s.id);
-                  setSessions((p) => p.filter((x) => x.id !== s.id));
-                  if (activeSession?.id === s.id) {
-                    setActiveSession(null);
-                    setMessages([]);
-                  }
-                }}
-                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--text-muted)] hover:text-[var(--danger-fg)]"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          ))}
-        </div>
-      </div>
+      <TutorHistory history={history} activeId={activeSession?.id}
+        mobileOpen={historyOpen} onClose={() => setHistoryOpen(false)}
+        onSelect={selectSession} onRename={renameSession} onDelete={deleteSession} />
+      {modeDialog && (
+        <TutorModeDialog kind={modeDialog} initialMode={modeDialog === 'create' ? 'general' : mode}
+          onConfirm={confirmMode} onClose={() => setModeDialog(null)} />
+      )}
 
       {/* Chat Area */}
-      <div className="lg:col-span-9 flex flex-col rounded-2xl zw-card overflow-hidden">
+      <div className="lg:col-span-9 flex min-h-0 min-w-0 flex-col md:rounded-2xl zw-card max-md:border-0 overflow-hidden">
         <div
-          className="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-2"
+          className="shrink-0 px-2 py-2 sm:px-4 sm:py-3 border-b flex flex-wrap items-center justify-between gap-1"
           style={{ borderColor: 'var(--border-hairline)' }}
         >
-          <div
-            className="flex p-1 rounded-xl"
-            style={{ background: 'var(--bg-subtle)' }}
-          >
-            <button
-              onClick={() => setMode('feynman')}
-              className="px-3 py-1 rounded-lg text-xs font-medium transition cursor-pointer flex items-center gap-1"
-              style={{
-                background: mode === 'feynman' ? 'var(--bg-card-solid)' : 'transparent',
-                color: mode === 'feynman' ? 'var(--text-primary)' : 'var(--text-muted)',
-              }}
-            >
-              <GraduationCap className="w-3.5 h-3.5" />
-              费曼考官
-            </button>
-            <button
-              onClick={() => setMode('qa')}
-              className="px-3 py-1 rounded-lg text-xs font-medium transition cursor-pointer flex items-center gap-1"
-              style={{
-                background: mode === 'qa' ? 'var(--bg-card-solid)' : 'transparent',
-                color: mode === 'qa' ? 'var(--text-primary)' : 'var(--text-muted)',
-              }}
-            >
-              <MessageSquareText className="w-3.5 h-3.5" />
-              深度答疑
-            </button>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => {
+          <div className="flex min-w-0 items-center gap-1 sm:gap-2">
+            {activeSession ? (
+              <button type="button" aria-label="对话设置" title="对话设置" aria-haspopup="dialog"
+                aria-expanded={modeDialog === 'settings'} aria-controls="tutor-mode-dialog"
+                onClick={() => setModeDialog('settings')}
+                className="zw-btn-secondary inline-flex min-h-9 items-center gap-1 rounded-xl px-1.5 text-xs sm:px-3">
+                {tutorModeLabels[mode]}<ChevronDown className="size-3" aria-hidden="true" />
+              </button>
+            ) : <span className="px-1 text-sm font-medium">{tutorModeLabels.general}</span>}
+            {mode !== 'general' && (
+              <button type="button" onClick={() => {
                 setShowContextPicker(!showContextPicker);
-                if (!showContextPicker) refreshContextNotes();
+                if (!showContextPicker) void refreshContextNotes();
               }}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl zw-btn-secondary text-xs cursor-pointer"
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              参考笔记 ({availableSelection.length || (notes.length ? '自动' : 0)})
+                aria-expanded={showContextPicker} aria-label={`参考笔记 (${referenceCount})`}
+                className="zw-btn-secondary inline-flex min-h-9 items-center gap-1 rounded-xl px-1.5 text-xs sm:px-3">
+                <BookOpen className="hidden size-3.5 sm:block" aria-hidden="true" />
+                <span>参考<span className="hidden min-[390px]:inline">笔记</span> ({referenceCount})</span>
+              </button>
+            )}
+          </div>
+          <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+            <button type="button" aria-haspopup="dialog" aria-controls="tutor-history" aria-expanded={historyOpen}
+              onClick={() => setHistoryOpen(true)}
+              className="zw-btn-secondary inline-flex min-h-9 items-center gap-1 rounded-xl px-1.5 text-xs sm:px-3 lg:hidden">
+              <History className="hidden size-3.5 min-[420px]:block" aria-hidden="true" />历史对话
             </button>
-            <button onClick={() => startNewSession()} className="lg:hidden p-2 rounded-xl zw-btn-secondary" title="新对话">
-              <Plus className="w-4 h-4" />
+            <button type="button" aria-haspopup="dialog" aria-controls="tutor-mode-dialog" aria-expanded={modeDialog === 'create'}
+              onClick={() => setModeDialog('create')}
+              className="zw-btn-primary inline-flex min-h-9 items-center gap-1 rounded-xl px-2 text-xs font-medium sm:px-3">
+              <Plus className="hidden size-3.5 min-[390px]:block" aria-hidden="true" />新建对话
             </button>
           </div>
         </div>
 
-        {showContextPicker && (
+        {mode !== 'general' && showContextPicker && (
           <div
             className="px-4 py-3 border-b max-h-36 overflow-y-auto"
             style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
           >
             <div className="text-[11px] text-[var(--text-muted)] mb-2">
-              {notes.length ? '可勾选参考笔记，默认参考最近更新的笔记。' : '笔记库暂无可参考的笔记。'}
+              {notes.length ? '勾选后只检索所选笔记，留空则按问题从笔记库查找。' : '笔记库暂无可参考的笔记。'}
             </div>
+            {selectedNoteIds.length > availableSelection.length && (
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+                部分所选笔记已不可用
+                <button type="button" onClick={() => {
+                  setDiscardedNoteIds(p => [...new Set([...p, ...selectedNoteIds.filter(id => !availableSelection.includes(id))])]);
+                  setSelectedNoteIds(availableSelection);
+                }}
+                  className="rounded-lg zw-btn-secondary px-2 py-1">移除失效选择</button>
+              </div>
+            )}
             <div className="flex flex-wrap gap-1.5">
               {notes.map((n) => {
                 const active = availableSelection.includes(n.id);
@@ -387,23 +457,20 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
           </div>
         )}
 
-        <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
-          {messages.length === 0 ? (
+        <div ref={conversationRef} role="region" aria-label="对话消息" className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-3 sm:p-5 space-y-4">
+          {visibleMessages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-2.5 py-8">
               <Sparkles className="w-7 h-7 text-[var(--text-muted)]" />
               <h3 className="font-semibold text-sm">
-                {mode === 'feynman' ? '费曼学习法：用输出倒逼深度理解' : '专属笔记助教：随时追问不留死角'}
+                {mode === 'general' ? '有什么想了解的？' : mode === 'feynman' ? '试着用自己的话解释一个概念' : '想讨论笔记里的哪个问题？'}
               </h3>
-              <p className="text-xs text-[var(--text-muted)] leading-relaxed">
-                对话中的精炼结论可直接一键「存为闪卡」或「追加到笔记」，真正沉淀进你的知识库。
-              </p>
             </div>
           ) : (
-            messages.map((m, idx) => (
+            visibleMessages.map((m, idx) => (
               <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className="max-w-[88%] sm:max-w-[78%] space-y-1.5">
+                <div className={`min-w-0 ${m.role === 'assistant' ? 'max-w-full' : 'max-w-[90%]'} sm:max-w-[78%] space-y-1.5`}>
                   <div
-                    className={`rounded-2xl px-4 py-3 text-sm ${
+                    className={`rounded-2xl px-3 sm:px-4 py-3 text-sm break-words ${
                       m.role === 'user' ? 'zw-btn-primary rounded-br-md' : 'border rounded-bl-md'
                     }`}
                     style={
@@ -415,7 +482,8 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
                     {m.role === 'user' ? (
                       <div className="whitespace-pre-wrap leading-relaxed">{m.content}</div>
                     ) : (
-                      <MarkdownView content={m.content} className="text-sm" />
+                      <MarkdownView content={m.content} className="text-sm"
+                        onOpenNote={(href) => onOpenCitation(href, m.session_id, conversationRef.current?.scrollTop ?? 0)} />
                     )}
                   </div>
                   {/* Closed-loop沉淀 actions on AI messages */}
@@ -446,7 +514,7 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
           {sending && (
             <div className="flex justify-start">
               <div
-                className="max-w-[88%] sm:max-w-[78%] rounded-2xl rounded-bl-md px-4 py-3 border text-sm"
+                className="min-w-0 max-w-full sm:max-w-[78%] rounded-2xl rounded-bl-md px-3 sm:px-4 py-3 border text-sm"
                 style={{ background: 'var(--bg-subtle)', borderColor: 'var(--border-hairline)' }}
               >
                 {streamingText ? (
@@ -454,20 +522,19 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
                 ) : (
                   <span className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    思考中...
+                    {retrievalStatus || '思考中…'}
                   </span>
                 )}
               </div>
             </div>
           )}
-          <div ref={bottomRef} />
         </div>
 
         <div
-          className="p-3 sm:p-4 border-t space-y-2.5"
+          className="shrink-0 p-2 sm:p-4 border-t space-y-2"
           style={{ borderColor: 'var(--border-hairline)', background: 'var(--bg-subtle)' }}
         >
-          {messages.length <= 1 && (
+          {mode !== 'general' && (visibleMessages.length === 0 || (visibleMessages.length === 1 && visibleMessages[0].role === 'assistant')) && (
             <div className="flex gap-1.5 overflow-x-auto pb-1">
               {quickPrompts.map((qp, i) => (
                 <button
@@ -486,21 +553,20 @@ export function TutorPage({ initialContext, onRefreshGlobal }: TutorPageProps) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   handleSend();
                 }
               }}
-              rows={2}
+              rows={1}
               placeholder={
-                mode === 'feynman'
-                  ? '用自己的话解释概念，或让考官向你提问... (Enter 发送)'
-                  : '输入想请教的问题... (Enter 发送)'
+                mode === 'general' ? '输入你的问题…' : mode === 'feynman' ? '用自己的话解释一个概念…' : '输入想请教的问题…'
               }
-              className="flex-1 px-3.5 py-2.5 rounded-xl zw-input text-sm resize-none"
+              className="min-w-0 min-h-11 max-h-28 sm:min-h-14 field-sizing-content flex-1 px-3 py-2 rounded-xl zw-input text-base sm:text-sm resize-none"
             />
             <button
               onClick={() => handleSend()}
+              aria-label="发送消息"
               disabled={sending || !input.trim()}
               className="p-3 rounded-xl zw-btn-primary disabled:opacity-45 cursor-pointer shrink-0"
             >

@@ -94,6 +94,7 @@ export function initDatabase() {
       title TEXT NOT NULL,
       content TEXT NOT NULL,
       source_content TEXT,
+      source_pages TEXT,
       chat_excerpts TEXT NOT NULL DEFAULT '[]',
       summary_json TEXT,
       category_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
@@ -255,11 +256,14 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_mistakes_review ON mistakes(next_review_at);
     CREATE INDEX IF NOT EXISTS idx_flashcards_review ON flashcards(next_review_at);
     CREATE INDEX IF NOT EXISTS idx_study_logs_date ON study_logs(date_key);
+    CREATE INDEX IF NOT EXISTS idx_tutor_sessions_history ON tutor_sessions(updated_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_tutor_messages_session ON tutor_messages(session_id, created_at);
   `);
 
   inTransaction(() => {
     const noteColumns = new Set(db.prepare('PRAGMA table_info(notes)').all().map((column) => column.name));
     if (!noteColumns.has('source_content')) db.exec('ALTER TABLE notes ADD COLUMN source_content TEXT');
+    if (!noteColumns.has('source_pages')) db.exec('ALTER TABLE notes ADD COLUMN source_pages TEXT');
     if (!noteColumns.has('chat_excerpts')) db.exec("ALTER TABLE notes ADD COLUMN chat_excerpts TEXT NOT NULL DEFAULT '[]'");
     if (!noteColumns.has('deleted_at')) db.exec('ALTER TABLE notes ADD COLUMN deleted_at TEXT');
     if (!db.prepare('PRAGMA table_info(categories)').all().some(({ name }) => name === 'updated_at')) {
@@ -267,6 +271,7 @@ export function initDatabase() {
     }
 
     db.exec(`
+      UPDATE tutor_sessions SET mode = 'qa' WHERE mode IS NULL OR mode NOT IN ('general', 'qa', 'feynman');
       CREATE INDEX IF NOT EXISTS idx_notes_trash ON notes(deleted_at) WHERE deleted_at IS NOT NULL;
       CREATE VIEW IF NOT EXISTS active_notes AS SELECT * FROM notes WHERE deleted_at IS NULL;
       DROP VIEW IF EXISTS active_concepts;

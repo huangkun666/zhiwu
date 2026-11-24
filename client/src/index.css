@@ -211,6 +211,22 @@
 }
 
 /* Editorial Markdown Prose (Theme-Aware) */
+mark[data-source-target] {
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  background: var(--warn-bg);
+  color: inherit;
+  border-bottom: 2px solid var(--warn-fg);
+}
+
+[data-source-target], .citation-scroll-target {
+  scroll-margin-top: calc(env(safe-area-inset-top) + 7.5rem);
+}
+
+@media (min-width: 768px) {
+  [data-source-target], .citation-scroll-target { scroll-margin-top: 4rem; }
+}
+
 .zhiwu-prose {
   color: var(--text-primary);
   line-height: 1.78;

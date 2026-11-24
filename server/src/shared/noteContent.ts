@@ -70,3 +70,10 @@ export function removeLegacyChatExcerpt(
   const replyEnd = offset + block.length - excerpt.content.length + reply.length;
   return { content: content.slice(0, offset) + content.slice(replyEnd) };
 }
+
+export function stripInlineImages(content: string): string {
+  return (content || '')
+    .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
+    .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
+    .trim();
+}

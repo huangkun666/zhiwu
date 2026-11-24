@@ -1,3 +1,5 @@
+import { stripInlineImages } from '../shared/noteContent.js';
+import type { TutorMode } from '../shared/tutorMode.js';
 import { AIProviderConfig, getAISettings } from '../db.js';
 
 export interface ChatMessage {
@@ -195,13 +197,6 @@ async function callGemini(
     throw new Error('Gemini 返回了空内容，请检查 API Key 或模型名称。');
   }
   return text.trim();
-}
-
-export function stripInlineImages(content: string): string {
-  return (content || '')
-    .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
-    .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
-    .trim();
 }
 
 export function cleanOcrMarkdown(raw: string): string {
@@ -722,58 +717,16 @@ export async function generateFlashcardsAI(
     }));
 }
 
-export async function tutorChatAI(
-  mode: 'qa' | 'feynman',
-  notes: { title: string; content: string }[],
-  history: { role: 'user' | 'assistant'; content: string }[],
-  userMessage: string
-): Promise<string> {
-  const messages = buildTutorMessages(mode, notes, history, userMessage);
+export async function tutorChatAI(mode: TutorMode, messages: ChatMessage[]): Promise<string> {
   return callLLM(messages, { temperature: mode === 'feynman' ? 0.55 : 0.4 });
 }
 
-function buildTutorMessages(
-  mode: 'qa' | 'feynman',
-  notes: { title: string; content: string }[],
-  history: { role: 'user' | 'assistant'; content: string }[],
-  userMessage: string
-): ChatMessage[] {
-  const noteContext = notes.length
-    ? notes.map((n, i) => `【参考笔记${i + 1}：${n.title}】\n${stripInlineImages(n.content).slice(0, 4000)}`).join('\n\n')
-    : '（未指定特定笔记，请结合通用知识与学习方法回答）';
-
-  const systemPrompt =
-    mode === 'feynman'
-      ? `你是「知悟」的**费曼学习法考官**。你的核心目标不是直接灌输答案，而是通过苏格拉底式追问帮助用户真正讲明白、吃透知识。
-工作方式：
-1. 每次用户尝试用自己的话解释概念时，先肯定其准确的部分（给一个简短的理解度评估，如 7/10）；
-2. 敏锐指出逻辑漏洞、含糊其辞或遗漏的边界条件；
-3. 每次只提出 1-2 个直击要害的追问或反例，引导用户用更简单直白的话（像教一个高中生一样）重新阐述；
-4. 如果用户实在卡壳，给一个小梯子提示，而不是直接甩大段教科书。
-
-参考学习材料：
-${noteContext}`
-      : `你是「知悟」的**专属知识助教**。请优先基于用户选定的学习笔记准确、深入地解答问题；如果笔记中未覆盖某部分，可以补充通用知识并明确标出「延伸补充」。善用类比、结构化要点和实例，回答清晰易懂。
-
-参考学习材料：
-${noteContext}`;
-
-  return [
-    { role: 'system', content: systemPrompt },
-    ...history.slice(-12).map((h) => ({ role: h.role, content: h.content })),
-    { role: 'user', content: userMessage },
-  ];
-}
-
 export async function tutorChatStreamAI(
-  mode: 'qa' | 'feynman',
-  notes: { title: string; content: string }[],
-  history: { role: 'user' | 'assistant'; content: string }[],
-  userMessage: string,
+  mode: TutorMode,
+  messages: ChatMessage[],
   onDelta: (chunk: string) => void
 ): Promise<string> {
   const provider = getActiveProvider();
-  const messages = buildTutorMessages(mode, notes, history, userMessage);
   const temperature = mode === 'feynman' ? 0.55 : 0.4;
 
   let res: Response;
@@ -805,10 +758,28 @@ export async function tutorChatStreamAI(
   }
 
   if (!res.ok || !res.body) {
-    // Graceful fallback to non-streaming call
+    if (mode === 'general') {
+      const details = (await res.text().catch(() => '')).slice(0, 1000);
+      const rejectsStreaming = res.status === 501 || ([400, 422].includes(res.status)
+        && /stream|流式/i.test(details)
+        && /unsupported|not support|not (?:allowed|available|implemented|permitted)|unknown|unrecogni[sz]ed|disabled|must be false|non[- ]?stream|不支持|未实现|未知参数|不允许|非流式/i.test(details));
+      if (!rejectsStreaming) throw new Error(res.ok ? '模型返回了空内容' : '模型请求失败 (' + res.status + ')：' + details.slice(0, 300));
+    }
+    // Some providers support ordinary completions but refuse streaming.
     const full = await callLLM(messages, { provider, temperature });
     onDelta(full);
     return full;
+  }
+
+  // A gateway may accept the stream option and reply with an ordinary completion in the same request.
+  if (/\bjson\b/i.test(res.headers.get('content-type') || '')) {
+    const data = await res.json() as any;
+    const msg = data?.choices?.[0]?.message;
+    const text = provider.type === 'gemini' ? data?.candidates?.[0]?.content?.parts?.map((part: any) => part.text || '').join('')
+      : msg?.content || msg?.reasoning_content;
+    if (typeof text !== 'string' || !text.trim()) throw new Error('模型返回了空内容');
+    onDelta(text);
+    return text.trim();
   }
 
   const reader = res.body.getReader();
@@ -842,5 +813,6 @@ export async function tutorChatStreamAI(
       }
     }
   }
+  if (mode === 'general' && !fullText.trim()) throw new Error('模型返回了空内容');
   return fullText.trim();
 }

@@ -21,7 +21,8 @@ import {
   Trash2,
   Undo2,
 } from 'lucide-react';
-import { splitLegacyChatExcerpts } from '../../../server/src/shared/noteContent';
+import { splitLegacyChatExcerpts, stripInlineImages } from '../../../server/src/shared/noteContent';
+import { sourceBlocks, unreadPdfPage, type SourceBlock } from '../../../server/src/shared/tutorSources';
 import { api } from '../api/client';
 import { MarkdownView } from '../components/MarkdownView';
 import { NoteSource } from '../components/NoteSource';
@@ -31,6 +32,8 @@ import type { Note, PageId, Synthesis, TrashedNote } from '../types';
 interface NotesPageProps {
   categoryLabels: ReadonlyMap<string, string>;
   initialNoteId?: string | null;
+  citation?: URLSearchParams;
+  onReturnToTutor?: () => void;
   onRefreshGlobal: () => void;
   onOpenImport: () => void;
   onNavigate: (page: PageId, context?: any) => void;
@@ -41,6 +44,8 @@ const CAT_COLORS = ['#6366F1', '#0F766E', '#D97706', '#E11D48', '#8B5CF6', '#028
 export function NotesPage({
   categoryLabels,
   initialNoteId,
+  citation,
+  onReturnToTutor,
   onRefreshGlobal,
   onOpenImport,
   onNavigate,
@@ -56,6 +61,7 @@ export function NotesPage({
   const [selectedTag, setSelectedTag] = useState<string>('');
 
   const [activeNote, setActiveNote] = useState<Note | null>(null);
+  const [linkedNoteError, setLinkedNoteError] = useState(false);
   const [activeSynthesis, setActiveSynthesis] = useState<Synthesis | null>(null);
   const [checkedIds, setCheckedIds] = useState<string[]>([]);
   const [multiSelectMode, setMultiSelectMode] = useState(false);
@@ -147,18 +153,23 @@ export function NotesPage({
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    setLinkedNoteError(false);
     if (initialNoteId) {
       api
         .getNote(initialNoteId)
         .then((n) => {
+          if (cancelled) return;
           setSubTab('notes');
           selectNote(n);
         })
-        .catch(() => {});
+        .catch(() => { if (!cancelled) setLinkedNoteError(true); });
     }
+    return () => { cancelled = true; };
   }, [initialNoteId]);
 
   const selectNote = (note: Note) => {
+    setLinkedNoteError(false);
     setActiveNote(note);
     setEditing(false);
   };
@@ -228,6 +239,7 @@ export function NotesPage({
     setChangingTrash(true);
     try {
       await api.deleteNote(deletedId);
+      if (deletedId === initialNoteId) setLinkedNoteError(true);
       setActiveNote((current) => current?.id === deletedId ? null : current);
       setCheckedIds((current) => current.filter((id) => id !== deletedId));
       setNotes((current) => current.filter((note) => note.id !== deletedId));
@@ -362,11 +374,36 @@ export function NotesPage({
   const showDetailMobile = Boolean((subTab === 'notes' && activeNote) || (subTab === 'syntheses' && activeSynthesis));
   const legacy = useMemo(() => splitLegacyChatExcerpts(activeNote?.content ?? ''), [activeNote?.content]);
   const legacyImport = Boolean(activeNote?.source_filename && activeNote.source_type !== 'image' && activeNote.source_content == null);
-  const body = legacyImport ? '' : legacy.body;
+  const body = useMemo(() => legacyImport ? '' : stripInlineImages(legacy.body), [legacyImport, legacy.body]);
   const source = activeNote?.source_content ?? (legacyImport ? legacy.body : null);
+  const block = useMemo(() => {
+    if (!citation || !activeNote || activeNote.id !== initialNoteId) return;
+    if (['note', 'part', 'at', 'sig', 'page'].some((key) => citation.getAll(key).length > 1)) return;
+    const candidates = sourceBlocks(activeNote);
+    if (citation.has('page')) {
+      const page = unreadPdfPage(activeNote, Number(citation.get('page')));
+      if (page) candidates.push(page);
+    }
+    return candidates.find((item) => (
+      item.field === citation.get('part') && String(item.index) === citation.get('at') && item.sig === citation.get('sig')
+      && (!citation.has('page') || (item.page !== undefined && String(item.page) === citation.get('page')))
+    ));
+  }, [activeNote, initialNoteId, citation]);
+  const citationError = linkedNoteError ? '无法打开这篇笔记，笔记可能已移入回收站。'
+    : citation && activeNote?.id === initialNoteId && !block ? '引用段落已变更或定位信息无效。' : '';
 
   return (
     <div className="space-y-5">
+      {(onReturnToTutor || citationError || block?.tableHeader) && (
+        <div className="sticky top-[calc(env(safe-area-inset-top)+3.5rem)] md:top-2 z-20 flex w-fit max-w-full items-center gap-2 rounded-xl zw-glass border px-2 py-1 shadow-sm">
+          {onReturnToTutor && <button type="button" onClick={onReturnToTutor}
+            className="inline-flex min-h-9 shrink-0 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-[var(--bg-hover)]">
+            <ArrowLeft className="size-4" /> 返回对话
+          </button>}
+          {citationError && <p role="status" className="px-1 py-1 text-sm">{citationError}</p>}
+          {block?.tableHeader && <span className="min-w-0 truncate text-xs" title={block.tableHeader}>表头　{block.tableHeader}</span>}
+        </div>
+      )}
       {toast && (
         <div role="status" className="fixed top-[max(1rem,env(safe-area-inset-top))] right-4 z-50 flex items-center gap-3 rounded-xl zw-card border-[var(--border-strong)] px-3 py-2 text-xs font-medium shadow-lg">
           {toast.message}
@@ -992,14 +1029,7 @@ export function NotesPage({
                   </div>
                 ) : (
                   <>
-                    {body.trim() && (
-                      <MarkdownView
-                        content={body
-                          .replace(/!\[[^\]]*\]\(data:image\/[^)]+\)\s*(?:---\s*)?/gi, '')
-                          .replace(/!\[[^\]]*\]\(\/uploads\/[^)]+\)\s*(?:---\s*)?/gi, '')
-                          .trim()}
-                      />
-                    )}
+                    {body && <MarkdownView content={body} highlight={block?.field === 'body' ? block : undefined} />}
                     {(legacy.excerpts.length > 0 || Boolean(activeNote.chat_excerpts?.length)) && (
                       <section className="space-y-3" aria-label="聊天追加">
                         <h3 className="text-sm font-semibold">聊天追加</h3>
@@ -1008,6 +1038,7 @@ export function NotesPage({
                             key={`legacy-${excerpt.offset}`}
                             date={excerpt.date}
                             content={excerpt.content}
+                            highlight={block?.excerptId === `legacy-${excerpt.offset}` ? block : undefined}
                             disabled={undoing}
                             onUndo={() => handleUndoChat(excerpt)}
                           />
@@ -1017,13 +1048,15 @@ export function NotesPage({
                             key={excerpt.id}
                             date={new Date(excerpt.created_at).toLocaleDateString()}
                             content={excerpt.content}
+                            highlight={block?.excerptId === excerpt.id ? block : undefined}
                             disabled={undoing}
                             onUndo={() => handleUndoChat(excerpt)}
                           />
                         ))}
                       </section>
                     )}
-                    {source !== null && <NoteSource key={activeNote.id} note={activeNote} content={source} />}
+                    {(source !== null || block?.page) && <NoteSource key={`${activeNote.id}:${block?.sig ?? ''}`} note={activeNote}
+                      content={source ?? ''} highlight={block?.field === 'source' ? block : undefined} />}
                   </>
                 )}
               </div>
@@ -1040,9 +1073,10 @@ export function NotesPage({
   );
 }
 
-function NoteChatExcerpt({ date, content, disabled, onUndo }: {
+function NoteChatExcerpt({ date, content, highlight, disabled, onUndo }: {
   date: string;
   content: string;
+  highlight?: SourceBlock;
   disabled: boolean;
   onUndo: () => void;
 }) {
@@ -1059,7 +1093,7 @@ function NoteChatExcerpt({ date, content, disabled, onUndo }: {
           <Undo2 className="w-3.5 h-3.5" /> 撤销追加
         </button>
       </div>
-      <MarkdownView content={content} />
+      <MarkdownView content={content} highlight={highlight} />
     </article>
   );
 }

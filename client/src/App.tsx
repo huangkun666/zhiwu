@@ -13,10 +13,24 @@ import { TutorPage } from './pages/TutorPage';
 import type { ActiveModelCapability, Category, PageId } from './types';
 import { applyTheme, getSavedTheme, type ThemeMode } from './utils/theme';
 
+function routeFromLocation(): { page: PageId; context: any } {
+  const params = new URLSearchParams(window.location.search);
+  const noteId = params.get('note');
+  if (noteId) return {
+    page: 'notes',
+    context: {
+      noteId,
+      citation: ['part', 'at', 'sig', 'page'].some((key) => params.has(key)) ? params : undefined,
+      fromTutor: Boolean(window.history.state?.fromTutor),
+    },
+  };
+  const sessionId = params.get('chat');
+  if (params.has('chat')) return { page: 'tutor', context: sessionId ? { sessionId, scrollTop: window.history.state?.chatScrollTop } : null };
+  return { page: 'home', context: null };
+}
+
 export default function App() {
-  const [linkedNoteId] = useState(() => new URLSearchParams(window.location.search).get('note'));
-  const [page, setPage] = useState<PageId>(linkedNoteId ? 'notes' : 'home');
-  const [pageContext, setPageContext] = useState<any>(linkedNoteId ? { noteId: linkedNoteId } : null);
+  const [{ page, context: pageContext }, setRoute] = useState(routeFromLocation);
   const [theme, setTheme] = useState<ThemeMode>(getSavedTheme);
   const [categories, setCategories] = useState<Category[]>([]);
   const categoryRequest = useRef(0);
@@ -72,6 +86,12 @@ export default function App() {
   }, [refreshGlobal]);
 
   useEffect(() => {
+    const restoreRoute = () => setRoute(routeFromLocation());
+    window.addEventListener('popstate', restoreRoute);
+    return () => window.removeEventListener('popstate', restoreRoute);
+  }, []);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
@@ -83,9 +103,27 @@ export default function App() {
   }, []);
 
   const handleNavigate = (target: PageId, context?: any) => {
-    setPageContext(context || null);
-    setPage(target);
+    if (target === 'tutor' && page === 'tutor' && !context) return;
+    const query = new URLSearchParams(window.location.search);
+    if (query.has('note') || query.has('chat')) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+    setRoute({ page: target, context: context || null });
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const rememberTutorSession = (id: string | null) => {
+    const query = new URLSearchParams(window.location.search);
+    if (query.get('chat') === (id ?? '')) return;
+    window.history.replaceState(null, '', '?' + new URLSearchParams({ chat: id ?? '' }));
+  };
+
+  const openTutorCitation = (href: string, sessionId: string, chatScrollTop: number) => {
+    const chat = new URLSearchParams({ chat: sessionId });
+    window.history.replaceState({ chatScrollTop }, '', `?${chat}`);
+    window.history.pushState({ fromTutor: true }, '', href);
+    setRoute(routeFromLocation());
+    window.scrollTo(0, 0);
   };
 
   const handleOpenImport = () => {
@@ -116,8 +154,11 @@ export default function App() {
         )}
         {page === 'notes' && (
           <NotesPage
+            key={pageContext?.citation?.toString() ?? pageContext?.noteId}
             categoryLabels={categoryLabels}
             initialNoteId={pageContext?.noteId}
+            citation={pageContext?.citation}
+            onReturnToTutor={pageContext?.fromTutor ? () => window.history.back() : undefined}
             onRefreshGlobal={refreshGlobal}
             onOpenImport={handleOpenImport}
             onNavigate={handleNavigate}
@@ -137,7 +178,8 @@ export default function App() {
           <ReviewPage onRefreshGlobal={refreshGlobal}
             onReturnHome={(masteryChanges) => handleNavigate('home', { masteryChanges })} />
         )}
-        {page === 'tutor' && <TutorPage initialContext={pageContext} onRefreshGlobal={refreshGlobal} />}
+        {page === 'tutor' && <TutorPage key={pageContext?.sessionId} initialContext={pageContext}
+          onRefreshGlobal={refreshGlobal} onOpenCitation={openTutorCitation} onSessionChange={rememberTutorSession} />}
         {page === 'settings' && (
           <SettingsPage
             theme={theme}

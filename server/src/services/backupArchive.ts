@@ -9,13 +9,13 @@ import {
   mergeBackupSnapshots,
   normalizeBackupSnapshot,
   parseBackupManifest,
-  safeAttachmentMime,
   type BackupAttachment,
   type BackupMissingAttachment,
   type BackupRecord,
   type BackupSnapshot,
 } from '../shared/libraryBackup.js';
 import { applyBackupSnapshot, readBackupSnapshot } from './backupSnapshot.js';
+import { embeddedOriginal, storedOriginalPath } from './noteOriginal.js';
 
 export const BACKUP_STAGING_DIR = path.join(DATA_DIR, 'backup-staging');
 fs.mkdirSync(BACKUP_STAGING_DIR, { recursive: true });
@@ -41,28 +41,6 @@ function mimeForOriginal(note: BackupRecord, filename: string): string {
   if (note.source_type === 'pdf') return 'application/pdf';
   if (note.source_type === 'docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   return 'application/octet-stream';
-}
-
-function embeddedOriginal(value: unknown) {
-  if (typeof value !== 'string') return null;
-  const match = /^data:([^,;]+);base64,([a-z\d+/\r\n]*={0,2})$/i.exec(value);
-  if (!match) return null;
-  const input = match[2].replace(/[\r\n]/g, '');
-  const bytes = Buffer.from(input, 'base64');
-  if (bytes.toString('base64').replace(/=+$/, '') !== input.replace(/=+$/, '')) return null;
-  return { bytes, mime: safeAttachmentMime(match[1]) };
-}
-
-function storedOriginalPath(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const filename = /^\/uploads\/([a-z\d][\w.-]*)$/i.exec(value)?.[1];
-  if (!filename) return null;
-  try {
-    const resolved = fs.realpathSync(path.join(UPLOADS_DIR, filename));
-    return path.dirname(resolved) === fs.realpathSync(UPLOADS_DIR) && fs.statSync(resolved).isFile() ? resolved : null;
-  } catch {
-    return null;
-  }
 }
 
 function absentOriginal(note: BackupRecord): BackupMissingAttachment | null {
