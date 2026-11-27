@@ -12,7 +12,7 @@ export function knowledgeCompletion(blocks) {
     aliases: [knowledgeQuestion],
     answer: '预热 30 分钟后开始测量。',
     conditions: '环境温度低于 10°C。',
-    sources: [{ block: block.id, quote: knowledgeClause }],
+    sources: [block.id],
   }] : [] });
 }
 

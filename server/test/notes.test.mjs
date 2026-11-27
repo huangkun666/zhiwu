@@ -229,7 +229,7 @@ test('long PDF imports extract knowledge automatically and tutor reads the same 
   let failNextBatch = true;
   knowledgeReply = async ({ messages }) => {
     const { blocks } = JSON.parse(messages[1].content);
-    starts.push(blocks[0].id);
+    starts.push(blocks[0].text);
     if (starts.length === 1) {
       firstBatch.resolve();
       await release.promise;
@@ -262,10 +262,11 @@ test('long PDF imports extract knowledge automatically and tutor reads the same 
   release.resolve();
   const paused = await waitForKnowledge(read, 'paused');
   assert.ok(paused.processed > 0 && paused.processed < paused.total);
+  const retry = starts.length;
   failNextBatch = false;
   await request(endpoint, { method: 'POST' });
   const completed = await waitForKnowledge(read, 'complete');
-  assert.equal(starts[1], starts[2], 'retry starts from the failed batch');
+  assert.equal(starts[1], starts[retry], 'retry starts from the failed batch');
   const [point] = completed.points;
   assert.equal(point.title, knowledgeTitle);
   assert.equal(point.conditions, '环境温度低于 10°C。');
@@ -281,6 +282,29 @@ test('long PDF imports extract knowledge automatically and tutor reads the same 
   assert.ok(!(await find(knowledgeQuestion)).points.some(({ id }) => id === point.id));
   await request(`notes/trash/${note.id}/restore`, { method: 'POST' });
   assert.equal((await find(knowledgeQuestion)).points[0].id, point.id);
+});
+
+test('a paused plain text import can resolve verified passage links when retried', { timeout: 30000 }, async (t) => {
+  configureTestModel();
+  let modelReady = false;
+  knowledgeReply = ({ messages }) => modelReady
+    ? knowledgeCompletion(JSON.parse(messages[1].content).blocks)
+    : '{"points":[';
+  t.after(() => { knowledgeReply = undefined; });
+  const source = 'Instrument documentation.\n\n' + knowledgeClause;
+  const form = new FormData();
+  form.append('files', new File([source], 'operation.txt', { type: 'text/plain' }));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body: form, status: 201 });
+  const endpoint = `notes/${note.id}/knowledge`;
+  const read = () => request(endpoint);
+  await waitForKnowledge(read, 'paused');
+  modelReady = true;
+  await request(endpoint, { method: 'POST' });
+  const complete = await waitForKnowledge(read, 'complete');
+  const [point] = complete.points;
+  assert.equal(point.title, knowledgeTitle);
+  assert.equal(point.sources[0].noteId, note.id);
+  assert.match(point.sources[0].params, /part=source&at=2/);
 });
 
 test('PDF import and legacy detail reads keep physical page numbers and preserve editable text', async () => {

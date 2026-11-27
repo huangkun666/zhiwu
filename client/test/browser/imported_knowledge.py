@@ -20,7 +20,7 @@ class KnowledgeModel:
         blocks = json.loads(body["messages"][1]["content"])["blocks"]
         return json.dumps(dict(points=[
             dict(title=TITLE, aliases=[ALIAS], answer="预热 30 分钟后开始测量。",
-                 conditions="环境温度低于 10°C。", sources=[dict(block=block["id"], quote=CLAUSE)])
+                 conditions="环境温度低于 10°C。", sources=[block["id"]])
             for block in blocks if CLAUSE in block["text"]
         ]))
 

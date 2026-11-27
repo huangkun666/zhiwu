@@ -40,7 +40,7 @@ test('offline import queues knowledge and resolves searches to the original note
     const { localApi: api } = await vite.ssrLoadModule('/src/api/localEngine.ts');
     await api.saveSettings({ ...await api.getSettings(), activeProviderId: 'local' });
     const text = `${'Ordinary setup procedure. '.repeat(1150)}\n\n# Final section\n\n${knowledgeClause}`;
-    const { imported: [note] } = await api.importFiles([new File([text], 'operation.md')]);
+    const { imported: [note] } = await api.importFiles([new File([text], 'operation.txt', { type: 'text/plain' })]);
     assert.equal(typeof api.getKnowledge, 'function', 'offline import records an extraction task');
     const read = () => api.getKnowledge(note.id);
     assert.equal((await read()).status, 'pending');

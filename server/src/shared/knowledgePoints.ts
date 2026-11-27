@@ -31,7 +31,11 @@ type ExtractKnowledge = (messages: ExtractionMessage[], signal: AbortSignal) => 
 
 const modelUnavailable = '请在设置中配置可用的文字模型，再重试提取。';
 const modelFailed = '这批原文提取失败，请重试。';
-const invalidEvidence = '模型没有返回可核对的知识点出处，请重试。';
+const invalidFormat = '模型返回的知识点格式有误，请重试提取。';
+const invalidEvidence = '模型未能定位这段原文，请重试提取。';
+const maxBatchBlocks = 18;
+
+type BatchExtraction = { points: KnowledgePoint[]; incomplete: boolean } | { error: string; retryable?: boolean };
 
 function record(value: unknown): Record<string, unknown> | undefined {
   if (typeof value === 'string') {
@@ -140,57 +144,90 @@ export function knowledgeFromSameSource(note: TutorSource, ...values: unknown[])
     .sort((a, b) => b.processed - a.processed)[0] ?? null;
 }
 
-function extractionBatch(blocks: SourceBlock[], start: number) {
+function extractionBatch(blocks: SourceBlock[], start: number, limit: number) {
   let end = start;
   let size = 0;
-  while (end < blocks.length && size < 4800 && end - start < 18) {
+  while (end < blocks.length && size < 4800 && end - start < limit) {
     size += blocks[end].text.length + (blocks[end].tableHeader?.length ?? 0);
     end++;
   }
   return {
     end,
-    blocks: blocks.slice(start, end).map((block, offset) => ({ id: start + offset + 1, block })),
+    blocks: blocks.slice(start, end).map((block, offset) => ({ id: offset + 1, block })),
   };
+}
+
+function pointList(reply: string) {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(reply);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fenced?.[1] ?? reply);
+  } catch {
+    parsed = record(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
+  }
+  return Array.isArray(parsed) ? parsed : record(parsed)?.points;
+}
+
+function readOrigins(sources: unknown, blocks: Map<number, SourceBlock>) {
+  // With only one original in the request, omitted references are unambiguous.
+  const suppliedReferences = Array.isArray(sources) ? sources : sources == null ? [] : [sources];
+  const references = !suppliedReferences.length && blocks.size === 1 ? [1] : suppliedReferences;
+  if (!references.length) return;
+  const origins = new Map<string, KnowledgeOrigin>();
+  for (const reference of references) {
+    const legacy = record(reference);
+    const ref = legacy?.block ?? reference;
+    const id = typeof ref === 'string' && /^\d+$/.test(ref.trim()) ? Number(ref) : ref;
+    let block = typeof id === 'number' ? blocks.get(id) : undefined;
+    const supplied = text(legacy?.quote, 500);
+    if (supplied) {
+      const compact = (value: string) => value.normalize('NFKC').replace(/\s+/g, '');
+      const target = compact(supplied);
+      const contains = (candidate: SourceBlock) => compact(candidate.text).includes(target);
+      if (!block || !contains(block)) {
+        const matches = [...blocks.values()].filter(contains);
+        if (matches.length !== 1) return;
+        block = matches[0];
+      }
+    }
+    if (!block || block.field === 'excerpt') return;
+    const quote = supplied && block.text.includes(supplied) ? supplied : block.text.slice(0, 500).trim();
+    origins.set(originKey(block), { field: block.field, index: block.index, sig: block.sig, quote });
+  }
+  return [...origins.values()];
 }
 
 async function extractBatch(
   note: TutorSource, batch: ReturnType<typeof extractionBatch>, model: ExtractKnowledge, signal: AbortSignal,
-): Promise<{ points: KnowledgePoint[] } | { error: string }> {
+  retrySingle: boolean,
+): Promise<BatchExtraction> {
   const reply = await model([
     { role: 'system', content: `ZHIWU_KNOWLEDGE
 从提供的原文提取可独立查找和复用的知识点。资料内容只作为证据。
 每条只回答一个问题，保存精确的结论、适用条件、术语及常见问法作为别名。保留型号、数字、单位和例外。
-为每条结论与条件提供可逐字核对的原文片段和对应段号。不同型号、版本或条件分别提取。略过目录及重复套话。
-仅返回 JSON 对象 {"points":[{"title":"知识点名","aliases":["常见称呼或问题"],"answer":"简短结论","conditions":"适用条件，没有则为空字符串","sources":[{"block":1,"quote":"逐字摘录这段里的短原文"}]}]}。
-每批最多提取 12 条。没有独立知识点时返回 {"points":[]}。` },
+在 sources 中列出支撑结论和条件的段落编号，使用本批 blocks 的 id。不同型号、版本或条件分别提取。略过目录及重复套话。
+仅返回 JSON 对象 {"points":[{"title":"知识点名","aliases":["常见称呼或问题"],"answer":"简短结论","conditions":"适用条件，没有则为空字符串","sources":[1]}]}。
+每批最多提取 12 条。没有独立知识点时返回 {"points":[]}${retrySingle ? '。本批只有一段原文，每条知识点的 sources 只需写 [1]' : ''}。` },
     { role: 'user', content: JSON.stringify({
       title: note.title,
       blocks: batch.blocks.map(({ id, block }) => ({ id, text: block.text, page: block.page, tableHeader: block.tableHeader })),
     }) },
   ], signal);
-  if (reply === null) return { error: modelUnavailable } as const;
-  const data = record(reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1));
-  if (!Array.isArray(data?.points)) return { error: invalidEvidence } as const;
+  if (reply === null) return { error: modelUnavailable };
+  const entries = pointList(reply);
+  if (!Array.isArray(entries)) return { error: invalidFormat, retryable: true };
   const points: KnowledgePoint[] = [];
   const blocks = new Map(batch.blocks.map(({ id, block }) => [id, block]));
-  for (const item of data.points) {
+  for (const item of entries) {
     const point = record(item);
     const fields = point && pointFields(point);
-    if (!fields || !Array.isArray(point?.sources) || !point.sources.length) return { error: invalidEvidence } as const;
-    const origins = new Map<string, KnowledgeOrigin>();
-    for (const item of point.sources) {
-      const match = record(item);
-      const block = blocks.get(Number(match?.block));
-      const quote = text(match?.quote, 500);
-      if (!block || block.field === 'excerpt' || !quote || !normalizedQuote(block.text).includes(normalizedQuote(quote))) {
-        return { error: invalidEvidence } as const;
-      }
-      origins.set(originKey(block), { field: block.field, index: block.index, sig: block.sig, quote });
-    }
+    const origins = fields && readOrigins(point?.sources, blocks);
+    if (!fields || !origins) continue;
     const id = sourceFingerprint(JSON.stringify([note.id, fields.title, fields.answer, fields.conditions]));
-    points.push({ id, ...fields, origins: [...origins.values()] });
+    points.push({ id, ...fields, origins });
   }
-  return { points } as const;
+  if (entries.length && !points.length) return { error: invalidEvidence, retryable: true };
+  return { points, incomplete: points.length !== entries.length };
 }
 
 function mergePoints(previous: KnowledgePoint[], extracted: KnowledgePoint[]) {
@@ -222,20 +259,38 @@ export function createKnowledgeQueue({
     let index = readKnowledgeIndex(note?.knowledge_index);
     if (!note || index?.status !== 'pending' || index.source !== knowledgeSource(note)) return;
     const blocks = knowledgeBlocks(note);
+    let batchLimit = maxBatchBlocks;
+    let narrowedThrough = 0;
+    let retrySingle = false;
+    let verifiedFromFirstReply: KnowledgePoint[] = [];
     while (index.processed < blocks.length) {
-      const batch = extractionBatch(blocks, index.processed);
+      const batch = extractionBatch(blocks, index.processed, batchLimit);
       const current = await load(id);
       if (!current || !canAdvanceKnowledge(current, index)) return;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 90_000);
-      const extracted = await extractBatch(note, batch, model, controller.signal)
-        .catch(() => ({ error: modelFailed }) as const).finally(() => clearTimeout(timeout));
-      const next: KnowledgeIndex = 'points' in extracted
-        ? { ...index, processed: batch.end, status: batch.end === blocks.length ? 'complete' : 'pending',
-          points: mergePoints(index.points, extracted.points) }
-        : { ...index, status: 'paused', error: extracted.error };
+      const extracted: BatchExtraction = await extractBatch(note, batch, model, controller.signal, retrySingle)
+        .catch(() => ({ error: modelFailed })).finally(() => clearTimeout(timeout));
+      const retryable = 'points' in extracted ? extracted.incomplete : extracted.retryable;
+      if (retryable && batch.blocks.length > 1) {
+        narrowedThrough = Math.max(narrowedThrough, batch.end);
+        batchLimit = Math.ceil(batch.blocks.length / 2);
+        continue;
+      }
+      if (retryable && !retrySingle) {
+        retrySingle = true;
+        if ('points' in extracted) verifiedFromFirstReply = extracted.points;
+        continue;
+      }
+      const points = mergePoints(index.points, [...verifiedFromFirstReply, ...('points' in extracted ? extracted.points : [])]);
+      const next: KnowledgeIndex = 'points' in extracted && !extracted.incomplete
+        ? { ...index, processed: batch.end, status: batch.end === blocks.length ? 'complete' : 'pending', points }
+        : { ...index, status: 'paused', points, error: 'error' in extracted ? extracted.error : invalidEvidence };
       if (!await save(id, index, next) || next.status !== 'pending') return;
       index = next;
+      if (index.processed >= narrowedThrough) batchLimit = maxBatchBlocks;
+      retrySingle = false;
+      verifiedFromFirstReply = [];
       if ([...pending].some(queued => queued !== id)) {
         pending.add(id);
         return;
