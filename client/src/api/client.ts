@@ -3,6 +3,7 @@ import { localApi } from './localEngine';
 import type { BackupPreview } from '../../../server/src/shared/libraryBackup';
 import type { MasteryChange } from '../../../server/src/shared/todayLearning';
 import type { TutorChatPayload } from '../../../server/src/shared/tutorHistory';
+import type { LibrarySearchResults, NoteKnowledge } from '../../../server/src/shared/tutorSearch';
 import type {
   AISettings,
   AIProviderConfig,
@@ -63,8 +64,11 @@ const serverApi = {
     return request<Note[]>(`/api/notes${qs ? `?${qs}` : ''}`);
   },
   getNote: (id: string) => request<Note>(`/api/notes/${encodeURIComponent(id)}`),
+  searchLibrary: (q: string) => request<LibrarySearchResults>(`/api/notes/search-library?${new URLSearchParams({ q })}`),
+  getKnowledge: (id: string) => request<NoteKnowledge>(`/api/notes/${encodeURIComponent(id)}/knowledge`),
+  extractKnowledge: (id: string) => request<NoteKnowledge>(`/api/notes/${encodeURIComponent(id)}/knowledge`, { method: 'POST' }),
   getTags: () => request<{ name: string; count: number }[]>('/api/notes/meta/tags'),
-  createNote: (payload: { title: string; content: string; categoryId?: string | null; tags?: string[]; sourceType?: string }) =>
+  createNote: (payload: { title: string; content: string; categoryId?: string | null; tags?: string[]; sourceType?: string; extractKnowledge?: boolean }) =>
     request<Note>('/api/notes', { method: 'POST', body: JSON.stringify(payload) }),
   updateNote: (
     id: string,

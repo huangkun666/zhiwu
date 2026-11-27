@@ -140,6 +140,7 @@ export function QuickImportModal({
           categoryId: categoryId || null,
           tags,
           sourceType: 'markdown',
+          extractKnowledge: true,
         });
         createdNotes = [note];
       } else {

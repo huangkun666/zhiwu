@@ -65,7 +65,7 @@ async function answerTutor(
     const condition = automatic ? '' : 'WHERE id IN (SELECT value FROM json_each(?))';
     const params = automatic ? [] : [JSON.stringify(noteIds)];
     const notes = db.prepare(
-      `SELECT id, title, content, source_type, source_filename, source_content, source_pages, chat_excerpts, tags, updated_at
+      `SELECT id, title, content, source_type, source_filename, source_content, source_pages, chat_excerpts, knowledge_index, tags, updated_at
        FROM active_notes ${condition} ORDER BY updated_at DESC, id`
     ).all(...params) as unknown as Parameters<typeof prepareTutorTurn>[1];
     const versions = new Map(notes.map(note => [note.id, note.updated_at]));

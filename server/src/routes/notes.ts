@@ -19,6 +19,9 @@ import {
 } from '../db.js';
 import { parseUploadedFile } from '../services/parser.js';
 import { ensurePdfPageIndexes } from '../services/pdfPageIndex.js';
+import { initializeNoteKnowledge, readKnowledgeNote, scheduleKnowledge } from '../services/knowledgeIndex.js';
+import { noteKnowledge, searchLibrary } from '../shared/tutorSearch.js';
+import type { TutorSource } from '../shared/tutorSources.js';
 import { readPdfPages } from '../shared/pdfPages.js';
 import {
   callVisionOCR,
@@ -64,8 +67,9 @@ function formatNote(row: any) {
   } catch {
     summary = null;
   }
+  const { knowledge_index: _knowledge, ...details } = row;
   return {
-    ...row,
+    ...details,
     tags,
     summary,
     chat_excerpts: readChatExcerpts(row.chat_excerpts),
@@ -213,6 +217,7 @@ function setNoteTrashed(id: string, trashed: boolean): boolean {
 
 notesRouter.post('/trash/:id/restore', (req, res) => {
   if (!setNoteTrashed(req.params.id, false)) return res.status(404).json({ error: '笔记不存在' });
+  scheduleKnowledge([req.params.id]);
   res.json({ ok: true });
 });
 
@@ -234,6 +239,30 @@ notesRouter.delete('/trash/:id', async (req, res) => {
     await fs.promises.unlink(path.join(UPLOADS_DIR, path.basename(attachment))).catch(() => {});
   }
   res.json({ ok: true });
+});
+
+notesRouter.get('/search-library', async (req, res) => {
+  const query = String(req.query.q || '').trim().slice(0, 800);
+  if (query) await ensurePdfPageIndexes();
+  const notes = query ? db.prepare(`SELECT id, title, content, source_content, source_type, source_filename,
+    source_pages, chat_excerpts, knowledge_index, tags FROM active_notes ORDER BY is_pinned DESC, updated_at DESC, id`).all() as unknown as TutorSource[] : [];
+  res.json(searchLibrary(notes, query));
+});
+
+notesRouter.get('/:id/knowledge', (req, res) => {
+  const note = readKnowledgeNote(req.params.id);
+  if (!note) return res.status(404).json({ error: '笔记不存在' });
+  const result = noteKnowledge(note);
+  if (result.status === 'pending') scheduleKnowledge([note.id]);
+  res.json(result);
+});
+
+notesRouter.post('/:id/knowledge', async (req, res) => {
+  await ensurePdfPageIndexes([req.params.id]);
+  const note = initializeNoteKnowledge(req.params.id);
+  if (!note) return res.status(404).json({ error: '笔记不存在' });
+  scheduleKnowledge([note.id]);
+  res.json(noteKnowledge(note));
 });
 
 // Get single note
@@ -263,6 +292,10 @@ notesRouter.post('/', (req, res) => {
 
   syncNoteFts(id, finalTitle, finalContent, cleanTags);
   logStudyActivity('note_import', id);
+  if (req.body?.extractKnowledge === true) {
+    initializeNoteKnowledge(id);
+    scheduleKnowledge([id]);
+  }
 
   res.status(201).json(formatNote(getNoteRow(id)));
 });
@@ -335,6 +368,7 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
         );
         syncNoteFts(id, parsed.title, parsed.content, extraTags);
         logStudyActivity('note_import', id);
+        initializeNoteKnowledge(id);
         if (compact) return { id, title: parsed.title, category_id: category, source_filename: originalName };
         return formatNote(getNoteRow(id));
       });
@@ -350,6 +384,7 @@ notesRouter.post('/import', upload.array('files', 30), async (req, res) => {
     return res.status(400).json({ error: warnings.join('；') });
   }
 
+  scheduleKnowledge(imported.map(({ id }) => id));
   res.status(201).json({ imported, warnings });
 });
 
@@ -449,6 +484,8 @@ notesRouter.post('/:id/ocr', async (req, res) => {
       return getNoteRow(note.id);
     });
     if (!updated) return res.status(404).json({ error: '笔记不存在' });
+    initializeNoteKnowledge(note.id);
+    scheduleKnowledge([note.id]);
     res.json(formatNote(updated));
   } catch (err: any) {
     res.status(400).json({ error: err?.message || '图片识别失败' });

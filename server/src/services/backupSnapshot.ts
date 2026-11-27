@@ -122,6 +122,7 @@ export function applyBackupSnapshot(snapshot: BackupSnapshot, changedNotes: Back
         tags: JSON.stringify(tags),
         source_content,
         source_pages: item.source_pages ? JSON.stringify(item.source_pages) : null,
+        knowledge_index: item.knowledge_index ? JSON.stringify(item.knowledge_index) : null,
         source_filename: item.source_filename ?? null,
         attachment_path: item.attachment_path ?? null,
         word_count: typeof item.word_count === 'number' ? item.word_count : countWords(studyText),

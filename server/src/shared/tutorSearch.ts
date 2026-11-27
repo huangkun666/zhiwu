@@ -1,5 +1,6 @@
 import { readPdfPages } from './pdfPages.js';
-import { blockLabel, sourceBlocks, sourceFields, type SourceBlock, type TutorSource } from './tutorSources.js';
+import { blockLabel, citationParams, sourceBlocks, sourceFields, type SourceBlock, type TutorSource } from './tutorSources.js';
+import { knowledgeSource, readKnowledgeIndex, verifiedKnowledge, type KnowledgePoint } from './knowledgePoints.js';
 
 export interface Unit {
   block: SourceBlock;
@@ -94,7 +95,7 @@ function terms(query: string) {
   return [...keys].filter(key => !stopWords.has(key)).slice(0, 100);
 }
 
-export function search(docs: Document[], query: string, previous = '') {
+function rankPassages(docs: Document[], query: string, previous = '') {
   const weights = new Map(terms(previous.slice(-300)).map(key => [key, 0.2]));
   for (const key of terms(query.slice(0, 800))) weights.set(key, 1);
   const units = docs.flatMap(doc => doc.units);
@@ -116,6 +117,83 @@ export function search(docs: Document[], query: string, previous = '') {
     return { unit, score };
   }).filter(item => item.score > 0).sort((a, b) => b.score - a.score).map(item => item.unit);
 }
+
+function knowledgeMatches(doc: Document) {
+  const index = readKnowledgeIndex(doc.note.knowledge_index);
+  return index ? verifiedKnowledge(doc.note, index, doc.units, unit => unit.block) : [];
+}
+
+function rankKnowledge(docs: Document[], query: string) {
+  const keys = terms(query);
+  if (!keys.length) return [];
+  const phrase = normalize(query).trim();
+  return docs.flatMap(knowledgeMatches).map(match => {
+    const names = [match.point.title, ...match.point.aliases].map(normalize);
+    const explanation = normalize(match.point.answer + ' ' + match.point.conditions);
+    const exact = names.some(name => name === phrase || (name.length >= 3 && phrase.includes(name)));
+    const score = keys.reduce((sum, key) => sum + (names.some(name => name.includes(key)) ? 3 : 0)
+      + (explanation.includes(key) ? 1 : 0), exact ? 100 : 0);
+    return { ...match, score };
+  }).filter(match => match.score > 0).sort((a, b) => b.score - a.score);
+}
+
+export function search(docs: Document[], query: string, previous = '') {
+  const passages = rankPassages(docs, query, previous);
+  const knowledge = rankKnowledge(docs, query).slice(0, 12);
+  if (!knowledge.length) return passages;
+  const direct = knowledge.filter(match => match.score >= 100).flatMap(match => match.sources);
+  const phrase = normalize(query).trim();
+  const literal = phrase ? passages.filter(unit => unit.normalized.includes(phrase)).slice(0, 3) : [];
+  const preferred = [...new Set([...literal, ...direct])].slice(0, 6);
+  return [...new Set([...preferred, ...passages.slice(0, 6), ...knowledge.flatMap(match => match.sources), ...passages])];
+}
+
+function sourceTarget(note: TutorSource, block: SourceBlock) {
+  return { noteId: note.id, title: note.title, label: blockLabel(block), params: citationParams(note.id, block).toString() };
+}
+
+function presentPoint(point: KnowledgePoint, sources: Unit[]) {
+  const { origins: _origins, ...fields } = point;
+  return { ...fields, sources: sources.map(unit => sourceTarget(unit.document.note, unit.block)) };
+}
+
+export function noteKnowledge(note: TutorSource) {
+  const index = readKnowledgeIndex(note.knowledge_index);
+  if (!index) return { status: 'not_started' as const, processed: 0, total: 0, points: [] };
+  if (index.source !== knowledgeSource(note)) {
+    return { status: 'stale' as const, processed: 0, total: 0, points: [] };
+  }
+  const doc = catalog([note])[0];
+  const points = knowledgeMatches(doc).map(match => presentPoint(match.point, match.sources));
+  return { status: index.status, processed: index.processed, total: index.total, error: index.error, points };
+}
+
+export function searchLibrary(notes: TutorSource[], query: string) {
+  const docs = catalog(notes);
+  const keys = terms(query);
+  const phrase = normalize(query).trim();
+  const contains = (input: string) => Boolean(phrase && input.includes(phrase));
+  const points = rankKnowledge(docs, query).slice(0, 12).map(match => presentPoint(match.point, match.sources));
+  const literal = docs.flatMap(doc => doc.units.filter(unit => contains(unit.normalized)));
+  const ranked = rankPassages(docs, query).filter(unit => keys.some(key => unit.normalized.includes(key)));
+  const passages = [...new Set([...literal, ...ranked])].slice(0, 16).map(unit => {
+    const positions = keys.map(key => unit.normalized.indexOf(key)).filter(position => position >= 0);
+    const position = contains(unit.normalized) ? unit.normalized.indexOf(phrase) : Math.min(...positions);
+    const start = Math.max(0, position - 65);
+    const end = start + 290;
+    const block = unit.block;
+    return { source: sourceTarget(unit.document.note, block),
+      text: `${start ? '…' : ''}${block.text.slice(start, end)}${end < block.text.length ? '…' : ''}` };
+  });
+  const represented = new Set([...points.flatMap(point => point.sources), ...passages.map(hit => hit.source)].map(source => source.noteId));
+  const headers = docs.filter(doc => !represented.has(doc.note.id) &&
+    (contains(normalize(doc.header)) || keys.some(key => normalize(doc.header).includes(key))))
+    .slice(0, 8).map(({ note }) => ({ id: note.id, title: note.title }));
+  return { points, passages, notes: headers };
+}
+
+export type LibrarySearchResults = ReturnType<typeof searchLibrary>;
+export type NoteKnowledge = ReturnType<typeof noteKnowledge>;
 
 // Literal lookup scans the underlying displayed field so hard block boundaries cannot swallow a code.
 export function exactSearch(docs: Document[], literal: string, offset: number, limit: number) {

@@ -95,6 +95,7 @@ export function initDatabase() {
       content TEXT NOT NULL,
       source_content TEXT,
       source_pages TEXT,
+      knowledge_index TEXT,
       chat_excerpts TEXT NOT NULL DEFAULT '[]',
       summary_json TEXT,
       category_id TEXT REFERENCES categories(id) ON DELETE SET NULL,
@@ -264,6 +265,7 @@ export function initDatabase() {
     const noteColumns = new Set(db.prepare('PRAGMA table_info(notes)').all().map((column) => column.name));
     if (!noteColumns.has('source_content')) db.exec('ALTER TABLE notes ADD COLUMN source_content TEXT');
     if (!noteColumns.has('source_pages')) db.exec('ALTER TABLE notes ADD COLUMN source_pages TEXT');
+    if (!noteColumns.has('knowledge_index')) db.exec('ALTER TABLE notes ADD COLUMN knowledge_index TEXT');
     if (!noteColumns.has('chat_excerpts')) db.exec("ALTER TABLE notes ADD COLUMN chat_excerpts TEXT NOT NULL DEFAULT '[]'");
     if (!noteColumns.has('deleted_at')) db.exec('ALTER TABLE notes ADD COLUMN deleted_at TEXT');
     if (!db.prepare('PRAGMA table_info(categories)').all().some(({ name }) => name === 'updated_at')) {

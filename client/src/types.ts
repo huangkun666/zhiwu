@@ -45,6 +45,7 @@ export interface NoteSummary {
 }
 
 export interface Note {
+  knowledge_index?: import('../../server/src/shared/knowledgePoints').KnowledgeIndex | null;
   id: string;
   title: string;
   content: string;

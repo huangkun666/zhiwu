@@ -1,4 +1,6 @@
 import { prepareTutorTurn, runTutorChat } from '../../../server/src/shared/tutorContext';
+import { noteKnowledge, searchLibrary } from '../../../server/src/shared/tutorSearch';
+import { canAdvanceKnowledge, createKnowledgeQueue, readKnowledgeIndex, startKnowledgeIndex } from '../../../server/src/shared/knowledgePoints';
 import { stripTutorNoteEdit } from '../../../server/src/shared/tutorNoteEdit';
 import { compareTutorHistory, readTutorHistoryCursor, savedTutorPair, tutorHistoryPage, tutorMessageIds, tutorSessionTitle, type TutorChatPayload } from '../../../server/src/shared/tutorHistory';
 import { isTutorMode, newTutorMode, requireTutorMode, tutorDefaultTitles, type TutorMode } from '../../../server/src/shared/tutorMode';
@@ -356,6 +358,7 @@ async function readState(): Promise<LocalDBState> {
   cachedState.settings = normalizeLocalSettings(cachedState.settings);
   reconcileLibraryReferences(cachedState);
   restoreReviewedConceptLinks(cachedState);
+  resumeLocalKnowledge(cachedState);
   return cachedState;
 }
 
@@ -416,6 +419,7 @@ function applyOfflineBackup(incoming: BackupSnapshot) {
     reconcileLibraryReferences(next);
     restoreReviewedConceptLinks(next);
     await saveState(next, state);
+    resumeLocalKnowledge(next);
     return { ok: true, notesCount: merged.notesCount };
   })().finally(() => {
     if (restoringLibrary === restore) restoringLibrary = null;
@@ -597,7 +601,7 @@ function extractJson<T = any>(raw: string): T {
 async function callLLMDirect(
   provider: AIProviderConfig,
   messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
-  opts: { temperature?: number; jsonMode?: boolean; maxTokens?: number } = {}
+  opts: { temperature?: number; jsonMode?: boolean; maxTokens?: number; signal?: AbortSignal } = {}
 ): Promise<string> {
   const temperature = opts.temperature ?? 0.4;
   if (provider.type === 'gemini') {
@@ -619,6 +623,7 @@ async function callLLMDirect(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: opts.signal,
     });
     if (!res.ok) throw new Error(`Gemini 请求失败 (${res.status}): ${(await res.text().catch(() => '')).slice(0, 240)}`);
     const data = await res.json();
@@ -633,12 +638,12 @@ async function callLLMDirect(
   if (opts.maxTokens) body.max_tokens = opts.maxTokens;
   if (opts.jsonMode) body.response_format = { type: 'json_object' };
 
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: opts.signal });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
     if (opts.jsonMode && res.status === 400 && errText.toLowerCase().includes('response_format')) {
       delete body.response_format;
-      const retry = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+      const retry = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: opts.signal });
       if (retry.ok) {
         const d = await retry.json();
         return String(d?.choices?.[0]?.message?.content || '').trim();
@@ -922,7 +927,8 @@ async function parseFileOnDevice(file: File, settings: AISettings): Promise<{
 
 function enrichNote(state: LocalDBState, n: Note): Note {
   const cat = state.categories.find((c) => c.id === n.category_id);
-  return { ...n, chat_excerpts: readChatExcerpts(n.chat_excerpts), category_name: cat?.name || null, category_color: cat?.color || null };
+  const { knowledge_index: _knowledge, ...details } = n;
+  return { ...details, chat_excerpts: readChatExcerpts(n.chat_excerpts), category_name: cat?.name || null, category_color: cat?.color || null };
 }
 
 function requireNote(state: LocalDBState, id: string): Note {
@@ -1000,6 +1006,28 @@ async function localTutorReply(
 }
 
 // --- Complete Local API Implementation (100% parity with Express server) ---
+const scheduleLocalKnowledge = createKnowledgeQueue({
+  async load(id) { return getActiveNote(await loadState(), id); },
+  async save(id, before, after) {
+    const state = await loadState();
+    const note = getActiveNote(state, id);
+    if (!note || !canAdvanceKnowledge(note, before)) return false;
+    note.knowledge_index = after;
+    await saveState(state);
+    return true;
+  },
+  async model(messages, signal) {
+    const { settings } = await loadState();
+    let provider: AIProviderConfig;
+    try { provider = requireActiveProvider(settings); } catch { return null; }
+    return callLLMDirect(provider, messages, { jsonMode: true, temperature: 0, maxTokens: 2400, signal });
+  },
+});
+
+function resumeLocalKnowledge(state: LocalDBState) {
+  scheduleLocalKnowledge(activeNotes(state).filter(note => readKnowledgeIndex(note.knowledge_index)?.status === 'pending').map(note => note.id));
+}
+
 export const localApi = {
   async getDashboard(): Promise<DashboardData> {
     const s = await loadState();
@@ -1291,6 +1319,29 @@ export const localApi = {
     return list.sort((a, b) => Number(b.is_pinned) - Number(a.is_pinned) || b.updated_at.localeCompare(a.updated_at));
   },
 
+  async searchLibrary(query: string) {
+    if (query.trim()) await ensureLocalPdfPageIndexes();
+    const notes = activeNotes(await loadState()).sort((a, b) =>
+      Number(b.is_pinned) - Number(a.is_pinned) || b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id));
+    return searchLibrary(notes, query.trim().slice(0, 800));
+  },
+
+  async getKnowledge(id: string) {
+    const result = noteKnowledge(requireNote(await loadState(), id));
+    if (result.status === 'pending') scheduleLocalKnowledge([id]);
+    return result;
+  },
+
+  async extractKnowledge(id: string) {
+    await ensureLocalPdfPageIndexes([id]);
+    const state = await loadState();
+    const note = requireNote(state, id);
+    note.knowledge_index = startKnowledgeIndex(note);
+    await saveState(state);
+    scheduleLocalKnowledge([id]);
+    return noteKnowledge(note);
+  },
+
   async getNote(id: string): Promise<Note> {
     await ensureLocalPdfPageIndexes([id]);
     const s = await loadState();
@@ -1312,7 +1363,7 @@ export const localApi = {
   },
 
   async createNote(payload: { title: string; content: string; categoryId?: string | null; categoryPath?: string[];
-    tags?: string[]; sourceType?: string; requestId?: string }): Promise<Note> {
+    tags?: string[]; sourceType?: string; requestId?: string; extractKnowledge?: boolean }): Promise<Note> {
     const s = await loadState();
     if (payload.categoryId && payload.categoryPath) throw new Error('请填写分类编号或分类路径中的一项');
     const selected = payload.categoryPath ? resolveCategoryPath(s, payload.categoryPath) : undefined;
@@ -1340,9 +1391,12 @@ export const localApi = {
       updated_at: now,
     };
     if (selected) s.categories.push(...selected.additions);
+    if (payload.extractKnowledge) note.knowledge_index = startKnowledgeIndex(note);
     s.notes.unshift(note);
     logStudy(s, 'note_import', note.id);
-    return savedNote(s, note, saveState(s));
+    const result = await savedNote(s, note, saveState(s));
+    if (payload.extractKnowledge) scheduleLocalKnowledge([id]);
+    return result;
   },
 
   async updateNote(id: string, payload: { title?: string; content?: string; categoryId?: string | null; tags?: string[];
@@ -1430,6 +1484,7 @@ export const localApi = {
       note.updated_at = nextNoteUpdatedAt(note.updated_at);
       await saveState(s);
     }
+    scheduleLocalKnowledge([id]);
     return { ok: true };
   },
 
@@ -1469,6 +1524,7 @@ export const localApi = {
           created_at: now,
           updated_at: now,
         };
+        note.knowledge_index = startKnowledgeIndex(note);
         imported.push(note);
       } catch (e: any) {
         warnings.push(`${f.name}：${e.message || '解析失败'}`);
@@ -1485,6 +1541,7 @@ export const localApi = {
       logStudy(s, 'note_import', note.id);
     }
     await saveState(s);
+    scheduleLocalKnowledge(imported.map(note => note.id));
     return { imported: imported.map((note) => enrichNote(s, note)), warnings };
   },
 
@@ -1503,7 +1560,10 @@ export const localApi = {
     }
     n.content = ocrText;
     n.summary = null; // clear stale error summary after re-OCR
-    return saveNoteText(s, n);
+    n.knowledge_index = startKnowledgeIndex(n);
+    const result = await saveNoteText(s, n);
+    scheduleLocalKnowledge([id]);
+    return result;
   },
 
   async summarizeNote(id: string, applyMeta = true): Promise<Note> {

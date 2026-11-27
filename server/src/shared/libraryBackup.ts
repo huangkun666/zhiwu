@@ -1,7 +1,9 @@
 import { readIds } from './libraryReferences.js';
+import { knowledgeFromSameSource, readKnowledgeIndex } from './knowledgePoints.js';
 import { readChatExcerpts } from './noteContent.js';
 import { readPdfPages } from './pdfPages.js';
 import { isTutorMode } from './tutorMode.js';
+import type { TutorSource } from './tutorSources.js';
 
 export type BackupRecord = { id: string } & Record<string, unknown>;
 
@@ -140,10 +142,12 @@ function normalizeSummary(value: unknown) {
 }
 
 function normalizeNote(record: BackupRecord): BackupRecord {
-  const { summary_json, ...note } = record;
+  const { summary_json, knowledge_index, ...note } = record;
   const deletedAt = note.deleted_at;
+  const knowledge = readKnowledgeIndex(knowledge_index);
   return {
     ...note,
+    ...(knowledge ? { knowledge_index: knowledge } : {}),
     source_pages: note.source_type === 'pdf' ? readPdfPages(note.source_pages, String(note.source_content ?? '')) : null,
     title: typeof note.title === 'string' ? note.title : '未命名笔记',
     content: typeof note.content === 'string' ? note.content : '',
@@ -279,7 +283,12 @@ function mergeNotes(current: BackupRecord, incoming: BackupRecord): BackupRecord
   if (primary === incoming && incoming.deleted_at === undefined && current.deleted_at !== undefined) {
     missing.deleted_at = current.deleted_at;
   }
-  return Object.keys(missing).length ? { ...primary, ...missing } : primary;
+  const merged = Object.keys(missing).length ? { ...primary, ...missing } : primary;
+  if (!primary.knowledge_index && !fallback.knowledge_index) return merged;
+  const { knowledge_index, ...note } = merged;
+  const knowledge = knowledgeFromSameSource(note as unknown as TutorSource, knowledge_index, fallback.knowledge_index);
+  if (JSON.stringify(knowledge) === JSON.stringify(knowledge_index ?? null)) return merged;
+  return knowledge ? { ...note, knowledge_index: knowledge } : note;
 }
 
 function mergeQuizzes(current: BackupRecord, incoming: BackupRecord): BackupRecord {

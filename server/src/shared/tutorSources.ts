@@ -10,6 +10,7 @@ export interface TutorSource {
   source_filename?: string | null;
   source_pages?: unknown;
   chat_excerpts?: unknown;
+  knowledge_index?: unknown;
   updated_at?: string;
   tags?: unknown;
 }
@@ -112,9 +113,14 @@ export function unreadPdfPage(note: TutorSource, page: number): SourceBlock | un
     sig: sourceFingerprint(JSON.stringify(['pdf-image', note.id, note.updated_at, note.source_filename, pages.length, page, target])) };
 }
 
-export function citationLink(note: TutorSource, block: SourceBlock) {
-  const params = new URLSearchParams({ note: note.id, part: block.field, at: String(block.index), sig: block.sig });
+export function citationParams(noteId: string, block: SourceBlock) {
+  const params = new URLSearchParams({ note: noteId, part: block.field, at: String(block.index), sig: block.sig });
   if (block.page) params.set('page', String(block.page));
+  return params;
+}
+
+export function citationLink(note: TutorSource, block: SourceBlock) {
+  const params = citationParams(note.id, block);
   const title = note.title.replace(/[\[\]\\<>\r\n]/g, ' ').slice(0, 120);
   return `[${title} · ${blockLabel(block)}](?${params.toString().replace(/\)/g, '%29')})`;
 }

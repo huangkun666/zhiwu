@@ -214,7 +214,7 @@ export default function App() {
       <GlobalSearchModal
         open={searchOpen}
         onClose={() => setSearchOpen(false)}
-        onSelectNote={(noteId) => handleNavigate('notes', { noteId })}
+        onSelectNote={(noteId, citation) => handleNavigate('notes', { noteId, citation })}
       />
     </>
   );

@@ -15,6 +15,8 @@ import {
   type BackupSnapshot,
 } from '../shared/libraryBackup.js';
 import { applyBackupSnapshot, readBackupSnapshot } from './backupSnapshot.js';
+import { scheduleKnowledge } from './knowledgeIndex.js';
+import { readKnowledgeIndex } from '../shared/knowledgePoints.js';
 import { embeddedOriginal, storedOriginalPath } from './noteOriginal.js';
 
 export const BACKUP_STAGING_DIR = path.join(DATA_DIR, 'backup-staging');
@@ -189,7 +191,7 @@ async function restoreBackup(backup: BackupPackage) {
       await fs.promises.writeFile(temp, await backup.readAttachment(entry), { flag: 'wx' });
       notes.get(noteId)!.attachment_path = destination;
     }
-    return inTransaction(() => {
+    const { pendingIds, ...restored } = inTransaction(() => {
       const local = readBackupSnapshot();
       for (const note of local.notes) {
         if (!storedOriginalPath(note.attachment_path) && !embeddedOriginal(note.attachment_path)) note.attachment_path = null;
@@ -205,8 +207,12 @@ async function restoreBackup(backup: BackupPackage) {
         promoted.push(file.final);
       }
       applyBackupSnapshot(snapshot, changedNotes);
-      return { ok: true, notesCount };
+      const pendingIds = changedNotes.filter(note => !note.deleted_at && readKnowledgeIndex(note.knowledge_index)?.status === 'pending')
+        .map(note => note.id);
+      return { ok: true, notesCount, pendingIds };
     });
+    scheduleKnowledge(pendingIds);
+    return restored;
   } catch (error) {
     removeFiles(promoted);
     throw error;

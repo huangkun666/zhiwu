@@ -13,9 +13,11 @@ import { graphRouter } from './routes/graph.js';
 import { tutorRouter } from './routes/tutor.js';
 import { dashboardRouter } from './routes/dashboard.js';
 import { getLocalIPv4Addresses, settingsRouter } from './routes/settings.js';
+import { resumeNoteKnowledge } from './services/knowledgeIndex.js';
 import { transferRouter } from './routes/transfer.js';
 
 initDatabase();
+resumeNoteKnowledge();
 
 const app = express();
 app.use(cors());

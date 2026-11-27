@@ -168,10 +168,14 @@ class Model(BaseHTTPRequestHandler):
         self.headers_for("text/plain")
 
     def do_POST(self):
-        witness = self.server.witness
+        witness = getattr(self.server, "witness", None)
         try:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            reply = witness.respond(body)
+            if body["messages"][0]["content"].startswith("ZHIWU_KNOWLEDGE"):
+                extract = getattr(self.server, "extract_knowledge", None)
+                reply = extract(body) if extract else '{"points":[]}'
+            else:
+                reply = witness.respond(body)
             self.send_response(200)
             if body.get("stream"):
                 self.headers_for("text/event-stream")
@@ -198,7 +202,8 @@ class Model(BaseHTTPRequestHandler):
                 self.headers_for("text/plain")
                 self.wfile.write(b"Fixture model could not read the requested paragraphs")
         except Exception as error:
-            witness.errors.append(repr(error))
+            if witness:
+                witness.errors.append(repr(error))
             self.send_error(500, "Fixture model protocol mismatch")
 
 

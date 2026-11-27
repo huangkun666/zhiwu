@@ -78,25 +78,27 @@ export async function callLLM(
     temperature?: number;
     jsonMode?: boolean;
     maxTokens?: number;
+    signal?: AbortSignal;
   } = {}
 ): Promise<string> {
   const provider = options.provider || getActiveProvider();
   const temperature = options.temperature ?? 0.4;
 
   if (provider.type === 'gemini') {
-    return callGemini(provider, messages, { temperature, jsonMode: options.jsonMode });
+    return callGemini(provider, messages, { temperature, jsonMode: options.jsonMode, signal: options.signal });
   }
   return callOpenAICompat(provider, messages, {
     temperature,
     jsonMode: options.jsonMode,
     maxTokens: options.maxTokens,
+    signal: options.signal,
   });
 }
 
 async function callOpenAICompat(
   provider: AIProviderConfig,
   messages: ChatMessage[],
-  options: { temperature: number; jsonMode?: boolean; maxTokens?: number }
+  options: { temperature: number; jsonMode?: boolean; maxTokens?: number; signal?: AbortSignal }
 ): Promise<string> {
   const base = provider.baseUrl.replace(/\/+$/, '');
   const url = `${base}/chat/completions`;
@@ -122,6 +124,7 @@ async function callOpenAICompat(
     method: 'POST',
     headers,
     body: JSON.stringify(body),
+    signal: options.signal,
   });
 
   if (!res.ok) {
@@ -133,6 +136,7 @@ async function callOpenAICompat(
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal: options.signal,
       });
       if (retry.ok) {
         const retryJson = (await retry.json()) as any;
@@ -154,7 +158,7 @@ async function callOpenAICompat(
 async function callGemini(
   provider: AIProviderConfig,
   messages: ChatMessage[],
-  options: { temperature: number; jsonMode?: boolean }
+  options: { temperature: number; jsonMode?: boolean; signal?: AbortSignal }
 ): Promise<string> {
   const base = (provider.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
   const url = `${base}/models/${encodeURIComponent(provider.model)}:generateContent?key=${encodeURIComponent(
@@ -184,6 +188,7 @@ async function callGemini(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: options.signal,
   });
 
   if (!res.ok) {

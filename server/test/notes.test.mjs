@@ -12,6 +12,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { verifyPendingTutorHistoryChanges, verifyTutorHistory } from './fixtures/tutor-history.mjs';
 import { verifyTutorModes } from './fixtures/tutor-modes.mjs';
+import { knowledgeCitation, knowledgeClause, knowledgeCompletion, knowledgeQuestion, knowledgeTitle, waitForKnowledge } from './fixtures/imported-knowledge.mjs';
 
 const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 let fixture;
@@ -21,6 +22,7 @@ let db;
 let initDatabase;
 let configureTestModel;
 let modelReply;
+let knowledgeReply;
 
 before(async () => {
   fixture = mkdtempSync(join(dist, 'notes-test-'));
@@ -48,7 +50,8 @@ before(async () => {
   app.use(express.json());
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', app: '知悟 (Zhiwu)' }));
   app.post('/test-model/chat/completions', async (req, res) => {
-    const reply = await modelReply?.(req.body, res);
+    const isKnowledge = req.body.messages?.[0]?.content?.startsWith?.('ZHIWU_KNOWLEDGE');
+    const reply = isKnowledge ? await knowledgeReply?.(req.body) ?? '{"points":[]}' : await modelReply?.(req.body, res);
     if (res.headersSent) return;
     if (req.body.stream) {
       res.type('text/event-stream');
@@ -195,7 +198,7 @@ test('JSON backups keep imported source and individual chat excerpts', async () 
   assert.equal((await request(`notes?q=${encodeURIComponent('原文查找词')}`))[0].id, note.id);
 });
 
-function makePagedPdf(texts) {
+function makePagedPdf(texts, width = 200) {
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     `<< /Type /Pages /Kids [${texts.map((_, i) => `${4 + i * 2} 0 R`).join(' ')}] /Count ${texts.length} >>`,
@@ -203,7 +206,7 @@ function makePagedPdf(texts) {
   ];
   for (const text of texts) {
     const stream = typeof text === 'object' ? text.stream : text ? `BT /F1 12 Tf 50 100 Td (${text}) Tj ET` : '';
-    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 3 0 R /F2 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> >> /Contents ${objects.length + 2} 0 R >>`);
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} 200] /Resources << /Font << /F1 3 0 R /F2 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> >> /Contents ${objects.length + 2} 0 R >>`);
     objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
   }
   let document = '%PDF-1.4\n';
@@ -218,6 +221,68 @@ function makePagedPdf(texts) {
   return Buffer.from(`${document}trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
 }
 
+test('long PDF imports extract knowledge automatically and tutor reads the same late page', { timeout: 90000 }, async (t) => {
+  configureTestModel();
+  const firstBatch = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const starts = [];
+  let failNextBatch = true;
+  knowledgeReply = async ({ messages }) => {
+    const { blocks } = JSON.parse(messages[1].content);
+    starts.push(blocks[0].id);
+    if (starts.length === 1) {
+      firstBatch.resolve();
+      await release.promise;
+    } else if (failNextBatch) {
+      return 'invalid knowledge response';
+    }
+    return knowledgeCompletion(blocks);
+  };
+  modelReply = ({ messages }) => {
+    const system = messages[0].content;
+    if (system.startsWith('ZHIWU_RETRIEVE')) return '{"action":"finish"}';
+    const citation = knowledgeCitation(system);
+    return citation ? `按原文预热 30 分钟 ${citation}` : '缺少原文';
+  };
+  t.after(() => { release.resolve(); modelReply = undefined; knowledgeReply = undefined; });
+
+  const pdf = makePagedPdf(Array.from({ length: 100 }, (_, index) => index === 99
+    ? knowledgeClause : `Page ${index + 1}. General instrument setup and stock description for the standard sample.`), 640);
+  const form = new FormData();
+  form.append('files', new File([pdf], 'instrument-100.pdf', { type: 'application/pdf' }));
+  const { imported: [note] } = await request('notes/import', { method: 'POST', body: form, status: 201 });
+  assert.ok(note.source_content.includes(knowledgeClause), 'fixture PDF must preserve the complete last-page clause');
+  const endpoint = `notes/${note.id}/knowledge`;
+  const read = () => request(endpoint);
+  assert.equal((await read()).status, 'pending', 'the import response must arrive before the model finishes');
+  await firstBatch.promise;
+  const find = (q) => request(`notes/search-library?${new URLSearchParams({ q })}`);
+  const raw = await find('preheat for 30 minutes');
+  assert.ok(raw.passages.some(({ source }) => source.noteId === note.id && source.label.includes('100')));
+  release.resolve();
+  const paused = await waitForKnowledge(read, 'paused');
+  assert.ok(paused.processed > 0 && paused.processed < paused.total);
+  failNextBatch = false;
+  await request(endpoint, { method: 'POST' });
+  const completed = await waitForKnowledge(read, 'complete');
+  assert.equal(starts[1], starts[2], 'retry starts from the failed batch');
+  const [point] = completed.points;
+  assert.equal(point.title, knowledgeTitle);
+  assert.equal(point.conditions, '环境温度低于 10°C。');
+  assert.equal(point.sources[0].noteId, note.id);
+  assert.equal(new URLSearchParams(point.sources[0].params).get('page'), '100');
+  assert.equal((await find(knowledgeQuestion)).points[0].id, point.id);
+
+  const session = await request('tutor/sessions', { method: 'POST', body: { mode: 'qa', noteIds: [note.id] }, status: 201 });
+  const reply = await request(`tutor/sessions/${session.id}/chat`, { method: 'POST', body: { message: knowledgeQuestion } });
+  assert.match(JSON.stringify(reply), /page=100/);
+
+  await request(`notes/${note.id}`, { method: 'DELETE' });
+  assert.ok(!(await find(knowledgeQuestion)).points.some(({ id }) => id === point.id));
+  await request(`notes/trash/${note.id}/restore`, { method: 'POST' });
+  assert.equal((await find(knowledgeQuestion)).points[0].id, point.id);
+});
+
 test('PDF import and legacy detail reads keep physical page numbers and preserve editable text', async () => {
   const body = new FormData();
   body.append('files', new File([makePagedPdf(['First', '', 'Third'])], 'pages.pdf', { type: 'application/pdf' }));
@@ -231,6 +296,9 @@ test('PDF import and legacy detail reads keep physical page numbers and preserve
   const excerpts = [{ id: 'legacy-pdf-clip', content: 'Saved excerpt', created_at: note.updated_at }];
   db.prepare(`UPDATE notes SET source_content = 'First', source_pages = NULL, content = 'My edits', chat_excerpts = ? WHERE id = ?`)
     .run(JSON.stringify(excerpts), note.id);
+  const matches = await request('notes/search-library?q=Third');
+  const hit = matches.passages.find(({ source }) => source.noteId === note.id);
+  assert.equal(new URLSearchParams(hit?.source.params).get('page'), '3', 'search repairs a legacy PDF before returning a link');
   const legacy = await request(`notes/${note.id}`);
   assert.deepEqual(legacy.source_pages, pages);
   assert.equal(legacy.source_content, note.source_content);
@@ -244,6 +312,24 @@ test('PDF import and legacy detail reads keep physical page numbers and preserve
   const unavailable = await request(`notes/${note.id}`);
   assert.equal(unavailable.source_pages, null);
   assert.equal(unavailable.source_content, legacy.source_content);
+});
+
+test('restoring a pending knowledge index resumes it and repeat restore keeps the library unchanged', { timeout: 30000 }, async (t) => {
+  configureTestModel();
+  knowledgeReply = ({ messages }) => knowledgeCompletion(JSON.parse(messages[1].content).blocks);
+  t.after(() => { knowledgeReply = undefined; });
+  const { knowledgeSource } = await import('../dist/shared/knowledgePoints.js');
+  const timestamp = '2026-05-01T00:00:00Z';
+  const note = { id: 'restored-checkpoint', title: '恢复测试', content: knowledgeClause, source_type: 'markdown',
+    created_at: timestamp, updated_at: timestamp };
+  const backup = { notes: [{ ...note, knowledge_index: {
+    source: knowledgeSource(note), status: 'pending', processed: 0, total: 1, points: [],
+  } }] };
+  const restore = () => request('settings/import-json', { method: 'POST', body: backup });
+  assert.equal((await restore()).notesCount, 1);
+  const read = async () => (await request('settings/export-json')).notes.find(({ id }) => id === note.id).knowledge_index;
+  assert.equal((await waitForKnowledge(read, 'complete')).points[0].title, knowledgeTitle);
+  assert.equal((await restore()).notesCount, 0);
 });
 
 test('PDF text preserves a continuous model code across font runs and a gap between table cells', async () => {

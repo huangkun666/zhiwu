@@ -27,6 +27,7 @@ import { api } from '../api/client';
 import { isPhoneMcpAvailable } from '../api/phoneMcpBridge';
 import { MarkdownView } from '../components/MarkdownView';
 import { NoteSource } from '../components/NoteSource';
+import { NoteKnowledgePanel } from '../components/NoteKnowledge';
 import { TrashList } from '../components/TrashList';
 import type { Note, PageId, Synthesis, TrashedNote } from '../types';
 
@@ -917,6 +918,9 @@ export function NotesPage({
                   )}
                 </div>
               </div>
+
+              {!editing && <NoteKnowledgePanel key={activeNote.id} noteId={activeNote.id} updatedAt={activeNote.updated_at}
+                onOpenSource={(noteId, citation) => onNavigate('notes', { noteId, citation })} />}
 
               {/* AI Summary Panel */}
               {activeNote.summary && !editing && (
